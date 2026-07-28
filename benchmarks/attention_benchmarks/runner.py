@@ -46,6 +46,11 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 # Backend Configuration
 # ============================================================================
 
+_FLASH_ATTN_VERSION_ALIASES = {
+    "FLASH_ATTN_FA3": 3,
+    "FLASH_ATTN_FA4": 4,
+}
+
 
 def _get_backend_config(backend: str) -> dict:
     """
@@ -470,7 +475,10 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     device = torch.device(config.device)
     torch.accelerator.set_device_index(device)
 
-    backend_cfg = _get_backend_config(config.backend)
+    flash_attn_version = _FLASH_ATTN_VERSION_ALIASES.get(config.backend)
+    backend_cfg = _get_backend_config(
+        "FLASH_ATTN" if flash_attn_version is not None else config.backend
+    )
 
     requests = parse_batch_spec(config.batch_spec)
 
@@ -491,6 +499,8 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     with log_warnings_and_errors_only():
         # Create vllm_config first - uses model's native dtype via "auto"
         vllm_config = _create_vllm_config(config, max_num_blocks)
+        if flash_attn_version is not None:
+            vllm_config.attention_config.flash_attn_version = flash_attn_version
         dtype = vllm_config.model_config.dtype
 
         # Wrap everything in set_current_vllm_config context
