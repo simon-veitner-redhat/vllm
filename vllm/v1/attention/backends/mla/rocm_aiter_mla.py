@@ -447,6 +447,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         self,
         block_table_tensor: torch.Tensor,
         seq_lens_device: torch.Tensor,
+        seq_lens_cpu: torch.Tensor | None,
         max_seq_len: int,
         query_start_loc_cpu: torch.Tensor,
         query_start_loc_device: torch.Tensor,

@@ -985,6 +985,7 @@ def test_flashmla_dcp_decode_metadata_uses_gathered_query_heads(
     metadata = builder._build_decode(
         block_table_tensor=torch.empty((2, 1), dtype=torch.int32),
         seq_lens_device=seq_lens,
+        seq_lens_cpu=seq_lens,
         max_seq_len=24,
         query_start_loc_cpu=query_start_loc,
         query_start_loc_device=query_start_loc,

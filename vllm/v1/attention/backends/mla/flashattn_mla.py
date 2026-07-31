@@ -7,7 +7,7 @@ from typing import ClassVar
 import torch
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -35,9 +35,43 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
     flash_attn_varlen_func,
     get_scheduler_metadata,
+    is_fa_version_supported,
+)
+from vllm.vllm_flash_attn.cute.split_scheduler import (
+    SplitSchedulerPlanner,
 )
 
 logger = init_logger(__name__)
+
+
+def _get_mla_fa_version(vllm_config: VllmConfig | None = None) -> int:
+    if vllm_config is None:
+        vllm_config = get_current_vllm_config_or_none()
+    requested_version = None
+    if vllm_config is not None and isinstance(vllm_config.additional_config, dict):
+        requested_version = vllm_config.additional_config.get(
+            "requested_decode_fa_version"
+        )
+    fa_version = (
+        requested_version
+        if requested_version is not None
+        else get_flash_attn_version()
+    )
+    if (
+        requested_version is None
+        and fa_version not in (3, 4)
+        and is_fa_version_supported(4)
+    ):
+        fa_version = 4
+    if fa_version not in (3, 4):
+        raise NotImplementedError(
+            f"FlashAttention MLA decode requires FA3 or FA4, got FA{fa_version}"
+        )
+    if not is_fa_version_supported(fa_version):
+        raise NotImplementedError(
+            f"FlashAttention MLA decode requested unsupported FA{fa_version}"
+        )
+    return fa_version
 
 
 class FlashAttnMLABackend(MLACommonBackend):
@@ -134,7 +168,8 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
             supports_dcp_with_varlen=(interleave_size == 1),
         )
         self.max_num_splits = 0  # No upper bound on the number of splits.
-        self.fa_aot_schedule = get_flash_attn_version() == 3
+        self.fa_version = _get_mla_fa_version(vllm_config)
+        self.fa_aot_schedule = self.fa_version == 3
 
         self.use_full_cuda_graph = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -162,6 +197,18 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
             self.max_num_splits = (
                 vllm_config.attention_config.flash_attn_max_num_splits_for_cuda_graph
             )
+
+        self.fa4_split_planner = (
+            SplitSchedulerPlanner(
+                device=self.device,
+                max_batch_size=max(
+                    vllm_config.scheduler_config.max_num_seqs,
+                    self.max_cudagraph_size or 0,
+                ),
+            )
+            if self.fa_version == 4
+            else None
+        )
 
         if envs.VLLM_BATCH_INVARIANT:
             self.max_num_splits = 1
@@ -198,6 +245,7 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
         self,
         block_table_tensor: torch.Tensor,
         seq_lens_device: torch.Tensor,
+        seq_lens_cpu: torch.Tensor | None,
         max_seq_len: int,
         query_start_loc_cpu: torch.Tensor,
         query_start_loc_device: torch.Tensor,
@@ -206,7 +254,6 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
     ) -> FlashAttnMLADecodeMetadata:
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         max_query_len = query_lens_cpu.max().item()
-
         # For Flash Attention MLA + full cudagraph
         max_num_splits = 0
         if (
@@ -233,7 +280,43 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
             max_num_splits=max_num_splits,
         )
 
-        if self.use_full_cuda_graph and scheduler_metadata is not None:
+        if self.fa_version == 4 and seq_lens_cpu is not None:
+            use_graph_bound = (
+                self.use_full_cuda_graph
+                and self.max_cudagraph_size is not None
+                and num_decode_tokens <= self.max_cudagraph_size
+            )
+            cuda_graph_max_num_splits = (
+                (
+                    1
+                    if envs.VLLM_BATCH_INVARIANT
+                    else self.vllm_config.attention_config
+                    .flash_attn_max_num_splits_for_cuda_graph
+                )
+                if use_graph_bound
+                else None
+            )
+            assert self.fa4_split_planner is not None
+            split_plan = self.fa4_split_planner(
+                query_start_loc_cpu,
+                seq_lens_cpu,
+                num_heads_q=self.num_heads,
+                num_heads_kv=1,
+                head_dim=self.mla_dims.qk_rope_head_dim,
+                head_dim_v=self.mla_dims.kv_lora_rank,
+                has_qv=True,
+                cp_world_size=self.dcp_world_size,
+                cuda_graph_max_num_splits=cuda_graph_max_num_splits,
+            )
+            if split_plan is not None:
+                max_num_splits = split_plan.num_splits
+                scheduler_metadata = split_plan.scheduler_metadata
+
+        if (
+            self.use_full_cuda_graph
+            and self.fa_aot_schedule
+            and scheduler_metadata is not None
+        ):
             n = scheduler_metadata.shape[0]
             # Ensure the persistent buffer is large enough
             assert n <= self.scheduler_metadata.shape[0], (
@@ -294,6 +377,7 @@ class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
         )
 
         assert flash_attn_supports_mla(), "FlashAttnMLA is not supported on this device"
+        self.fa_version = _get_mla_fa_version()
 
         unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
         if any(unsupported_features):
@@ -356,7 +440,7 @@ class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
             softmax_scale=self.scale,
             causal=True,
             return_softmax_lse=self.need_to_return_lse_for_decode,
-            fa_version=3,  # only version 3 is supported
+            fa_version=self.fa_version,
             scheduler_metadata=attn_metadata.decode.scheduler_metadata,
             num_splits=attn_metadata.decode.max_num_splits,
             cp_world_size=self.dcp_world_size,

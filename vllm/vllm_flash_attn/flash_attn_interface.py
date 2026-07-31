@@ -279,6 +279,14 @@ def flash_attn_varlen_func(
         f"Fused FP8 output (output_scale) is only supported by FA4, "
         f"got fa_version={fa_version}"
     )
+    if (
+        fa_version == 4
+        and cp_world_size > 1
+        and torch.cuda.get_device_capability(q.device)[0] != 9
+    ):
+        raise NotImplementedError(
+            "FA4 decode context parallelism is only supported on Hopper (SM90)"
+        )
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -289,7 +297,7 @@ def flash_attn_varlen_func(
     else:
         assert len(window_size) == 2
         real_window_size = (window_size[0], window_size[1])
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    q, k, v, q_v = [maybe_contiguous(x) for x in (q, k, v, q_v)]
 
     dummy_cu_seqlens_k = torch.empty_like(cu_seqlens_q)
 
@@ -388,10 +396,14 @@ def flash_attn_varlen_func(
 
         from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
 
+        num_splits_dynamic_ptr = None
+        if scheduler_metadata is not None and num_splits > 1:
+            num_splits_dynamic_ptr = scheduler_metadata
         out, softmax_lse, _, _ = _flash_attn_fwd(
             q,
             k,
             v,
+            qv=q_v,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             seqused_k=seqused_k,
@@ -405,12 +417,16 @@ def flash_attn_varlen_func(
             window_size_left=real_window_size[0] if real_window_size[0] >= 0 else None,
             window_size_right=real_window_size[1] if real_window_size[1] >= 0 else None,
             num_splits=num_splits,
+            num_splits_dynamic_ptr=num_splits_dynamic_ptr,
             return_lse=return_softmax_lse,
             out=out,
             learnable_sink=s_aux,
             mask_mod=mask_mod,
             aux_tensors=aux_tensors,
             output_scale=output_scale,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            cp_tot_seqused_k=cp_tot_seqused_k,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")

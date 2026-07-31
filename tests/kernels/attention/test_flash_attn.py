@@ -34,6 +34,34 @@ SOFT_CAPS = [None]
 SLIDING_WINDOWS = [None, 256]
 
 
+def test_fa4_dcp_rejects_non_hopper(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda _device: (10, 0)
+    )
+    q = torch.empty((1, 1, 64))
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32)
+    seqused_k = torch.tensor([1], dtype=torch.int32)
+
+    with pytest.raises(
+        NotImplementedError,
+        match="only supported on Hopper",
+    ):
+        flash_attn_varlen_func(
+            q=q,
+            k=torch.empty_like(q),
+            v=torch.empty((1, 1, 256)),
+            q_v=torch.empty((1, 1, 256)),
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            max_seqlen_q=1,
+            max_seqlen_k=1,
+            fa_version=4,
+            cp_world_size=2,
+            cp_rank=0,
+            cp_tot_seqused_k=seqused_k,
+        )
+
+
 def ref_paged_attn(
     query: torch.Tensor,
     key_cache: torch.Tensor,

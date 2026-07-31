@@ -1,0 +1,34 @@
+description: "Focused MLA FA3 versus FA4 prefill comparison"
+
+# DeepSeek-V3 TP1.
+# https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json
+model:
+  num_layers: 61
+  num_q_heads: 128
+  num_kv_heads: 1
+  head_dim: 576
+  kv_lora_rank: 512
+  qk_nope_head_dim: 128
+  qk_rope_head_dim: 64
+  v_head_dim: 128
+  block_size: 128
+
+batch_specs:
+  - "q128"
+  - "q512"
+  - "q2k"
+  - "q8k"
+  - "4q512"
+  - "q128s1k"
+  - "q512s4k"
+  - "q1ks16k"
+
+decode_backends:
+  - FLASH_ATTN_MLA
+
+prefill_backends:
+  - fa3
+  - fa4
+
+device: "cuda:0"
+profile_memory: false

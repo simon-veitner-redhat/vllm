@@ -1,0 +1,65 @@
+description: "Production-path mixed MLA attention"
+
+model:
+  num_layers: 60
+  block_size: 32
+  head_dim: 576
+  kv_lora_rank: 512
+  qk_nope_head_dim: 128
+  qk_rope_head_dim: 64
+  num_q_heads: 16
+  num_kv_heads: 1
+
+model_parameter_sweep:
+  values:
+    # Mistral Small 4 119B TP2.
+    # https://huggingface.co/mistralai/Mistral-Small-4-119B-2603/blob/main/params.json
+    - num_layers: 36
+      head_dim: 320
+      kv_lora_rank: 256
+      qk_nope_head_dim: 64
+      qk_rope_head_dim: 64
+      v_head_dim: 128
+      num_q_heads: 16
+      num_kv_heads: 1
+    # DeepSeek-V3 TP8.
+    # https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json
+    - num_layers: 61
+      head_dim: 576
+      kv_lora_rank: 512
+      qk_nope_head_dim: 128
+      qk_rope_head_dim: 64
+      v_head_dim: 128
+      num_q_heads: 16
+      num_kv_heads: 1
+    # Kimi K3 TP1 full-attention layer geometry. The q_lora projection and
+    # output gate are outside this attention-kernel benchmark.
+    # https://huggingface.co/moonshotai/Kimi-K3/blob/main/config.json
+    - num_layers: 24
+      head_dim: 576
+      kv_lora_rank: 512
+      qk_nope_head_dim: 128
+      qk_rope_head_dim: 64
+      v_head_dim: 128
+      num_q_heads: 96
+      num_kv_heads: 1
+  label_format: "{backend}_cache{head_dim}_h{num_q_heads}"
+
+batch_specs:
+  # FlashAttention MLA decode/prefill routing boundary.
+  - "q512"
+  - "q513"
+  - "16q1s4k_q1k"
+  - "32q1s8k_4q1ks2k"
+  - "32q1s16k_16q4s4k_2q1ks8k"
+  # One residual-length mix in production scheduler order:
+  # decode -> short/spec extends -> prefill.
+  - "9q1s3071_4q8s2049_q257s8191_2q513"
+
+backends:
+  - FLASH_ATTN_MLA_ALL_FA3
+  - FLASH_ATTN_MLA_ALL_FA4
+
+device: "cuda:0"
+profile_memory: false
+cuda_graphs: true
