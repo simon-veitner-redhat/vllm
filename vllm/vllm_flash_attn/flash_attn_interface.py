@@ -279,13 +279,9 @@ def flash_attn_varlen_func(
         f"Fused FP8 output (output_scale) is only supported by FA4, "
         f"got fa_version={fa_version}"
     )
-    if (
-        fa_version == 4
-        and cp_world_size > 1
-        and torch.cuda.get_device_capability(q.device)[0] != 9
-    ):
+    if fa_version == 4 and cp_world_size > 1:
         raise NotImplementedError(
-            "FA4 decode context parallelism is only supported on Hopper (SM90)"
+            "FA4 decode context parallelism is not enabled in vLLM"
         )
 
     if softmax_scale is None:
@@ -424,9 +420,6 @@ def flash_attn_varlen_func(
             mask_mod=mask_mod,
             aux_tensors=aux_tensors,
             output_scale=output_scale,
-            cp_world_size=cp_world_size,
-            cp_rank=cp_rank,
-            cp_tot_seqused_k=cp_tot_seqused_k,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")

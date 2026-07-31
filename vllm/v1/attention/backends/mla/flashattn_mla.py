@@ -7,7 +7,7 @@ from typing import ClassVar
 import torch
 
 import vllm.envs as envs
-from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -45,23 +45,13 @@ logger = init_logger(__name__)
 
 
 def _get_mla_fa_version(vllm_config: VllmConfig | None = None) -> int:
-    if vllm_config is None:
-        vllm_config = get_current_vllm_config_or_none()
-    requested_version = None
-    if vllm_config is not None and isinstance(vllm_config.additional_config, dict):
-        requested_version = vllm_config.additional_config.get(
-            "requested_decode_fa_version"
-        )
     fa_version = (
-        requested_version
-        if requested_version is not None
+        vllm_config.attention_config.flash_attn_version
+        if vllm_config is not None
+        and vllm_config.attention_config.flash_attn_version is not None
         else get_flash_attn_version()
     )
-    if (
-        requested_version is None
-        and fa_version not in (3, 4)
-        and is_fa_version_supported(4)
-    ):
+    if fa_version not in (3, 4) and is_fa_version_supported(4):
         fa_version = 4
     if fa_version not in (3, 4):
         raise NotImplementedError(

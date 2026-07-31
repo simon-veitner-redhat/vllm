@@ -63,9 +63,6 @@ class ParallelSetup(NamedTuple):
 class CPTestOptions(NamedTuple):
     multi_node_only: bool
     attn_backend: str | None = None
-    flash_attn_version: int | None = None
-    dcp_comm_backend: Literal["ag_rs", "a2a"] | None = None
-    test_id: str | None = None
 
 
 @dataclass
@@ -85,9 +82,6 @@ class CPTestSettings:
         multi_node_only: bool = False,
         runner: RunnerOption = "auto",
         attn_backend: str | None = None,
-        flash_attn_version: int | None = None,
-        dcp_comm_backend: Literal["ag_rs", "a2a"] | None = None,
-        test_id: str | None = None,
     ):
         parallel_setups = []
         if dcp_multipliers is None:
@@ -115,9 +109,6 @@ class CPTestSettings:
             test_options=CPTestOptions(
                 multi_node_only=multi_node_only,
                 attn_backend=attn_backend,
-                flash_attn_version=flash_attn_version,
-                dcp_comm_backend=dcp_comm_backend,
-                test_id=test_id,
             ),
         )
 
@@ -126,17 +117,12 @@ class CPTestSettings:
 
         for parallel_setup in self.parallel_setups:
             for backend in self.distributed_backends:
-                param = (
+                yield (
                     model_id,
                     parallel_setup,
                     backend,
                     self.runner,
                     opts,
-                )
-                yield (
-                    pytest.param(*param, id=opts.test_id)
-                    if opts.test_id is not None
-                    else param
                 )
 
 
@@ -152,28 +138,7 @@ if current_platform.is_rocm():
 else:
     CP_TEXT_GENERATION_MODELS = {
         "deepseek-ai/DeepSeek-V2-Lite-Chat": [
-            CPTestSettings.detailed(
-                tp_base=2,
-                dcp_multipliers=[1],
-                attn_backend="FLASH_ATTN_MLA",
-                flash_attn_version=3,
-                test_id="flash-attn-mla-fa3-dcp2",
-            ),
-            CPTestSettings.detailed(
-                tp_base=2,
-                dcp_multipliers=[1],
-                attn_backend="FLASH_ATTN_MLA",
-                flash_attn_version=4,
-                test_id="flash-attn-mla-fa4-dcp2",
-            ),
-            CPTestSettings.detailed(
-                tp_base=2,
-                dcp_multipliers=[1],
-                attn_backend="FLASH_ATTN_MLA",
-                flash_attn_version=4,
-                dcp_comm_backend="a2a",
-                test_id="flash-attn-mla-fa4-dcp2-a2a",
-            ),
+            CPTestSettings.detailed(dcp_multipliers=[1]),
             CPTestSettings.detailed(
                 dcp_multipliers=[0.5],
                 cp_kv_cache_interleave_size=64,
@@ -217,13 +182,7 @@ def _test_cp_gsm8k(
         chunked_prefill,
     ) = parallel_setup
 
-    (
-        multi_node_only,
-        attn_backend,
-        flash_attn_version,
-        dcp_comm_backend,
-        _,
-    ) = test_options
+    multi_node_only, attn_backend = test_options
 
     model_info = HF_EXAMPLE_MODELS.find_hf_info(model_id)
     model_info.check_transformers_version(on_fail="skip")
@@ -283,12 +242,6 @@ def _test_cp_gsm8k(
 
     if attn_backend:
         server_args.append(f"--attention-backend={attn_backend}")
-    if flash_attn_version is not None:
-        server_args.append(
-            f"--attention-config.flash_attn_version={flash_attn_version}"
-        )
-    if dcp_comm_backend is not None:
-        server_args.extend(["--dcp-comm-backend", dcp_comm_backend])
 
     with RemoteOpenAIServer(
         model_id,
@@ -343,20 +296,14 @@ def test_cp_generation(
     test_options: CPTestOptions,
     num_gpus_available,
 ):
-    device_capability = torch.cuda.get_device_capability()
     if (
         model_id == "deepseek-ai/DeepSeek-V2-Lite-Chat"
-        and device_capability < (9, 0)
+        and torch.cuda.get_device_capability() < (9, 0)
     ):
         pytest.skip(reason="MLA+DCP requires compute capability of 9.0 or higher")
     if (
-        test_options.attn_backend == "FLASH_ATTN_MLA"
-        and device_capability[0] != 9
-    ):
-        pytest.skip(reason="FlashAttention MLA+DCP is only supported on Hopper")
-    if (
         model_id == "Qwen/Qwen2.5-1.5B-Instruct"
-        and device_capability != (9, 0)
+        and torch.cuda.get_device_capability() != (9, 0)
     ):
         pytest.skip(reason="GQA+DCP currently requires compute capability of 9.0")
 

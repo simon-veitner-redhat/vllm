@@ -126,7 +126,7 @@ def create_minimal_vllm_config(
     prefill_backend: str | None = None,
     kv_cache_dtype: str = "auto",
     sparse_mla_force_mqa: bool = False,
-    requested_decode_fa_version: int | None = None,
+    flash_attn_version: int | None = None,
 ) -> VllmConfig:
     """
     Create minimal VllmConfig for MLA benchmarks.
@@ -145,8 +145,7 @@ def create_minimal_vllm_config(
                         the specified prefill backend.
         sparse_mla_force_mqa: If True, forces all sparse MLA tokens through
                     forward_mqa (even prefill tokens).
-        requested_decode_fa_version: Requested FlashAttention MLA decode
-                    version for a benchmark-only versioned alias.
+        flash_attn_version: Requested FlashAttention version for a benchmark alias.
 
     Returns:
         VllmConfig for benchmarking
@@ -260,10 +259,8 @@ def create_minimal_vllm_config(
     if sparse_mla_force_mqa:
         vllm_config.attention_config.sparse_mla_force_mqa = True
 
-    if requested_decode_fa_version is not None:
-        vllm_config.additional_config["requested_decode_fa_version"] = (
-            requested_decode_fa_version
-        )
+    if flash_attn_version is not None:
+        vllm_config.attention_config.flash_attn_version = flash_attn_version
 
     return vllm_config
 
@@ -1171,7 +1168,7 @@ def _run_mla_benchmark_batched(
         prefill_backend=prefill_backend,
         kv_cache_dtype=kv_cache_dtype,
         sparse_mla_force_mqa=sparse_mla_force_mqa,
-        requested_decode_fa_version=requested_fa_version,
+        flash_attn_version=requested_fa_version,
     )
 
     results = []
