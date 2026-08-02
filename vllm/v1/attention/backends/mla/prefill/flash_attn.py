@@ -154,7 +154,9 @@ class FA4MLAPrefillKernel(VllmJitKernel["FA4MLAPrefillKernel.CompileKey"]):
 
         mla_dims = get_mla_dims(vllm_config.model_config)
         qk_head_dim = mla_dims.qk_nope_head_dim + mla_dims.qk_rope_head_dim
-        fa_version = get_flash_attn_version(head_size=qk_head_dim)
+        fa_version = vllm_config.attention_config.flash_attn_version
+        if fa_version is None:
+            fa_version = get_flash_attn_version(head_size=qk_head_dim)
         if fa_version != 4:
             return []
 
