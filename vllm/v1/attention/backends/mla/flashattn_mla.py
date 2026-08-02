@@ -37,9 +37,6 @@ from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
     get_scheduler_metadata,
     is_fa_version_supported,
 )
-from vllm.vllm_flash_attn.cute.split_scheduler import (
-    SplitSchedulerPlanner,
-)
 
 logger = init_logger(__name__)
 
@@ -188,18 +185,6 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
                 vllm_config.attention_config.flash_attn_max_num_splits_for_cuda_graph
             )
 
-        self.fa4_split_planner = (
-            SplitSchedulerPlanner(
-                device=self.device,
-                max_batch_size=max(
-                    vllm_config.scheduler_config.max_num_seqs,
-                    self.max_cudagraph_size or 0,
-                ),
-            )
-            if self.fa_version == 4
-            else None
-        )
-
         if envs.VLLM_BATCH_INVARIANT:
             self.max_num_splits = 1
 
@@ -269,38 +254,6 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
             causal=True,
             max_num_splits=max_num_splits,
         )
-
-        if self.fa_version == 4 and seq_lens_cpu is not None:
-            use_graph_bound = (
-                self.use_full_cuda_graph
-                and self.max_cudagraph_size is not None
-                and num_decode_tokens <= self.max_cudagraph_size
-            )
-            cuda_graph_max_num_splits = (
-                (
-                    1
-                    if envs.VLLM_BATCH_INVARIANT
-                    else self.vllm_config.attention_config
-                    .flash_attn_max_num_splits_for_cuda_graph
-                )
-                if use_graph_bound
-                else None
-            )
-            assert self.fa4_split_planner is not None
-            split_plan = self.fa4_split_planner(
-                query_start_loc_cpu,
-                seq_lens_cpu,
-                num_heads_q=self.num_heads,
-                num_heads_kv=1,
-                head_dim=self.mla_dims.qk_rope_head_dim,
-                head_dim_v=self.mla_dims.kv_lora_rank,
-                has_qv=True,
-                cp_world_size=self.dcp_world_size,
-                cuda_graph_max_num_splits=cuda_graph_max_num_splits,
-            )
-            if split_plan is not None:
-                max_num_splits = split_plan.num_splits
-                scheduler_metadata = split_plan.scheduler_metadata
 
         if (
             self.use_full_cuda_graph

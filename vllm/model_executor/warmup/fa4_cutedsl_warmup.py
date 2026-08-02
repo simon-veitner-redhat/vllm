@@ -39,6 +39,37 @@ def fa4_cutedsl_warmup(worker: Worker) -> None:
         flash_attn.FA4_MLA_PREFILL_KERNEL.warmup(vllm_config)
 
     if not worker.use_v2_model_runner:
+        if vllm_config.model_config.use_mla:
+            from vllm.v1.attention.backends.mla.flashattn_mla import (
+                FlashAttnMLAMetadataBuilder,
+            )
+
+            max_warmup_tokens = min(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                vllm_config.model_config.max_model_len,
+            )
+            if max_warmup_tokens < 2:
+                return
+            runner._dummy_run(
+                min(
+                    FlashAttnMLAMetadataBuilder.reorder_batch_threshold + 1,
+                    max_warmup_tokens,
+                ),
+                force_attention=True,
+                is_profile=True,
+                create_mixed_batch=True,
+                skip_eplb=True,
+                profile_seq_lens=max_warmup_tokens // 2,
+            )
+            for context_len in (min(128, max_warmup_tokens), max_warmup_tokens // 2):
+                runner._dummy_run(
+                    2,
+                    force_attention=True,
+                    is_profile=True,
+                    skip_eplb=True,
+                    profile_seq_lens=context_len,
+                    num_reqs=1,
+                )
         return
     from vllm.v1.kv_cache_interface import CrossAttentionSpec, MambaSpec
 

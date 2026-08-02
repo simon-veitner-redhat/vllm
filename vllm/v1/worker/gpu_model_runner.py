@@ -5828,6 +5828,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        num_reqs: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5855,6 +5856,8 @@ class GPUModelRunner(
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            num_reqs: If provided, distribute tokens across exactly this many
+                requests instead of the scheduler maximum.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -5887,6 +5890,10 @@ class GPUModelRunner(
         # has num_tokens in total.
         assert num_tokens <= self.max_num_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
+        if num_reqs is not None:
+            assert not create_mixed_batch
+            assert 0 < num_reqs <= min(num_tokens, max_num_reqs)
+            max_num_reqs = num_reqs
         if create_mixed_batch:
             assert not uniform_decode
             # Create mixed batch:
