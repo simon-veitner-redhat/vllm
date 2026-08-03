@@ -1,0 +1,92 @@
+description: "Focused MLA FA3 versus FA4 absorbed-decode comparison"
+
+model:
+  num_layers: 60
+  block_size: 128
+
+model_parameter_sweep:
+  values:
+    # DeepSeek-V3 TP8.
+    # https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json
+    - num_layers: 61
+      head_dim: 576
+      kv_lora_rank: 512
+      qk_nope_head_dim: 128
+      qk_rope_head_dim: 64
+      v_head_dim: 128
+      num_q_heads: 16
+      num_kv_heads: 1
+    # DeepSeek-V3 TP1.
+    - num_layers: 61
+      head_dim: 576
+      kv_lora_rank: 512
+      qk_nope_head_dim: 128
+      qk_rope_head_dim: 64
+      v_head_dim: 128
+      num_q_heads: 128
+      num_kv_heads: 1
+    # Mistral Small 4 119B TP2.
+    # https://huggingface.co/mistralai/Mistral-Small-4-119B-2603/blob/main/params.json
+    - num_layers: 36
+      head_dim: 320
+      kv_lora_rank: 256
+      qk_nope_head_dim: 64
+      qk_rope_head_dim: 64
+      v_head_dim: 128
+      num_q_heads: 16
+      num_kv_heads: 1
+    # DeepSeek-V3 TP4.
+    - num_layers: 61
+      head_dim: 576
+      kv_lora_rank: 512
+      qk_nope_head_dim: 128
+      qk_rope_head_dim: 64
+      v_head_dim: 128
+      num_q_heads: 32
+      num_kv_heads: 1
+      block_size: 32
+    # DeepSeek-V3 TP2.
+    - num_layers: 61
+      head_dim: 576
+      kv_lora_rank: 512
+      qk_nope_head_dim: 128
+      qk_rope_head_dim: 64
+      v_head_dim: 128
+      num_q_heads: 64
+      num_kv_heads: 1
+      block_size: 32
+    # Kimi K3 TP1 full-attention layer geometry. The q_lora projection and
+    # output gate are outside this absorbed-attention kernel benchmark.
+    # https://huggingface.co/moonshotai/Kimi-K3/blob/main/config.json
+    - num_layers: 24
+      head_dim: 576
+      kv_lora_rank: 512
+      qk_nope_head_dim: 128
+      qk_rope_head_dim: 64
+      v_head_dim: 128
+      num_q_heads: 96
+      num_kv_heads: 1
+  label_format: "{backend}_cache{head_dim}_h{num_q_heads}"
+
+batch_specs:
+  - "q1s512"
+  - "q1s4k"
+  - "q1s32k"
+  - "16q1s512"
+  - "16q1s4k"
+  - "16q1s32k"
+  - "64q1s512"
+  - "64q1s4k"
+  - "64q1s32k"
+  - "16q4s1k"
+  - "16q8s4k"
+  - "4q128s1k"
+  # High-occupancy heterogeneous decode lengths expose scheduler imbalance.
+  - "32q1s512_32q1s4k_32q1s8k_32q1s16k"
+
+backends:
+  - FLASH_ATTN_MLA_FA3
+  - FLASH_ATTN_MLA_FA4
+
+device: "cuda:0"
+profile_memory: false

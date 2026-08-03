@@ -20,6 +20,8 @@ from common import (
     MockHfConfig,
     MockIndexer,
     MockLayer,
+    is_mla_all_phase_backend,
+    resolve_mla_backend,
     run_do_bench,
     run_ncu_profile,
     setup_mla_dims,
@@ -124,6 +126,7 @@ def create_minimal_vllm_config(
     prefill_backend: str | None = None,
     kv_cache_dtype: str = "auto",
     sparse_mla_force_mqa: bool = False,
+    flash_attn_version: int | None = None,
 ) -> VllmConfig:
     """
     Create minimal VllmConfig for MLA benchmarks.
@@ -142,6 +145,7 @@ def create_minimal_vllm_config(
                         the specified prefill backend.
         sparse_mla_force_mqa: If True, forces all sparse MLA tokens through
                     forward_mqa (even prefill tokens).
+        flash_attn_version: Requested FlashAttention version for a benchmark alias.
 
     Returns:
         VllmConfig for benchmarking
@@ -166,6 +170,10 @@ def create_minimal_vllm_config(
         "num_attention_heads": mla_dims["num_q_heads"],
         "num_key_value_heads": mla_dims["num_kv_heads"],
         "hidden_size": mla_dims["head_dim"] * mla_dims["num_q_heads"],
+        "kv_lora_rank": mla_dims["kv_lora_rank"],
+        "qk_nope_head_dim": mla_dims["qk_nope_head_dim"],
+        "qk_rope_head_dim": mla_dims["qk_rope_head_dim"],
+        "v_head_dim": mla_dims["v_head_dim"],
         "torch_dtype": "bfloat16",
         "max_position_embeddings": 163840,  # DeepSeek V3 default
         "rope_theta": 10000.0,
@@ -251,6 +259,9 @@ def create_minimal_vllm_config(
     if sparse_mla_force_mqa:
         vllm_config.attention_config.sparse_mla_force_mqa = True
 
+    if flash_attn_version is not None:
+        vllm_config.attention_config.flash_attn_version = flash_attn_version
+
     return vllm_config
 
 
@@ -333,6 +344,9 @@ def _get_backend_config(backend: str) -> dict:
     from vllm.v1.attention.backend import MultipleOf
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+    requested_backend = backend
+    backend, requested_fa_version = resolve_mla_backend(backend)
+
     try:
         backend_enum = AttentionBackendEnum[backend]
         backend_class = backend_enum.get_class()
@@ -358,6 +372,10 @@ def _get_backend_config(backend: str) -> dict:
     props = _BACKEND_PROPERTIES.get(backend, {})
 
     return {
+        "requested_backend": requested_backend,
+        "canonical_backend": backend,
+        "requested_fa_version": requested_fa_version,
+        "all_phase_fa_alias": is_mla_all_phase_backend(requested_backend),
         "backend_class": backend_class,
         "impl_class": backend_class.get_impl_cls(),
         "builder_class": backend_class.get_builder_cls(),
@@ -659,7 +677,7 @@ def _create_backend_impl(
     kv_cache_spec = FullAttentionSpec(
         block_size=backend_cfg["block_size"] or vllm_config.cache_config.block_size,
         num_kv_heads=1,  # MLA uses 1 KV head
-        head_size=576,  # MLA head dim
+        head_size=mla_dims["kv_lora_rank"] + mla_dims["qk_rope_head_dim"],
         dtype=torch.bfloat16,
     )
 
@@ -764,6 +782,7 @@ def _run_single_benchmark(
     kv_cache_dtype: str | None = None,
     output_scale: float | None = None,
     fuse_quant_op: bool = False,
+    expected_phase: str | None = None,
 ) -> BenchmarkResult:
     """
     Run a single benchmark iteration.
@@ -782,6 +801,7 @@ def _run_single_benchmark(
         fuse_quant_op: With output_scale set, True lets the prefill kernel write
             FP8 directly; False runs bf16 attention then a standalone static-FP8
             quant. The delta isolates the saved post-quant kernel.
+        expected_phase: If set, require metadata to contain only this phase.
 
     Returns:
         BenchmarkResult with timing statistics
@@ -863,6 +883,18 @@ def _run_single_benchmark(
         has_prefill = metadata.prefill is not None
     if not has_decode and not has_prefill:
         raise RuntimeError("Metadata has neither decode nor prefill metadata")
+    if expected_phase == "decode" and (not has_decode or has_prefill):
+        raise RuntimeError(
+            "Expected exclusive decode metadata, got "
+            f"decode={has_decode}, prefill={has_prefill}"
+        )
+    if expected_phase == "prefill" and (has_decode or not has_prefill):
+        raise RuntimeError(
+            "Expected exclusive prefill metadata, got "
+            f"decode={has_decode}, prefill={has_prefill}"
+        )
+    if expected_phase not in {None, "decode", "prefill"}:
+        raise ValueError(f"Unknown expected phase: {expected_phase!r}")
     if is_sparse and force_dense_mha and not has_prefill:
         raise RuntimeError(
             "Sparse MLA dense_mha benchmark did not produce prefill metadata. "
@@ -1039,6 +1071,7 @@ def _run_mla_benchmark_batched(
     sparse_mla_force_mqa: bool = False,
     output_scale: float | None = None,
     fuse_quant_op: bool = False,
+    expected_phase: str | None = None,
 ) -> list[BenchmarkResult]:
     """
     Unified batched MLA benchmark runner for all backends.
@@ -1067,6 +1100,23 @@ def _run_mla_benchmark_batched(
         return []
 
     backend_cfg = _get_backend_config(backend)
+    requested_fa_version = backend_cfg["requested_fa_version"]
+    all_phase_fa_alias = backend_cfg["all_phase_fa_alias"]
+    if requested_fa_version is not None and not all_phase_fa_alias:
+        if expected_phase not in {None, "decode"}:
+            raise ValueError(
+                f"Decode alias '{backend}' conflicts with expected phase "
+                f"{expected_phase!r}"
+            )
+        expected_phase = "decode"
+    if all_phase_fa_alias:
+        requested_prefill_backend = f"fa{requested_fa_version}"
+        if prefill_backend not in {None, requested_prefill_backend}:
+            raise ValueError(
+                f"All-phase alias '{backend}' requires prefill backend "
+                f"'{requested_prefill_backend}', got {prefill_backend!r}"
+            )
+        prefill_backend = requested_prefill_backend
     device = torch.device(configs_with_params[0][0].device)
     torch.accelerator.set_device_index(device)
 
@@ -1118,6 +1168,7 @@ def _run_mla_benchmark_batched(
         prefill_backend=prefill_backend,
         kv_cache_dtype=kv_cache_dtype,
         sparse_mla_force_mqa=sparse_mla_force_mqa,
+        flash_attn_version=requested_fa_version,
     )
 
     results = []
@@ -1144,6 +1195,15 @@ def _run_mla_benchmark_batched(
             index_topk=index_topk if is_sparse else None,
             kv_cache_dtype=kv_cache_dtype,
         )
+
+        if requested_fa_version is not None:
+            actual_fa_version = getattr(impl, "fa_version", None)
+            if actual_fa_version != requested_fa_version:
+                raise RuntimeError(
+                    f"Decode backend '{backend}' requested FA version "
+                    f"{requested_fa_version}, got {actual_fa_version} from "
+                    f"{type(impl).__name__}."
+                )
 
         # Verify the actual prefill backend matches what was requested. The
         # selector + impl construction already raise on misuse; here we just
@@ -1213,6 +1273,7 @@ def _run_mla_benchmark_batched(
                     kv_cache_dtype=kv_cache_dtype,
                     output_scale=output_scale,
                     fuse_quant_op=fuse_quant_op,
+                    expected_phase=expected_phase,
                 )
                 results.append(result)
 
@@ -1243,6 +1304,7 @@ def run_mla_benchmark(
     sparse_mla_force_mqa: bool = False,
     output_scale: float | None = None,
     fuse_quant_op: bool = False,
+    expected_phase: str | None = None,
 ) -> BenchmarkResult | list[BenchmarkResult]:
     """
     Unified MLA benchmark runner for all backends.
@@ -1267,6 +1329,7 @@ def run_mla_benchmark(
         output_scale: Static per-tensor FP8 scale for prefill output (None = bf16).
         fuse_quant_op: With output_scale set, fuse the FP8 write into the prefill
             kernel vs a standalone post-quant kernel. See _run_single_benchmark.
+        expected_phase: If set, require exclusive decode or prefill metadata.
 
     Returns:
         BenchmarkResult (single mode) or list of BenchmarkResult (batched mode)
@@ -1298,6 +1361,7 @@ def run_mla_benchmark(
         sparse_mla_force_mqa=sparse_mla_force_mqa,
         output_scale=output_scale,
         fuse_quant_op=fuse_quant_op,
+        expected_phase=expected_phase,
     )
 
     # Return single result or list based on input

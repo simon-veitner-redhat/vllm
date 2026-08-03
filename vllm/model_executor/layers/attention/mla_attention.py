@@ -1899,6 +1899,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         self,
         block_table_tensor: torch.Tensor,
         seq_lens_device: torch.Tensor,
+        seq_lens_cpu: torch.Tensor | None,
         max_seq_len: int,
         query_start_loc_cpu: torch.Tensor,
         query_start_loc_device: torch.Tensor,
@@ -2030,6 +2031,11 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             decode_metadata = self._build_decode(
                 block_table_tensor=block_table_tensor[:num_decodes, ...],
                 seq_lens_device=seq_lens[:num_decodes],
+                seq_lens_cpu=(
+                    common_attn_metadata.seq_lens_cpu_upper_bound[:num_decodes]
+                    if common_attn_metadata.seq_lens_cpu_upper_bound is not None
+                    else None
+                ),
                 max_seq_len=max_seq_len,
                 query_start_loc_cpu=query_start_loc_cpu[: num_decodes + 1],
                 query_start_loc_device=query_start_loc[: num_decodes + 1],

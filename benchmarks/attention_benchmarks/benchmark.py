@@ -33,6 +33,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
+import torch
 import yaml
 from rich.console import Console
 from tqdm import tqdm
@@ -1255,6 +1256,11 @@ def main():
             "kv_lora_rank": args.kv_lora_rank,
             "qk_nope_head_dim": args.qk_nope_head_dim,
             "qk_rope_head_dim": args.qk_rope_head_dim,
+            "dtype": (
+                torch.bfloat16
+                if all(is_mla_backend(backend) for backend in backends)
+                else torch.float16
+            ),
         }
         all_results = run_model_parameter_sweep(
             backends,
@@ -1358,13 +1364,18 @@ def main():
                             profile_memory=args.profile_memory,
                             warmup_ms=args.warmup_ms,
                             prefill_backend=pb,
+                            dtype=torch.bfloat16,
                             kv_lora_rank=args.kv_lora_rank,
                             qk_nope_head_dim=args.qk_nope_head_dim,
                             qk_rope_head_dim=args.qk_rope_head_dim,
                             v_head_dim=args.v_head_dim,
                         )
 
-                        result = run_benchmark(config)
+                        result = run_benchmark(
+                            config,
+                            reorder_batch_threshold=-1,
+                            expected_phase="prefill",
+                        )
 
                         # Label result with prefill backend name for display
                         labeled_config = replace(result.config, backend=pb)
