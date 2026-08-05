@@ -117,11 +117,21 @@ def fa4_cutedsl_warmup(worker: Worker) -> None:
                 worker.execute_model,
                 worker.sample_tokens,
                 prefill_len + 2,
-                decode_prompt_len=max_warmup_tokens // 2,
+                decode_prompt_len=prefill_len,
                 num_decode_reqs=1,
                 decode_scheduled_tokens=2,
                 req_id_prefix=f"_fa4_fp8_warmup_{prefill_len}",
             )
+        run_mixed_prefill_decode_warmup(
+            runner,
+            worker.execute_model,
+            worker.sample_tokens,
+            prefill_lengths[-1] + 2,
+            decode_prompt_len=max_warmup_tokens // 2,
+            num_decode_reqs=1,
+            decode_scheduled_tokens=2,
+            req_id_prefix=f"_fa4_fp8_warmup_long_{max_warmup_tokens}",
+        )
     if vllm_config.model_config.use_mla:
         from vllm.v1.attention.backends.mla.flashattn_mla import (
             FlashAttnMLAMetadataBuilder,

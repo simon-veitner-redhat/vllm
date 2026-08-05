@@ -263,3 +263,77 @@ def test_v1_fa4_mla_warmup_covers_mixed_and_batch_one(monkeypatch):
             num_reqs=1,
         ),
     ]
+
+
+def test_v2_fa4_fp8_warmup_covers_persistent_tiles(monkeypatch):
+    mixed_warmup = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.warmup.run_mixed_prefill_decode_warmup",
+        mixed_warmup,
+    )
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(
+            flash_attn_version=4,
+            _hopper_fa4_fp8=True,
+        ),
+        model_config=SimpleNamespace(use_mla=False, max_model_len=8192),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+    )
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        vllm_config=config,
+        max_num_reqs=16,
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+        _dummy_run=MagicMock(),
+    )
+    worker = SimpleNamespace(
+        model_runner=runner,
+        use_v2_model_runner=True,
+        execute_model=MagicMock(),
+        sample_tokens=MagicMock(),
+    )
+
+    fa4_warmup.fa4_cutedsl_warmup(worker)
+
+    assert mixed_warmup.call_args_list == [
+        call(
+            runner,
+            worker.execute_model,
+            worker.sample_tokens,
+            18,
+            decode_prompt_len=16,
+            num_decode_reqs=1,
+            decode_scheduled_tokens=2,
+            req_id_prefix="_fa4_fp8_warmup_16",
+        ),
+        call(
+            runner,
+            worker.execute_model,
+            worker.sample_tokens,
+            19,
+            decode_prompt_len=17,
+            num_decode_reqs=1,
+            decode_scheduled_tokens=2,
+            req_id_prefix="_fa4_fp8_warmup_17",
+        ),
+        call(
+            runner,
+            worker.execute_model,
+            worker.sample_tokens,
+            19,
+            decode_prompt_len=4096,
+            num_decode_reqs=1,
+            decode_scheduled_tokens=2,
+            req_id_prefix="_fa4_fp8_warmup_long_8192",
+        ),
+        call(
+            runner,
+            worker.execute_model,
+            worker.sample_tokens,
+            11,
+            decode_prompt_len=4096,
+            num_decode_reqs=4,
+            decode_scheduled_tokens=2,
+            req_id_prefix="_fa4_warmup_8192",
+        ),
+    ]
