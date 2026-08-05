@@ -839,6 +839,19 @@ class Worker(WorkerBase):
 
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
+        if self.vllm_config.attention_config._hopper_fa4_fp8:
+            from vllm.vllm_flash_attn.flash_attn_interface import (
+                arm_flash_attn_compile_monitor,
+            )
+
+            inventory = arm_flash_attn_compile_monitor()
+            logger.info(
+                "FA4 warmup compile inventory: forward=%d, combine=%d, keys=%s",
+                len(inventory["forward"]["keys"]),
+                len(inventory["combine"]["keys"]),
+                inventory,
+            )
+
         from vllm.utils.jit_monitor import activate as activate_jit_monitor
 
         activate_jit_monitor(

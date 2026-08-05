@@ -47,6 +47,47 @@ except (ImportError, ModuleNotFoundError) as e:
 # isort: on
 
 DEFAULT_FA_VERSION = 2
+_fa4_compile_monitor_armed = False
+
+
+def get_flash_attn_compile_stats() -> dict:
+    from vllm.vllm_flash_attn.cute.interface import (
+        get_flash_attn_compile_stats as _get_stats,
+    )
+
+    return _get_stats()
+
+
+def arm_flash_attn_compile_monitor() -> dict:
+    """Return the warmup inventory, then reject later FA4 compilations."""
+    from vllm.vllm_flash_attn.cute.interface import (
+        reset_flash_attn_compile_stats,
+    )
+
+    global _fa4_compile_monitor_armed
+    inventory = get_flash_attn_compile_stats()
+    reset_flash_attn_compile_stats()
+    _fa4_compile_monitor_armed = True
+    return inventory
+
+
+def _check_flash_attn_compile_monitor() -> None:
+    if not _fa4_compile_monitor_armed:
+        return
+    stats = get_flash_attn_compile_stats()
+    if any(stats[kind]["compilations"] for kind in ("forward", "combine")):
+        raise RuntimeError(
+            f"FA4 compiled an attention kernel after the warmup closure: {stats}"
+        )
+
+
+def _hopper_fa4_fp8_enabled() -> bool:
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    return bool(
+        vllm_config is not None and vllm_config.attention_config._hopper_fa4_fp8
+    )
 
 
 def _is_fa2_supported() -> tuple[bool, str | None]:
@@ -399,6 +440,14 @@ def flash_attn_varlen_func(
         num_splits_dynamic_ptr = None
         if scheduler_metadata is not None and num_splits > 1:
             num_splits_dynamic_ptr = scheduler_metadata
+        hopper_fa4_fp8 = (
+            q.dtype
+            in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            )
+            and _hopper_fa4_fp8_enabled()
+        )
         out, softmax_lse, _, _ = _flash_attn_fwd(
             q,
             k,
@@ -424,10 +473,15 @@ def flash_attn_varlen_func(
             mask_mod=mask_mod,
             aux_tensors=aux_tensors,
             output_scale=output_scale,
+            q_descale=q_descale if hopper_fa4_fp8 else None,
+            k_descale=k_descale if hopper_fa4_fp8 else None,
+            v_descale=v_descale if hopper_fa4_fp8 else None,
             cp_world_size=cp_world_size,
             cp_rank=cp_rank,
             cp_tot_seqused_k=cp_tot_seqused_k,
         )
+        if hopper_fa4_fp8:
+            _check_flash_attn_compile_monitor()
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")
     return (out, softmax_lse) if return_softmax_lse else out

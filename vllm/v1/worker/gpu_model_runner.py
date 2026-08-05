@@ -983,9 +983,8 @@ class GPUModelRunner(
         """
         Re-initialize the KV cache and FP8 scales after waking from sleep.
         1. Zero out the KV cache tensors to remove garbage data from re-allocation.
-        2. Reset Attention layer scaling factors (_k_scale, _v_scale) to 1.0.
-          If these are left at 0.0 (default after wake_up), all KV cache values
-          become effectively zero, causing gibberish output.
+        2. Reset ordinary FP8 scaling factors to 1.0, or restore authoritative
+           Hopper FA4 FP8 checkpoint scales in place.
         """
         if not is_quantized_kv_cache(self.cache_config.cache_dtype):
             return
@@ -995,12 +994,38 @@ class GPUModelRunner(
             if cache_tensor is not None:
                 cache_tensor.zero_()
 
+        hopper_fa4_fp8 = self.vllm_config.attention_config._hopper_fa4_fp8
         k_attr_names = ("_k_scale", "k_scale")
         v_attr_names = ("_v_scale", "v_scale")
 
         attn_layers = self.compilation_config.static_forward_context
         for name, module in attn_layers.items():
             if isinstance(module, (Attention, MLAAttention)):
+                if hopper_fa4_fp8:
+                    values = getattr(module, "_authoritative_qkv_scales", None)
+                    if values is None:
+                        raise RuntimeError(
+                            f"Hopper FA4 FP8 authoritative scales missing for {name}"
+                        )
+                    q_value, k_value, v_value = values
+                    for attr, value in (
+                        ("_q_scale", q_value),
+                        ("q_scale", q_value),
+                        ("_k_scale", k_value),
+                        ("k_scale", k_value),
+                        ("_v_scale", v_value),
+                        ("v_scale", v_value),
+                    ):
+                        param = getattr(module, attr, None)
+                        if isinstance(param, torch.Tensor):
+                            param.fill_(value)
+                    module._q_scale_float = q_value
+                    module._k_scale_float = k_value
+                    module._v_scale_float = v_value
+                    module._k_scale_cpu.fill_(k_value)
+                    module._v_scale_cpu.fill_(v_value)
+                    continue
+
                 # TODO: Generally, scale is 1.0 if user uses on-the-fly fp8
                 # kvcache quant. However, to get better accuracy, compression
                 # frameworks like llm-compressors allow users to tune the

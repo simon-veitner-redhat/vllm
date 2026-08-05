@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
+
 import torch
 
 from vllm.logger import init_logger
@@ -79,6 +81,13 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             assert not hasattr(layer, "prob_scale")
             return
 
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        hopper_fa4_fp8 = bool(
+            vllm_config is not None and vllm_config.attention_config._hopper_fa4_fp8
+        )
+
         # Per-token-head quantized KV cache: scales are computed dynamically
         # per (token, head) in the kernel at cache-write time.  Checkpoint
         # scales are never used regardless of calculate_kv_scales.
@@ -130,6 +139,16 @@ class BaseKVCacheMethod(QuantizeMethodBase):
                     "Only support per-tensor scaling factor for fp8 KV cache"
                 )
 
+            if hopper_fa4_fp8 and (
+                not math.isfinite(k_scale)
+                or not math.isfinite(v_scale)
+                or k_scale <= 0.0
+                or v_scale <= 0.0
+            ):
+                raise ValueError(
+                    "Hopper FA4 FP8 requires finite positive static K/V scales"
+                )
+
             if layer.q_scale < 0.0:
                 logger.warning_once(
                     "Checkpoint does not provide a q scaling factor. "
@@ -154,7 +173,10 @@ class BaseKVCacheMethod(QuantizeMethodBase):
                     "scaling factors are properly set in the checkpoint."
                 )
 
-        if layer.q_scale > 0.0:
+        if hopper_fa4_fp8:
+            q_scale = k_scale
+            layer.calculate_kv_scales = False
+        elif layer.q_scale > 0.0:
             q_scale = layer.q_scale
             if current_platform.is_fp8_fnuz():
                 q_scale *= 2
@@ -186,6 +208,12 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         )
 
         layer._prob_scale.copy_(prob_scale)
+        if hopper_fa4_fp8:
+            layer._authoritative_qkv_scales = (
+                float(q_scale),
+                float(k_scale),
+                float(v_scale),
+            )
         if layer.kv_cache_dtype == "fp8" and (q_scale == 1.0 or prob_scale == 1.0):
             logger.warning_once(
                 f"Using uncalibrated q_scale {q_scale} and/or prob_scale "

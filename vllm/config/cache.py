@@ -81,6 +81,13 @@ class CacheConfig:
     bfloat16 instead, this is an invalid option for models that do not default
     to fp8.
     """
+    _checkpoint_implied_fp8: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        metadata={"preserve_on_replace": True},
+    )
+    """Whether ``auto`` resolved to FP8 from checkpoint metadata."""
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""
@@ -226,6 +233,7 @@ class CacheConfig:
             "user_specified_block_size",
             "user_specified_mamba_block_size",
             "_block_size_resolved",
+            "_checkpoint_implied_fp8",
             # Post-init/derived counters
             "num_gpu_blocks",
             "num_cpu_blocks",

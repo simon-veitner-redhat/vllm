@@ -82,6 +82,46 @@ def fa4_cutedsl_warmup(worker: Worker) -> None:
         vllm_config.scheduler_config.max_num_batched_tokens,
         vllm_config.model_config.max_model_len,
     )
+    if vllm_config.attention_config._hopper_fa4_fp8:
+        # Close ordinary and dynamic decode, both persistent single-request
+        # tiles, and both dynamic mixed-varlen tiles before graph capture.
+        decode_shapes = (
+            (min(4, runner.max_num_reqs), max_warmup_tokens // 2),
+            (min(16, runner.max_num_reqs), min(16, max_warmup_tokens)),
+        )
+        for num_reqs, context_len in decode_shapes:
+            runner._dummy_run(
+                num_reqs,
+                force_attention=True,
+                uniform_decode=True,
+                is_profile=True,
+                skip_eplb=True,
+                profile_seq_lens=context_len,
+                num_reqs=num_reqs,
+            )
+        prefill_lengths = sorted(
+            {min(16, max_warmup_tokens), min(17, max_warmup_tokens)}
+        )
+        for query_len in prefill_lengths:
+            runner._dummy_run(
+                query_len,
+                force_attention=True,
+                is_profile=True,
+                skip_eplb=True,
+                profile_seq_lens=query_len,
+                num_reqs=1,
+            )
+        for prefill_len in prefill_lengths:
+            run_mixed_prefill_decode_warmup(
+                runner,
+                worker.execute_model,
+                worker.sample_tokens,
+                prefill_len + 2,
+                decode_prompt_len=max_warmup_tokens // 2,
+                num_decode_reqs=1,
+                decode_scheduled_tokens=2,
+                req_id_prefix=f"_fa4_fp8_warmup_{prefill_len}",
+            )
     if vllm_config.model_config.use_mla:
         from vllm.v1.attention.backends.mla.flashattn_mla import (
             FlashAttnMLAMetadataBuilder,

@@ -1950,6 +1950,10 @@ class EngineArgs:
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
         )
+        cache_config._checkpoint_implied_fp8 = (
+            self.kv_cache_dtype == "auto"
+            and resolved_cache_dtype in ("fp8", "fp8_e4m3")
+        )
 
         if resolved_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
