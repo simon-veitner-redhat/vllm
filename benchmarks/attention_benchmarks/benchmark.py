@@ -637,8 +637,35 @@ def main():
     # Output
     parser.add_argument("--output-csv", help="Save to CSV")
     parser.add_argument("--output-json", help="Save to JSON")
+    parser.add_argument(
+        "--validate-config-only",
+        action="store_true",
+        help="Validate prepared-FP8 config/manifests without initializing CUDA.",
+    )
+    parser.add_argument(
+        "--prepared-fp8",
+        action="store_true",
+        help="Opt in to hash-verified prepared-cache FP8 benchmarking.",
+    )
+    parser.add_argument("--prepared-manifest")
+    parser.add_argument("--prepared-manifest-sha256")
+    parser.add_argument("--scale-manifest")
+    parser.add_argument("--scale-manifest-sha256")
+    parser.add_argument("--model-path")
+    parser.add_argument("--tokenizer-path")
+    parser.add_argument("--rng-seed", type=int)
+    parser.add_argument("--timing-rep-ms", type=int)
+    parser.add_argument("--untimed-closure-replays", type=int)
+    parser.add_argument("--arm-order", nargs="+")
+    parser.add_argument("--preflight-layer", type=int)
+    parser.add_argument("--input-scale-multiplier", type=float)
+    parser.add_argument("--input-clamp-multiplier", type=float)
 
     args = parser.parse_args()
+    args.prepared_batch_specs_explicit = args.batch_specs is not None
+    args.prepared_backends_explicit = (
+        args.backend is not None or args.backends is not None
+    )
 
     console = Console()
     console.print("[bold cyan]vLLM Attention Benchmark[/]")
@@ -789,7 +816,7 @@ def main():
 
     # Re-exec under ncu if --ncu-profile and not already inside ncu. This runs
     # after YAML processing so ncu_profile set via config file is honored.
-    if args.ncu_profile and "_NCU_INNER" not in os.environ:
+    if args.ncu_profile and not args.prepared_fp8 and "_NCU_INNER" not in os.environ:
         ncu = shutil.which("ncu")
         if ncu is None:
             print("Error: 'ncu' not found in PATH", file=sys.stderr)
@@ -812,6 +839,34 @@ def main():
         env["_NCU_INNER"] = "1"
         print(f"Launching: {' '.join(cmd)}")
         sys.exit(subprocess.call(cmd, env=env))
+
+    if args.prepared_fp8:
+        if not args.config:
+            parser.error("--prepared-fp8 requires --config")
+        from prepared_fp8_runner import (
+            apply_prepared_cli_overrides,
+            run_campaign,
+            validate_prepared_config,
+        )
+
+        try:
+            prepared_yaml = apply_prepared_cli_overrides(yaml_config, args)
+            prepared_config = validate_prepared_config(prepared_yaml, args.config)
+        except (KeyError, TypeError, ValueError) as error:
+            parser.error(str(error))
+        if args.validate_config_only:
+            console.print("[green]Prepared-FP8 config and manifests are valid.[/]")
+            return
+        if args.ncu_profile:
+            parser.error("use fp8_ncu.py for prepared-cache NCU capture")
+        if not args.output_json:
+            parser.error("prepared_fp8 requires --output-json")
+        init_workspace_manager(args.device)
+        run_campaign(prepared_config, args.output_json)
+        console.print(f"[green]Saved prepared-FP8 raw results to {args.output_json}[/]")
+        return
+    if args.validate_config_only:
+        parser.error("--validate-config-only requires --prepared-fp8")
 
     # Handle CLI-based parameter sweep (if not from YAML)
     if (

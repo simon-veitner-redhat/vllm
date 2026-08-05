@@ -141,15 +141,21 @@ def _build_common_attn_metadata(
 def _create_vllm_config(
     config: BenchmarkConfig,
     max_num_blocks: int,
+    *,
+    model_path: str | None = None,
+    tokenizer_path: str | None = None,
+    model_max_model_len: int | None = None,
 ) -> VllmConfig:
     """Create a VllmConfig for benchmarking with mock model methods."""
+    model = model_path or "meta-llama/Meta-Llama-3-8B"
+    tokenizer = tokenizer_path or model
     model_config = ModelConfig(
-        model="meta-llama/Meta-Llama-3-8B",
-        tokenizer="meta-llama/Meta-Llama-3-8B",
+        model=model,
+        tokenizer=tokenizer,
         trust_remote_code=False,
         dtype=config.dtype,
         seed=0,
-        max_model_len=1024,
+        max_model_len=model_max_model_len or 1024,
     )
 
     cache_config = CacheConfig(

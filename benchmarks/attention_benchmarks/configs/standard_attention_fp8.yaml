@@ -1,0 +1,26 @@
+# Reusable FlashAttention FP8-cache comparison. Prepared-cache campaigns add
+# their manifests, hashes, generation policy, arm order, and repetitions via
+# explicit CLI options.
+
+model:
+  num_layers: 32
+  num_q_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  block_size: 16
+  max_model_len: 8192
+
+batch_specs:
+  - "q512"
+  - "q2k"
+  - "8q1s1k"
+  - "16q1s2k"
+
+backends:
+  - FLASH_ATTN_FA3
+  - FLASH_ATTN_FA4
+
+device: "cuda:0"
+kv_cache_dtype: fp8
+cuda_graphs: true
+profile_memory: false
