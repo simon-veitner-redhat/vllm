@@ -23,6 +23,20 @@ if TYPE_CHECKING:
 _ROCM_FLASH_ATTN_AVAILABLE = False
 
 
+def _model_uses_attention_sinks(model_config: Any) -> bool:
+    text_config = model_config.hf_text_config
+    dflash_config = getattr(text_config, "dflash_config", None)
+    return bool(
+        getattr(text_config, "attention_sink", False)
+        or getattr(text_config, "swa_attention_sink_enabled", False)
+        or getattr(text_config, "add_swa_attention_sink_bias", False)
+        or (
+            isinstance(dflash_config, dict)
+            and dflash_config.get("attention_sink_bias", False)
+        )
+    )
+
+
 def _hopper_fa4_fp8_fallback_reasons(vllm_config: "VllmConfig") -> list[str]:
     """Return ordered failures of the supported Hopper FA4 FP8 shape."""
     attention = vllm_config.attention_config
@@ -56,10 +70,29 @@ def _hopper_fa4_fp8_fallback_reasons(vllm_config: "VllmConfig") -> list[str]:
         reasons.append("query heads")
     if model.get_num_kv_heads(parallel) != 8:
         reasons.append("GQA")
-    if model.use_mla or model.is_multimodal_model or model.is_encoder_decoder:
+    if (
+        model.use_mla
+        or model.is_diffusion
+        or model.is_multimodal_model
+        or model.is_encoder_decoder
+        or model.runner_type != "generate"
+    ):
         reasons.append("attention kind")
-    if cache.sliding_window is not None:
+    if attention.use_non_causal:
+        reasons.append("non-causal attention")
+    if cache.sliding_window is not None or model.get_sliding_window() is not None:
         reasons.append("sliding window")
+    if model.rswa_window is not None:
+        reasons.append("mask modification")
+    if model.is_mm_prefix_lm:
+        reasons.append("MM-prefix mask")
+    if getattr(model.hf_text_config, "attn_logit_softcapping", None) not in (
+        None,
+        0.0,
+    ):
+        reasons.append("attention softcap")
+    if _model_uses_attention_sinks(model):
+        reasons.append("attention sinks")
     if cache.enable_prefix_caching:
         reasons.append("prefix caching")
     if cache.calculate_kv_scales:
@@ -179,7 +212,14 @@ def resolve_flash_attn_version(vllm_config: "VllmConfig") -> int | None:
         "fp8_e4m3",
     )
     if is_hopper_fp8:
+        if capability.minor != 0:
+            reasons.append("device capability")
         reasons.extend(_hopper_fa4_fp8_fallback_reasons(vllm_config))
+        if vllm_config.model_config.dtype != torch.bfloat16:
+            raise ValueError(
+                "Hopper FA4 FP8 requires BF16 model activations and output; "
+                "FP16 activation output adaptation is not supported"
+            )
     if _uses_generic_sparse_mla_fa3(vllm_config):
         reasons.append("FA4 does not support the generic sparse-MLA FA3 route")
 

@@ -196,6 +196,21 @@ def _capture(prepared):
     return graph
 
 
+def _reset_compile_monitor():
+    from vllm.vllm_flash_attn.flash_attn_interface import (
+        disarm_flash_attn_compile_monitor,
+    )
+
+    disarm_flash_attn_compile_monitor()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_compile_monitor():
+    _reset_compile_monitor()
+    yield
+    _reset_compile_monitor()
+
+
 @pytest.mark.parametrize("case", GRAPH_CASES, ids=lambda case: case.name)
 def test_graph_replay(case, fp8_scale_manifest, fp8_record):
     from vllm.vllm_flash_attn.flash_attn_interface import (
@@ -356,7 +371,7 @@ def test_stream_concurrency(fp8_scale_manifest, fp8_record):
 
 
 def _attention_module(q_value, k_value, v_value):
-    from vllm.attention.layer import Attention
+    from vllm.model_executor.layers.attention import Attention
 
     module = Attention.__new__(Attention)
     torch.nn.Module.__init__(module)
@@ -588,22 +603,11 @@ def _prepare_non_fp8(dtype, form):
         value=value,
         expected_key=expected_key,
         expected_value=expected_value,
+        graph_inputs=(table_cuda, cu_q, used_k),
         output=output,
         lse=lse,
         graph=graph,
     )
-
-
-def _rebuild_non_fp8(prepared):
-    offset = 0
-    key_flat = prepared.key.reshape(-1, KV_HEADS, HEAD_DIM)
-    value_flat = prepared.value.reshape(-1, KV_HEADS, HEAD_DIM)
-    for length, slots in zip(
-        prepared.case.k_lens, prepared.per_sequence, strict=True
-    ):
-        key_flat[list(slots)] = prepared.logical_k[offset : offset + length].cuda()
-        value_flat[list(slots)] = prepared.logical_v[offset : offset + length].cuda()
-        offset += length
 
 
 def _assert_non_fp8_bounds(prepared, dtype):
@@ -709,7 +713,7 @@ def test_non_fp8_graph_replay(dtype, form):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_non_fp8_scale_lifecycle(dtype, fp8_record):
-    from vllm.attention.layer import Attention
+    from vllm.model_executor.layers.attention import Attention
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
     module = Attention.__new__(Attention)
@@ -740,7 +744,8 @@ def test_non_fp8_scale_lifecycle(dtype, fp8_record):
     prepared.value.zero_()
     assert torch.count_nonzero(prepared.key) == 0
     assert torch.count_nonzero(prepared.value) == 0
-    _rebuild_non_fp8(prepared)
+    prepared.key.copy_(prepared.expected_key)
+    prepared.value.copy_(prepared.expected_value)
     assert torch.equal(prepared.key, prepared.expected_key)
     assert torch.equal(prepared.value, prepared.expected_value)
     prepared.graph.replay()

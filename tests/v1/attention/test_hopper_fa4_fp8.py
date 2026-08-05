@@ -13,7 +13,9 @@ import pytest
 import torch
 
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.attention.attention import set_default_quant_scales
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends import fa_utils
@@ -78,8 +80,8 @@ def _values(generator, shape, scale):
 
 
 def _quantize(values, scale):
-    op = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
     with set_current_vllm_config(VllmConfig()):
+        op = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
         result, returned_scale = op(
             values.reshape(-1, HEAD_DIM).cuda(), scale.reshape(1)
         )
@@ -123,7 +125,7 @@ def _current_config(enabled=True):
 
 def _implementation():
     from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
-    from vllm.v1.attention.backends.utils import AttentionType
+    from vllm.v1.attention.backend import AttentionType
 
     impl = object.__new__(FlashAttentionImpl)
     impl.num_heads = HEADS
@@ -331,6 +333,7 @@ def _routing_config():
         backend=AttentionBackendEnum.FLASH_ATTN,
         backend_per_kind={},
         flash_attn_version=4,
+        use_non_causal=False,
         _flash_attn_version_fallback=False,
         _flash_attn_version_required=False,
         _hopper_fa4_fp8=False,
@@ -362,15 +365,24 @@ def _routing_config():
     }
     model = SimpleNamespace(
         dtype=torch.bfloat16,
-        hf_text_config=SimpleNamespace(),
+        hf_text_config=SimpleNamespace(
+            attn_logit_softcapping=None,
+            swa_attention_sink_enabled=False,
+            add_swa_attention_sink_bias=False,
+            dflash_config=None,
+        ),
         model_arch_config=SimpleNamespace(quantization_config=quantization),
         use_mla=False,
         is_diffusion=False,
         architecture="LlamaForCausalLM",
         is_multimodal_model=False,
         is_encoder_decoder=False,
+        is_mm_prefix_lm=False,
+        runner_type="generate",
         disable_cascade_attn=True,
+        rswa_window=None,
         get_head_size=lambda: 128,
+        get_sliding_window=lambda: None,
         get_num_attention_heads=lambda parallel: 32,
         get_num_kv_heads=lambda parallel: 8,
     )
@@ -446,7 +458,13 @@ def test_routing(route, hopper, monkeypatch, fp8_record):
     elif route == "head-dim-512":
         config.model_config.get_head_size = lambda: 512
 
-    if route == "head-dim-512":
+    if route == "fp16-output":
+        with pytest.raises(ValueError, match="requires BF16"):
+            fa_utils.resolve_flash_attn_version(config)
+        assert config.attention_config.flash_attn_version == 4
+        assert not config.attention_config._flash_attn_version_fallback
+        effective = "startup-error"
+    elif route == "head-dim-512":
         with pytest.raises(ValueError, match="requires FA4"):
             fa_utils.resolve_flash_attn_version(config)
         effective = "startup-error"
@@ -474,9 +492,6 @@ def test_routing(route, hopper, monkeypatch, fp8_record):
             reason = warning.call_args.args[1]
             if route == "parallel-and-page":
                 assert reason == "page, TP, PP, DCP"
-            elif route == "fp16-output":
-                assert reason == "activation/output dtype"
-                assert not config.attention_config._hopper_fa4_fp8
     fp8_record(
         {
             "id": route,
@@ -487,6 +502,89 @@ def test_routing(route, hopper, monkeypatch, fp8_record):
             "admitted": config.attention_config._hopper_fa4_fp8,
         }
     )
+
+
+@pytest.mark.parametrize(
+    ("feature", "expected_reason"),
+    [
+        ("non-causal", "non-causal attention"),
+        ("sliding-window", "sliding window"),
+        ("mask-modification", "mask modification"),
+        ("diffusion", "attention kind"),
+        ("pooling", "attention kind"),
+        ("mm-prefix", "MM-prefix mask"),
+        ("softcap", "attention softcap"),
+        ("sinks", "attention sinks"),
+    ],
+)
+def test_hopper_fa4_fp8_rejects_attention_features(
+    feature, expected_reason, hopper, monkeypatch
+):
+    config = _routing_config()
+    warning = MagicMock()
+    monkeypatch.setattr(fa_utils.logger, "warning_once", warning)
+
+    if feature == "non-causal":
+        config.attention_config.use_non_causal = True
+    elif feature == "sliding-window":
+        config.model_config.get_sliding_window = lambda: 4096
+    elif feature == "mask-modification":
+        config.model_config.rswa_window = 4096
+    elif feature == "diffusion":
+        config.model_config.is_diffusion = True
+    elif feature == "pooling":
+        config.model_config.runner_type = "pooling"
+    elif feature == "mm-prefix":
+        config.model_config.is_mm_prefix_lm = True
+    elif feature == "softcap":
+        config.model_config.hf_text_config.attn_logit_softcapping = 30.0
+    elif feature == "sinks":
+        config.model_config.hf_text_config.add_swa_attention_sink_bias = True
+
+    assert fa_utils.resolve_flash_attn_version(config) == 3
+    assert warning.call_args.args[1] == expected_reason
+    assert config.attention_config._flash_attn_version_fallback
+    assert not config.attention_config._hopper_fa4_fp8
+
+
+def test_hopper_fa4_fp8_requires_exact_sm90(hopper, monkeypatch):
+    config = _routing_config()
+    warning = MagicMock()
+    monkeypatch.setattr(fa_utils.logger, "warning_once", warning)
+    monkeypatch.setattr(
+        fa_utils.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(major=9, minor=1),
+    )
+
+    assert fa_utils.resolve_flash_attn_version(config) == 3
+    assert warning.call_args.args[1] == "device capability"
+    assert config.attention_config._flash_attn_version_fallback
+    assert not config.attention_config._hopper_fa4_fp8
+
+
+@pytest.mark.parametrize(
+    ("k_scale", "v_scale"),
+    [(0.3, -1.0), (-1.0, -1.0), (float("nan"), 0.4), (0.3, 0.0)],
+)
+def test_hopper_fa4_fp8_rejects_missing_checkpoint_kv_scales(k_scale, v_scale):
+    layer = torch.nn.Module()
+    set_default_quant_scales(layer, register_buffer=True)
+    layer.kv_cache_dtype = "fp8"
+    layer.calculate_kv_scales = False
+    method = BaseKVCacheMethod(quant_config=None)
+    method.create_weights(layer)
+    layer.k_scale.weight_loader(layer.k_scale, torch.tensor(k_scale))
+    layer.v_scale.weight_loader(layer.v_scale, torch.tensor(v_scale))
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(_hopper_fa4_fp8=True)
+    )
+
+    with (
+        set_current_vllm_config(config),
+        pytest.raises(ValueError, match="separate finite positive"),
+    ):
+        method.process_weights_after_loading(layer)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])

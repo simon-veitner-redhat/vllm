@@ -110,7 +110,25 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             is_quantized_kv_cache(layer.kv_cache_dtype)
             and not layer.calculate_kv_scales
         ):
-            if layer.k_scale > 0.0 and layer.v_scale > 0.0:
+            if hopper_fa4_fp8:
+                k_scale = layer.k_scale.detach().to("cpu").tolist()
+                v_scale = layer.v_scale.detach().to("cpu").tolist()
+                if (
+                    not isinstance(k_scale, float)
+                    or not isinstance(v_scale, float)
+                    or not math.isfinite(k_scale)
+                    or not math.isfinite(v_scale)
+                    or k_scale <= 0.0
+                    or v_scale <= 0.0
+                ):
+                    raise ValueError(
+                        "Hopper FA4 FP8 requires separate finite positive "
+                        "static checkpoint K/V scales"
+                    )
+                if current_platform.is_fp8_fnuz():
+                    k_scale *= 2
+                    v_scale *= 2
+            elif layer.k_scale > 0.0 and layer.v_scale > 0.0:
                 # We prefer to use separate k_scale and v_scale if present
                 k_scale = layer.k_scale.to("cpu").tolist()
                 v_scale = layer.v_scale.to("cpu").tolist()
@@ -137,16 +155,6 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             if not isinstance(k_scale, float) or not isinstance(v_scale, float):
                 raise ValueError(
                     "Only support per-tensor scaling factor for fp8 KV cache"
-                )
-
-            if hopper_fa4_fp8 and (
-                not math.isfinite(k_scale)
-                or not math.isfinite(v_scale)
-                or k_scale <= 0.0
-                or v_scale <= 0.0
-            ):
-                raise ValueError(
-                    "Hopper FA4 FP8 requires finite positive static K/V scales"
                 )
 
             if layer.q_scale < 0.0:

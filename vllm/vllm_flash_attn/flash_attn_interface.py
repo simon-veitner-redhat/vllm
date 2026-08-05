@@ -57,8 +57,8 @@ def _get_flash_attn_compile_cache_key_sets() -> dict[str, frozenset[object]]:
     )
 
     return {
-        "forward": frozenset(_flash_attn_fwd.compile_cache),
-        "combine": frozenset(_flash_attn_fwd_combine.compile_cache),
+        "forward": frozenset(_flash_attn_fwd.compile_cache.cache),
+        "combine": frozenset(_flash_attn_fwd_combine.compile_cache.cache),
     }
 
 
@@ -83,6 +83,12 @@ def arm_flash_attn_compile_monitor() -> dict[str, tuple[str, ...]]:
     global _fa4_compile_cache_baseline
     _fa4_compile_cache_baseline = _get_flash_attn_compile_cache_key_sets()
     return _format_flash_attn_compile_cache_keys(_fa4_compile_cache_baseline)
+
+
+def disarm_flash_attn_compile_monitor() -> None:
+    """Clear the process-local warmup baseline before a new engine warmup."""
+    global _fa4_compile_cache_baseline
+    _fa4_compile_cache_baseline = None
 
 
 def _check_flash_attn_compile_monitor() -> None:

@@ -446,6 +446,8 @@ def initialize_backend(
         _get_backend_config,
     )
     from vllm.config import set_current_vllm_config
+    from vllm.v1.attention.backends.fa_utils import resolve_flash_attn_version
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.kv_cache_interface import FullAttentionSpec
 
     version = {"FLASH_ATTN_FA3": 3, "FLASH_ATTN_FA4": 4}[backend]
@@ -458,7 +460,14 @@ def initialize_backend(
         tokenizer_path=config.tokenizer_path,
         model_max_model_len=config.max_model_len,
     )
+    vllm_config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN
     vllm_config.attention_config.flash_attn_version = version
+    vllm_config.cache_config.enable_prefix_caching = False
+    effective_version = resolve_flash_attn_version(vllm_config)
+    _require(
+        effective_version == version,
+        f"{backend} resolved FA{effective_version}, expected FA{version}",
+    )
     device = torch.device(config.device)
     with set_current_vllm_config(vllm_config):
         backend_class, impl, template_layer = _create_backend_impl(

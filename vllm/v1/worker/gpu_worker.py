@@ -466,6 +466,17 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
+        if self.vllm_config.attention_config._hopper_fa4_fp8:
+            from vllm.vllm_flash_attn.flash_attn_interface import (
+                disarm_flash_attn_compile_monitor,
+            )
+
+            disarm_flash_attn_compile_monitor()
+            with set_current_vllm_config(self.vllm_config):
+                return self._determine_available_memory()
+        return self._determine_available_memory()
+
+    def _determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
 
@@ -685,6 +696,12 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        if self.vllm_config.attention_config._hopper_fa4_fp8:
+            with set_current_vllm_config(self.vllm_config):
+                return self._compile_or_warm_up_model()
+        return self._compile_or_warm_up_model()
+
+    def _compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -1097,9 +1114,15 @@ class Worker(WorkerBase):
             )
 
         with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
+            if self.vllm_config.attention_config._hopper_fa4_fp8:
+                with set_current_vllm_config(self.vllm_config):
+                    output = self.model_runner.execute_model(
+                        scheduler_output, intermediate_tensors
+                    )
+            else:
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model

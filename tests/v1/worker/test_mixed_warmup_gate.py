@@ -3,12 +3,15 @@
 """Tests for scheduler-realistic attention warmup."""
 
 import sys
+from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import pytest
 
+from vllm.config import get_current_vllm_config_or_none, set_current_vllm_config
 from vllm.model_executor.warmup import fa4_cutedsl_warmup as fa4_warmup
+from vllm.v1.worker import gpu_worker
 from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
 
 
@@ -62,6 +65,149 @@ def test_mixed_warmup_builds_multiple_decodes():
     assert sorted(mixed.num_scheduled_tokens.values()) == [2, 2, 5]
     assert len(outputs[3].finished_req_ids) == 3
     assert connector.set_disabled.call_args_list == [call(True), call(False)]
+
+
+@pytest.mark.parametrize("hopper_fa4_fp8", [True, False])
+def test_fa4_fp8_warmup_config_context(monkeypatch, hopper_fa4_fp8):
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(_hopper_fa4_fp8=hopper_fa4_fp8),
+    )
+    outer_config = SimpleNamespace(
+        attention_config=SimpleNamespace(_hopper_fa4_fp8=False)
+    )
+    worker = object.__new__(gpu_worker.Worker)
+    worker.vllm_config = config
+    observed = []
+
+    def observe_fa4_dispatch(_):
+        from vllm.vllm_flash_attn.flash_attn_interface import (
+            _hopper_fa4_fp8_enabled,
+        )
+
+        observed.append(
+            (get_current_vllm_config_or_none(), _hopper_fa4_fp8_enabled())
+        )
+
+    monkeypatch.setattr(
+        gpu_worker.Worker,
+        "_compile_or_warm_up_model",
+        observe_fa4_dispatch,
+    )
+
+    with set_current_vllm_config(outer_config):
+        gpu_worker.Worker.compile_or_warm_up_model(worker)
+        assert get_current_vllm_config_or_none() is outer_config
+
+    expected = config if hopper_fa4_fp8 else outer_config
+    assert observed == [(expected, hopper_fa4_fp8)]
+
+
+@pytest.mark.parametrize("hopper_fa4_fp8", [True, False])
+def test_fa4_fp8_memory_profile_config_context(monkeypatch, hopper_fa4_fp8):
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(_hopper_fa4_fp8=hopper_fa4_fp8),
+    )
+    outer_config = SimpleNamespace(
+        attention_config=SimpleNamespace(_hopper_fa4_fp8=False)
+    )
+    worker = object.__new__(gpu_worker.Worker)
+    worker.vllm_config = config
+    observed = []
+
+    def observe(label):
+        def inner(_):
+            observed.append((label, get_current_vllm_config_or_none()))
+            return 1
+
+        return inner
+
+    monkeypatch.setattr(
+        gpu_worker.Worker,
+        "_determine_available_memory",
+        observe("worker"),
+    )
+    with set_current_vllm_config(outer_config):
+        assert gpu_worker.Worker.determine_available_memory(worker) == 1
+        assert get_current_vllm_config_or_none() is outer_config
+
+    expected = config if hopper_fa4_fp8 else outer_config
+    assert observed == [("worker", expected)]
+
+
+@pytest.mark.parametrize("hopper_fa4_fp8", [True, False])
+def test_fa4_fp8_memory_profile_compile_monitor_reset(monkeypatch, hopper_fa4_fp8):
+    from vllm.vllm_flash_attn import flash_attn_interface
+
+    sentinel = {"forward": frozenset({object()}), "combine": frozenset()}
+    flash_attn_interface._fa4_compile_cache_baseline = sentinel
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(_hopper_fa4_fp8=hopper_fa4_fp8),
+    )
+    worker = object.__new__(gpu_worker.Worker)
+    worker.vllm_config = config
+    observed = []
+    monkeypatch.setattr(
+        gpu_worker.Worker,
+        "_determine_available_memory",
+        lambda _: observed.append(
+            flash_attn_interface._fa4_compile_cache_baseline
+        )
+        or 1,
+    )
+
+    assert gpu_worker.Worker.determine_available_memory(worker) == 1
+
+    assert observed == [None if hopper_fa4_fp8 else sentinel]
+    flash_attn_interface.disarm_flash_attn_compile_monitor()
+
+
+@pytest.mark.parametrize("hopper_fa4_fp8", [True, False])
+def test_fa4_fp8_execute_model_config_context(monkeypatch, hopper_fa4_fp8):
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(_hopper_fa4_fp8=hopper_fa4_fp8),
+        compilation_config=SimpleNamespace(
+            pass_config=SimpleNamespace(enable_sp=False)
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+    )
+    outer_config = SimpleNamespace(
+        attention_config=SimpleNamespace(_hopper_fa4_fp8=False)
+    )
+    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=1)
+    observed = []
+
+    def observe_fa4_dispatch(*args):
+        from vllm.vllm_flash_attn.flash_attn_interface import (
+            _hopper_fa4_fp8_enabled,
+        )
+
+        observed.append(
+            (args, get_current_vllm_config_or_none(), _hopper_fa4_fp8_enabled())
+        )
+
+    worker = object.__new__(gpu_worker.Worker)
+    worker.vllm_config = config
+    worker._pp_send_work = []
+    worker.use_v2_model_runner = True
+    worker.model_runner = SimpleNamespace(
+        execute_model=observe_fa4_dispatch,
+        is_pooling_model=False,
+    )
+    worker.annotate_profile = lambda _: nullcontext()
+    monkeypatch.setattr(
+        gpu_worker,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True),
+    )
+
+    with set_current_vllm_config(outer_config):
+        assert gpu_worker.Worker.execute_model(worker, scheduler_output) is None
+        assert get_current_vllm_config_or_none() is outer_config
+
+    expected = config if hopper_fa4_fp8 else outer_config
+    assert observed == [
+        ((scheduler_output, None), expected, hopper_fa4_fp8)
+    ]
 
 
 def test_v1_fa4_mla_warmup_covers_mixed_and_batch_one(monkeypatch):
