@@ -200,7 +200,7 @@ def _capture(prepared):
 def test_graph_replay(case, fp8_scale_manifest, fp8_record):
     from vllm.vllm_flash_attn.flash_attn_interface import (
         arm_flash_attn_compile_monitor,
-        get_flash_attn_compile_stats,
+        get_flash_attn_compile_cache_keys,
     )
 
     prepared = _prepare_graph(case, fp8_scale_manifest)
@@ -253,9 +253,8 @@ def test_graph_replay(case, fp8_scale_manifest, fp8_record):
             assert nrms <= 0.025
             sequence_nrms.append(nrms)
         q_base += q_len
-    stats = get_flash_attn_compile_stats()
-    assert stats["forward"]["compilations"] == 0
-    assert stats["combine"]["compilations"] == 0
+    post_warmup_keys = get_flash_attn_compile_cache_keys()
+    assert post_warmup_keys == inventory
     fp8_record(
         {
             "id": case.name,
@@ -278,8 +277,8 @@ def test_graph_replay(case, fp8_scale_manifest, fp8_record):
             "sequence_output_nrms": sequence_nrms,
             "capture_count": 1,
             "replay_count": 10,
-            "warmup_inventory": inventory,
-            "post_warmup_compile_stats": stats,
+            "warmup_compile_cache_keys": inventory,
+            "post_warmup_compile_cache_keys": post_warmup_keys,
             "requested_version": 4,
             "effective_version": 4,
         }
@@ -288,7 +287,8 @@ def test_graph_replay(case, fp8_scale_manifest, fp8_record):
 
 def test_stream_concurrency(fp8_scale_manifest, fp8_record):
     from vllm.vllm_flash_attn.flash_attn_interface import (
-        get_flash_attn_compile_stats,
+        arm_flash_attn_compile_monitor,
+        get_flash_attn_compile_cache_keys,
     )
 
     prefill_case = GraphCase(
@@ -320,6 +320,7 @@ def test_stream_concurrency(fp8_scale_manifest, fp8_record):
     with set_current_vllm_config(helpers._current_config()):
         prefill_serial = _forward(prefill).clone()
         decode_serial = _forward(decode).clone()
+    warmup_keys = arm_flash_attn_compile_monitor()
     streams = (torch.cuda.Stream(), torch.cuda.Stream())
     prefill_outputs = []
     decode_outputs = []
@@ -337,9 +338,8 @@ def test_stream_concurrency(fp8_scale_manifest, fp8_record):
     torch.cuda.synchronize()
     assert all(torch.equal(output, prefill_serial) for output in prefill_outputs)
     assert all(torch.equal(output, decode_serial) for output in decode_outputs)
-    stats = get_flash_attn_compile_stats()
-    assert stats["forward"]["compilations"] == 0
-    assert stats["combine"]["compilations"] == 0
+    post_warmup_keys = get_flash_attn_compile_cache_keys()
+    assert post_warmup_keys == warmup_keys
     fp8_record(
         {
             "id": "two-stream-overlap",
@@ -349,7 +349,8 @@ def test_stream_concurrency(fp8_scale_manifest, fp8_record):
             "prefill_output_hash": helpers._hash(prefill.output),
             "decode_output_hash": helpers._hash(decode.output),
             "independent_caches": prefill.kv_cache.data_ptr() != decode.kv_cache.data_ptr(),
-            "post_warmup_compile_stats": stats,
+            "warmup_compile_cache_keys": warmup_keys,
+            "post_warmup_compile_cache_keys": post_warmup_keys,
         }
     )
 
@@ -373,7 +374,8 @@ def _attention_module(q_value, k_value, v_value):
 
 def test_sleep_wake(fp8_scale_manifest, fp8_record):
     from vllm.vllm_flash_attn.flash_attn_interface import (
-        get_flash_attn_compile_stats,
+        arm_flash_attn_compile_monitor,
+        get_flash_attn_compile_cache_keys,
     )
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -399,6 +401,7 @@ def test_sleep_wake(fp8_scale_manifest, fp8_record):
     prepared = _prepare_graph(case, fp8_scale_manifest)
     prepared.layer = modules[f"layer-{helpers.SEED_LAYERS[case.seed]}"]
     graph = _capture(prepared)
+    warmup_keys = arm_flash_attn_compile_monitor()
     before = prepared.output.clone()
     cache_before = helpers._hash(prepared.kv_cache)
 
@@ -463,9 +466,8 @@ def test_sleep_wake(fp8_scale_manifest, fp8_record):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(prepared.output, before)
-    stats = get_flash_attn_compile_stats()
-    assert stats["forward"]["compilations"] == 0
-    assert stats["combine"]["compilations"] == 0
+    post_warmup_keys = get_flash_attn_compile_cache_keys()
+    assert post_warmup_keys == warmup_keys
     fp8_record(
         {
             "id": "sleep-wake",
@@ -478,7 +480,8 @@ def test_sleep_wake(fp8_scale_manifest, fp8_record):
             "cache_rebuilt": True,
             "graph_reused": True,
             "output_hash": helpers._hash(prepared.output),
-            "post_warmup_compile_stats": stats,
+            "warmup_compile_cache_keys": warmup_keys,
+            "post_warmup_compile_cache_keys": post_warmup_keys,
         }
     )
 
