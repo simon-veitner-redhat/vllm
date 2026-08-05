@@ -47,37 +47,53 @@ except (ImportError, ModuleNotFoundError) as e:
 # isort: on
 
 DEFAULT_FA_VERSION = 2
-_fa4_compile_monitor_armed = False
+_fa4_compile_cache_baseline: dict[str, frozenset[object]] | None = None
 
 
-def get_flash_attn_compile_stats() -> dict:
+def _get_flash_attn_compile_cache_key_sets() -> dict[str, frozenset[object]]:
     from vllm.vllm_flash_attn.cute.interface import (
-        get_flash_attn_compile_stats as _get_stats,
+        _flash_attn_fwd,
+        _flash_attn_fwd_combine,
     )
 
-    return _get_stats()
+    return {
+        "forward": frozenset(_flash_attn_fwd.compile_cache),
+        "combine": frozenset(_flash_attn_fwd_combine.compile_cache),
+    }
 
 
-def arm_flash_attn_compile_monitor() -> dict:
-    """Return the warmup inventory, then reject later FA4 compilations."""
-    from vllm.vllm_flash_attn.cute.interface import (
-        reset_flash_attn_compile_stats,
+def _format_flash_attn_compile_cache_keys(
+    key_sets: dict[str, frozenset[object]],
+) -> dict[str, tuple[str, ...]]:
+    return {
+        kind: tuple(sorted(repr(key) for key in keys))
+        for kind, keys in key_sets.items()
+    }
+
+
+def get_flash_attn_compile_cache_keys() -> dict[str, tuple[str, ...]]:
+    """Return a deterministic read-only view of the current FA4 cache keys."""
+    return _format_flash_attn_compile_cache_keys(
+        _get_flash_attn_compile_cache_key_sets()
     )
 
-    global _fa4_compile_monitor_armed
-    inventory = get_flash_attn_compile_stats()
-    reset_flash_attn_compile_stats()
-    _fa4_compile_monitor_armed = True
-    return inventory
+
+def arm_flash_attn_compile_monitor() -> dict[str, tuple[str, ...]]:
+    """Snapshot warmup keys, then reject any later cache-key change."""
+    global _fa4_compile_cache_baseline
+    _fa4_compile_cache_baseline = _get_flash_attn_compile_cache_key_sets()
+    return _format_flash_attn_compile_cache_keys(_fa4_compile_cache_baseline)
 
 
 def _check_flash_attn_compile_monitor() -> None:
-    if not _fa4_compile_monitor_armed:
+    if _fa4_compile_cache_baseline is None:
         return
-    stats = get_flash_attn_compile_stats()
-    if any(stats[kind]["compilations"] for kind in ("forward", "combine")):
+    current = _get_flash_attn_compile_cache_key_sets()
+    if current != _fa4_compile_cache_baseline:
         raise RuntimeError(
-            f"FA4 compiled an attention kernel after the warmup closure: {stats}"
+            "FA4 compile-cache keys changed after the warmup closure: "
+            f"before={_format_flash_attn_compile_cache_keys(_fa4_compile_cache_baseline)}, "
+            f"current={_format_flash_attn_compile_cache_keys(current)}"
         )
 
 

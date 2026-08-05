@@ -847,8 +847,8 @@ class Worker(WorkerBase):
             inventory = arm_flash_attn_compile_monitor()
             logger.info(
                 "FA4 warmup compile inventory: forward=%d, combine=%d, keys=%s",
-                len(inventory["forward"]["keys"]),
-                len(inventory["combine"]["keys"]),
+                len(inventory["forward"]),
+                len(inventory["combine"]),
                 inventory,
             )
 
