@@ -52,6 +52,14 @@ class AttentionConfig:
     )
     """Whether model configuration requires FA4-only behavior."""
 
+    _hopper_fa4_fp8: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        metadata={"preserve_on_replace": True},
+    )
+    """Whether the server satisfies the supported Hopper FA4 FP8 shape."""
+
     use_prefill_decode_attention: bool = False
     """Use separate prefill and decode kernels for attention instead of
     the unified triton kernel."""
@@ -127,6 +135,7 @@ class AttentionConfig:
         ignored_factors = {
             "_flash_attn_version_fallback",
             "_flash_attn_version_required",
+            "_hopper_fa4_fp8",
         }
         factors = get_hash_factors(self, ignored_factors)
         return hash_factors(factors)

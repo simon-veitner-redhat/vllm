@@ -43,6 +43,9 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 
+FP8_QK_SCALE = 0.0257568359375
+FP8_V_SCALE = 0.00115966796875
+
 # ============================================================================
 # Backend Configuration
 # ============================================================================
@@ -247,7 +250,20 @@ def _create_backend_impl(
         dtype=dtype,
     )
 
-    return backend_class, impl, MockLayer(device, kv_cache_spec=kv_cache_spec)
+    layer = MockLayer(device, kv_cache_spec=kv_cache_spec)
+    if config.kv_cache_dtype.startswith("fp8") and config.backend in (
+        "FLASH_ATTN_FA3",
+        "FLASH_ATTN_FA4",
+    ):
+        # Layer 0 of the pinned static-minmax HF model used by the FP8 YAML.
+        layer._q_scale.fill_(FP8_QK_SCALE)
+        layer._k_scale.fill_(FP8_QK_SCALE)
+        layer._v_scale.fill_(FP8_V_SCALE)
+        layer._q_scale_float = float(layer._q_scale.item())
+        layer._k_scale_float = float(layer._k_scale.item())
+        layer._v_scale_float = float(layer._v_scale.item())
+
+    return backend_class, impl, layer
 
 
 def _create_metadata_builder(
@@ -324,9 +340,15 @@ def _create_input_tensors(
     q_list = [
         torch.randn(
             total_q, config.num_q_heads, config.head_dim, device=device, dtype=dtype
-        ).to(q_dtype)
+        )
         for _ in range(config.num_layers)
     ]
+    if quantize_query:
+        limit = torch.finfo(q_dtype).max
+        q_list = [
+            query.float().div(FP8_QK_SCALE).clamp(-limit, limit).to(q_dtype)
+            for query in q_list
+        ]
     k_list = [
         torch.randn(
             total_q, config.num_kv_heads, config.head_dim, device=device, dtype=dtype
@@ -502,6 +524,15 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         vllm_config = _create_vllm_config(config, max_num_blocks)
         if flash_attn_version is not None:
             vllm_config.attention_config.flash_attn_version = flash_attn_version
+        if (
+            flash_attn_version == 4
+            and config.kv_cache_dtype.startswith("fp8")
+            and config.dtype == torch.bfloat16
+            and (config.head_dim, config.num_q_heads, config.num_kv_heads)
+            == (128, 32, 8)
+            and config.block_size == 16
+        ):
+            vllm_config.attention_config._hopper_fa4_fp8 = True
         dtype = vllm_config.model_config.dtype
 
         # Wrap everything in set_current_vllm_config context

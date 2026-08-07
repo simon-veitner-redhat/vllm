@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from vllm.config import AttentionConfig, replace
+from vllm.config.cache import CacheConfig
 from vllm.model_executor.models.config import Gemma4Config
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends import fa_utils
@@ -22,23 +23,68 @@ def _config(
     kv_cache_dtype: str = "auto",
     backend: AttentionBackendEnum | None = None,
     sparse_mla: bool = False,
+    admitted_fp8: bool = False,
 ):
     hf_text_config = SimpleNamespace()
     if sparse_mla:
         hf_text_config.index_topk = 2048
+    if admitted_fp8:
+        kv_cache_dtype = "fp8"
+        backend = AttentionBackendEnum.FLASH_ATTN
+    quantization_config = None
+    if admitted_fp8:
+        quantization_config = {
+            "quant_method": "compressed-tensors",
+            "quantization_status": "frozen",
+            "kv_cache_scheme": {
+                "dynamic": False,
+                "num_bits": 8,
+                "strategy": "tensor",
+                "symmetric": True,
+                "type": "float",
+            }
+        }
     return SimpleNamespace(
         attention_config=AttentionConfig(
             flash_attn_version=version,
             backend=backend,
         ),
-        cache_config=SimpleNamespace(cache_dtype=kv_cache_dtype),
+        cache_config=SimpleNamespace(
+            cache_dtype=kv_cache_dtype,
+            _checkpoint_implied_fp8=False,
+            block_size=16,
+            sliding_window=None,
+            enable_prefix_caching=False,
+            calculate_kv_scales=False,
+            kv_cache_dtype_skip_layers=None,
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        kernel_config=SimpleNamespace(enable_jit_warmup=True),
         model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
             use_mla=sparse_mla,
             is_diffusion=False,
+            is_multimodal_model=False,
+            is_encoder_decoder=False,
+            is_mm_prefix_lm=False,
+            runner_type="generate",
+            rswa_window=None,
+            disable_cascade_attn=True,
             architecture="DeepseekV3ForCausalLM",
             hf_text_config=hf_text_config,
+            model_arch_config=SimpleNamespace(
+                quantization_config=quantization_config
+            ),
             get_head_size=lambda: 128,
+            get_sliding_window=lambda: None,
+            get_num_attention_heads=lambda parallel: 32,
+            get_num_kv_heads=lambda parallel: 8,
         ),
+        speculative_config=None,
     )
 
 
@@ -83,6 +129,10 @@ def test_internal_resolution_state_does_not_change_config_hash():
     config._flash_attn_version_required = True
 
     assert config.compute_hash() == original_hash
+
+    cache_config = CacheConfig()
+    cache_config._checkpoint_implied_fp8 = True
+    assert "_checkpoint_implied_fp8" not in cache_config.metrics_info()
 
 
 def test_internal_resolution_state_survives_config_replace():
@@ -147,7 +197,7 @@ def test_explicit_fa_version_is_frozen_and_logged(
 @pytest.mark.parametrize(
     ("config_kwargs", "batch_invariant", "import_error", "reason"),
     [
-        ({"kv_cache_dtype": "fp8"}, False, None, "FP8 KV cache"),
+        ({"kv_cache_dtype": "fp8"}, False, None, "backend"),
         ({}, True, None, "batch-invariant serving"),
         (
             {"backend": AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE},
@@ -202,6 +252,129 @@ def test_explicit_non_fa_sparse_mla_route_does_not_fallback(hopper):
     assert config.attention_config.flash_attn_version == 4
 
 
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("admitted", "fa4"),
+        ("missing-backend", "fallback"),
+        ("checkpoint-implied", "fallback"),
+        ("head-scales", "fallback"),
+        ("runtime-scales", "fallback"),
+        ("page32", "fallback"),
+        ("tp2", "fallback"),
+        ("pp2", "fallback"),
+        ("dcp2", "fallback"),
+        ("head-dim64", "fallback"),
+        ("gqa8", "fallback"),
+        ("value-dim64", "fallback"),
+        ("qheads16", "fallback"),
+        ("per-kind-backend", "fallback"),
+        ("mla", "fallback"),
+        ("diffusion", "fallback"),
+        ("multimodal", "fallback"),
+        ("encoder-decoder", "fallback"),
+        ("non-generate", "fallback"),
+        ("non-causal", "fallback"),
+        ("cache-window", "fallback"),
+        ("model-window", "fallback"),
+        ("rswa", "fallback"),
+        ("mm-prefix", "fallback"),
+        ("softcap", "fallback"),
+        ("sinks", "fallback"),
+        ("prefix-cache", "fallback"),
+        ("mixed-cache", "fallback"),
+        ("speculative", "fallback"),
+        ("cascade", "fallback"),
+        ("bad-scheme", "fallback"),
+        ("fp16", "error"),
+    ],
+)
+def test_hopper_fa4_fp8_policy(hopper, case, expected):
+    config = _config(admitted_fp8=True)
+    if case == "missing-backend":
+        config.attention_config.backend = None
+    elif case == "checkpoint-implied":
+        config.cache_config._checkpoint_implied_fp8 = True
+    elif case == "head-scales":
+        scheme = config.model_config.model_arch_config.quantization_config
+        scheme["kv_cache_scheme"]["strategy"] = "head"
+    elif case == "runtime-scales":
+        config.cache_config.calculate_kv_scales = True
+    elif case == "page32":
+        config.cache_config.block_size = 32
+    elif case == "tp2":
+        config.parallel_config.tensor_parallel_size = 2
+    elif case == "pp2":
+        config.parallel_config.pipeline_parallel_size = 2
+    elif case == "dcp2":
+        config.parallel_config.decode_context_parallel_size = 2
+    elif case == "head-dim64":
+        config.model_config.get_head_size = lambda: 64
+    elif case == "gqa8":
+        config.model_config.get_num_kv_heads = lambda parallel: 4
+    elif case == "value-dim64":
+        config.model_config.hf_text_config.linear_value_head_dim = 64
+    elif case == "qheads16":
+        config.model_config.get_num_attention_heads = lambda parallel: 16
+    elif case == "per-kind-backend":
+        config.attention_config.backend_per_kind["attention"] = (
+            AttentionBackendEnum.FLASH_ATTN
+        )
+    elif case == "mla":
+        config.model_config.use_mla = True
+    elif case == "diffusion":
+        config.model_config.is_diffusion = True
+    elif case == "multimodal":
+        config.model_config.is_multimodal_model = True
+    elif case == "encoder-decoder":
+        config.model_config.is_encoder_decoder = True
+    elif case == "non-generate":
+        config.model_config.runner_type = "pooling"
+    elif case == "non-causal":
+        config.attention_config.use_non_causal = True
+    elif case == "cache-window":
+        config.cache_config.sliding_window = 128
+    elif case == "model-window":
+        config.model_config.get_sliding_window = lambda: 128
+    elif case == "rswa":
+        config.model_config.rswa_window = 128
+    elif case == "mm-prefix":
+        config.model_config.is_mm_prefix_lm = True
+    elif case == "softcap":
+        config.model_config.hf_text_config.attn_logit_softcapping = 30.0
+    elif case == "sinks":
+        config.model_config.hf_text_config.attention_sink = True
+    elif case == "prefix-cache":
+        config.cache_config.enable_prefix_caching = True
+    elif case == "mixed-cache":
+        config.cache_config.kv_cache_dtype_skip_layers = [0]
+    elif case == "speculative":
+        config.speculative_config = SimpleNamespace()
+    elif case == "cascade":
+        config.model_config.disable_cascade_attn = False
+    elif case == "bad-scheme":
+        scheme = config.model_config.model_arch_config.quantization_config
+        scheme["quant_method"] = "other"
+    elif case == "fp16":
+        config.model_config.dtype = torch.float16
+
+    if expected == "error":
+        with pytest.raises(ValueError, match="requires BF16"):
+            fa_utils.resolve_flash_attn_version(config)
+        return
+
+    effective = fa_utils.resolve_flash_attn_version(config)
+    assert effective == (4 if expected == "fa4" else 3)
+    assert config.attention_config._hopper_fa4_fp8 is (expected == "fa4")
+    assert config.attention_config._flash_attn_version_fallback is (
+        expected == "fallback"
+    )
+    if case == "admitted":
+        disabled = _config(admitted_fp8=True)
+        disabled.kernel_config.enable_jit_warmup = False
+        assert fa_utils.resolve_flash_attn_version(disabled) == 3
+
+
 def test_deepseek_v4_sparse_route_is_outside_fa3_policy(hopper):
     config = _config(sparse_mla=True)
     config.model_config.architecture = "DeepseekV4ForCausalLM"
@@ -225,12 +398,12 @@ def test_each_distinct_fallback_reason_uses_warning_once(
 
     fa_utils.resolve_flash_attn_version(config)
 
-    reasons = [call.args[1] for call in warning_once.call_args_list]
-    assert len(reasons) == len(set(reasons)) == 3
-    assert all(
-        call.kwargs == {"scope": "global"}
-        for call in warning_once.call_args_list
-    )
+    warning_once.assert_called_once()
+    reasons = warning_once.call_args.args[1]
+    assert "failed to import" in reasons
+    assert "batch-invariant serving" in reasons
+    assert "backend" in reasons
+    assert warning_once.call_args.kwargs == {"scope": "global"}
 
 
 def test_fallback_reasons_are_collected_from_all_ranks(

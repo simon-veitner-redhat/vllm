@@ -7,7 +7,9 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import pytest
+import torch
 
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.warmup import fa4_cutedsl_warmup as fa4_warmup
 from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
 
@@ -83,7 +85,9 @@ def test_v1_fa4_mla_warmup_covers_mixed_and_batch_one(monkeypatch):
     )
 
     config = SimpleNamespace(
-        attention_config=SimpleNamespace(flash_attn_version=4),
+        attention_config=SimpleNamespace(
+            flash_attn_version=4, _hopper_fa4_fp8=False
+        ),
         model_config=SimpleNamespace(use_mla=True, max_model_len=8192),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
     )
@@ -130,5 +134,113 @@ def test_v1_fa4_mla_warmup_covers_mixed_and_batch_one(monkeypatch):
             skip_eplb=True,
             profile_seq_lens=4096,
             num_reqs=1,
+        ),
+    ]
+
+
+def test_v2_fa4_fp8_warmup_covers_persistent_tiles(monkeypatch):
+    monkeypatch.setattr(
+        fa4_warmup.current_platform, "is_device_capability", lambda _: True
+    )
+    mixed_warmup = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.warmup.run_mixed_prefill_decode_warmup",
+        mixed_warmup,
+    )
+    layer = object.__new__(Attention)
+    layer._q_scale = torch.tensor(1.0, requires_grad=True)
+    layer._k_scale = torch.tensor(0.25, requires_grad=True)
+    layer._v_scale = torch.tensor(0.5, requires_grad=True)
+    layer._q_scale_float = 1.0
+    layer._k_scale_float = 0.25
+    layer._v_scale_float = 0.5
+    layer._k_scale_cpu = torch.tensor(1.0)
+    layer._v_scale_cpu = torch.tensor(1.0)
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(
+            flash_attn_version=4,
+            _hopper_fa4_fp8=True,
+        ),
+        model_config=SimpleNamespace(use_mla=False, max_model_len=8192),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        compilation_config=SimpleNamespace(
+            static_forward_context={"layer": layer}
+        ),
+    )
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        vllm_config=config,
+        max_num_reqs=16,
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+        _dummy_run=MagicMock(),
+    )
+    worker = SimpleNamespace(
+        model_runner=runner,
+        use_v2_model_runner=True,
+        execute_model=MagicMock(),
+        sample_tokens=MagicMock(),
+    )
+
+    config.attention_config.flash_attn_version = 3
+    layer._k_scale_float = 1.0
+    fa4_warmup.normalize_hopper_fa4_fp8_scales(worker)
+    assert layer._q_scale.item() == 1.0
+    layer._k_scale_float = 0.25
+    config.attention_config.flash_attn_version = 4
+
+    for scale_attr in ("_k_scale_float", "_v_scale_float"):
+        original_scale = getattr(layer, scale_attr)
+        setattr(layer, scale_attr, 1.0)
+        with pytest.raises(ValueError, match="positive non-unit"):
+            fa4_warmup.normalize_hopper_fa4_fp8_scales(worker)
+        setattr(layer, scale_attr, original_scale)
+
+    fa4_warmup.fa4_cutedsl_warmup(worker)
+
+    assert layer._q_scale.item() == layer._k_scale.item() == 0.25
+    assert layer._v_scale.item() == 0.5
+    assert layer._q_scale_float == 0.25
+    assert layer._k_scale_cpu.item() == 0.25
+    assert layer._v_scale_cpu.item() == 0.5
+    assert mixed_warmup.call_args_list == [
+        call(
+            runner,
+            worker.execute_model,
+            worker.sample_tokens,
+            18,
+            decode_prompt_len=16,
+            num_decode_reqs=1,
+            decode_scheduled_tokens=2,
+            req_id_prefix="_fa4_fp8_warmup_16",
+        ),
+        call(
+            runner,
+            worker.execute_model,
+            worker.sample_tokens,
+            19,
+            decode_prompt_len=17,
+            num_decode_reqs=1,
+            decode_scheduled_tokens=2,
+            req_id_prefix="_fa4_fp8_warmup_17",
+        ),
+        call(
+            runner,
+            worker.execute_model,
+            worker.sample_tokens,
+            19,
+            decode_prompt_len=4096,
+            num_decode_reqs=1,
+            decode_scheduled_tokens=2,
+            req_id_prefix="_fa4_fp8_warmup_long_8192",
+        ),
+        call(
+            runner,
+            worker.execute_model,
+            worker.sample_tokens,
+            25,
+            decode_prompt_len=4096,
+            num_decode_reqs=4,
+            decode_scheduled_tokens=2,
+            req_id_prefix="_fa4_warmup_8192",
         ),
     ]

@@ -1321,6 +1321,12 @@ def main():
                             ncu_profile=args.ncu_profile,
                             warmup_ms=args.warmup_ms,
                             num_splits=args.num_splits,
+                            dtype=(
+                                torch.bfloat16
+                                if args.kv_cache_dtype.startswith("fp8")
+                                and backend in ("FLASH_ATTN_FA3", "FLASH_ATTN_FA4")
+                                else torch.float16
+                            ),
                         )
 
                         result = run_benchmark(config)

@@ -400,6 +400,7 @@ def flash_attn_varlen_func(
         num_splits_dynamic_ptr = None
         if sm90 and scheduler_metadata is not None and num_splits > 1:
             num_splits_dynamic_ptr = scheduler_metadata
+        hopper_fa4_fp8 = sm90 and q.dtype == torch.float8_e4m3fn
         out, softmax_lse, _, _ = _flash_attn_fwd(
             q,
             k,
@@ -425,6 +426,9 @@ def flash_attn_varlen_func(
             mask_mod=mask_mod,
             aux_tensors=aux_tensors,
             output_scale=output_scale,
+            q_descale=q_descale if hopper_fa4_fp8 else None,
+            k_descale=k_descale if hopper_fa4_fp8 else None,
+            v_descale=v_descale if hopper_fa4_fp8 else None,
             cp_world_size=cp_world_size if sm90 else 1,
             cp_rank=cp_rank if sm90 else 0,
             cp_tot_seqused_k=cp_tot_seqused_k if sm90 else None,

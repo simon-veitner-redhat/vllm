@@ -23,6 +23,108 @@ if TYPE_CHECKING:
 _ROCM_FLASH_ATTN_AVAILABLE = False
 
 
+def _model_uses_attention_sinks(model_config: Any) -> bool:
+    text_config = model_config.hf_text_config
+    dflash_config = getattr(text_config, "dflash_config", None)
+    return bool(
+        getattr(text_config, "attention_sink", False)
+        or getattr(text_config, "swa_attention_sink_enabled", False)
+        or getattr(text_config, "add_swa_attention_sink_bias", False)
+        or (
+            isinstance(dflash_config, dict)
+            and dflash_config.get("attention_sink_bias", False)
+        )
+    )
+
+
+def _hopper_fa4_fp8_fallback_reasons(vllm_config: "VllmConfig") -> list[str]:
+    """Return ordered failures of the supported Hopper FA4 FP8 shape."""
+    attention = vllm_config.attention_config
+    cache = vllm_config.cache_config
+    model = vllm_config.model_config
+    parallel = vllm_config.parallel_config
+    reasons: list[str] = []
+
+    backend = attention.backend
+    if backend is None or getattr(backend, "name", str(backend)) != "FLASH_ATTN":
+        reasons.append("backend")
+    if attention.backend_per_kind:
+        reasons.append("per-kind backend")
+    if cache._checkpoint_implied_fp8:
+        reasons.append("cache dtype auto/checkpoint intent")
+    if cache.block_size != 16:
+        reasons.append("page")
+    if parallel.tensor_parallel_size != 1:
+        reasons.append("TP")
+    if parallel.pipeline_parallel_size != 1:
+        reasons.append("PP")
+    if parallel.decode_context_parallel_size != 1:
+        reasons.append("DCP")
+    if model.dtype != torch.bfloat16:
+        reasons.append("activation/output dtype")
+    if model.get_head_size() != 128:
+        reasons.append("geometry")
+    if getattr(model.hf_text_config, "linear_value_head_dim", 128) != 128:
+        reasons.append("value geometry")
+    if model.get_num_attention_heads(parallel) != 32:
+        reasons.append("query heads")
+    if model.get_num_kv_heads(parallel) != 8:
+        reasons.append("GQA")
+    if (
+        model.use_mla
+        or model.is_diffusion
+        or model.is_multimodal_model
+        or model.is_encoder_decoder
+        or model.runner_type != "generate"
+    ):
+        reasons.append("attention kind")
+    if attention.use_non_causal:
+        reasons.append("non-causal attention")
+    if cache.sliding_window is not None or model.get_sliding_window() is not None:
+        reasons.append("sliding window")
+    if model.rswa_window is not None:
+        reasons.append("mask modification")
+    if model.is_mm_prefix_lm:
+        reasons.append("MM-prefix mask")
+    if getattr(model.hf_text_config, "attn_logit_softcapping", None) not in (
+        None,
+        0.0,
+    ):
+        reasons.append("attention softcap")
+    if _model_uses_attention_sinks(model):
+        reasons.append("attention sinks")
+    if cache.enable_prefix_caching:
+        reasons.append("prefix caching")
+    if cache.calculate_kv_scales:
+        reasons.append("runtime scales")
+    if cache.kv_cache_dtype_skip_layers:
+        reasons.append("mixed cache dtype")
+    if vllm_config.speculative_config is not None:
+        reasons.append("speculative decoding")
+    if not model.disable_cascade_attn:
+        reasons.append("cascade")
+    if not vllm_config.kernel_config.enable_jit_warmup:
+        reasons.append("JIT warmup disabled")
+
+    scheme = model.model_arch_config.quantization_config or {}
+    kv_scheme = scheme.get("kv_cache_scheme") or {}
+    expected_scheme = {
+        "dynamic": False,
+        "num_bits": 8,
+        "strategy": "tensor",
+        "symmetric": True,
+        "type": "float",
+    }
+    if (
+        scheme.get("quant_method") != "compressed-tensors"
+        or scheme.get("quantization_status") != "frozen"
+        or any(kv_scheme.get(key) != value for key, value in expected_scheme.items())
+    ):
+        reasons.append("quantization scheme")
+
+    return reasons
+
+
 def _fa4_cute_import_error() -> str | None:
     """Import the real CuTeDSL entry point used by FA4 kernels."""
     try:
@@ -117,8 +219,17 @@ def resolve_flash_attn_version(vllm_config: "VllmConfig") -> int | None:
         reasons.append("FA4 does not support batch-invariant serving on Hopper")
 
     cache_config = vllm_config.cache_config
-    if cache_config is not None and cache_config.cache_dtype in ("fp8", "fp8_e4m3"):
-        reasons.append("FA4 does not support FP8 KV cache on Hopper")
+    is_hopper_fp8 = cache_config is not None and cache_config.cache_dtype in (
+        "fp8",
+        "fp8_e4m3",
+    )
+    if is_hopper_fp8:
+        reasons.extend(_hopper_fa4_fp8_fallback_reasons(vllm_config))
+        if vllm_config.model_config.dtype != torch.bfloat16:
+            raise ValueError(
+                "Hopper FA4 FP8 requires BF16 model activations and output; "
+                "FP16 activation output adaptation is not supported"
+            )
     if _uses_generic_sparse_mla_fa3(vllm_config):
         reasons.append("FA4 does not support the generic sparse-MLA FA3 route")
 
@@ -131,15 +242,24 @@ def resolve_flash_attn_version(vllm_config: "VllmConfig") -> int | None:
             )
         vllm_config.attention_config.flash_attn_version = 3
         vllm_config.attention_config._flash_attn_version_fallback = True
-        for reason in reasons:
+        if is_hopper_fp8:
             logger.warning_once(
-                "%s; the whole server is using FA3 "
-                "(requested=FA4, effective=FA3).",
-                reason,
+                "Hopper FA4 FP8 capability check failed fields: %s; the whole "
+                "server is using FA3 (requested=FA4, effective=FA3).",
+                ", ".join(reasons),
                 scope="global",
             )
+        else:
+            for reason in reasons:
+                logger.warning_once(
+                    "%s; the whole server is using FA3 "
+                    "(requested=FA4, effective=FA3).",
+                    reason,
+                    scope="global",
+                )
         return 3
 
+    vllm_config.attention_config._hopper_fa4_fp8 = is_hopper_fp8
     logger.info_once(
         "FlashAttention version resolved for the whole server: "
         "requested=FA4, effective=FA4.",
@@ -444,6 +564,13 @@ def flash_attn_supports_kv_cache_dtype(
         return True
     if fa_version == 4 and current_platform.is_device_capability_family(100):
         return True
+    if fa_version == 4 and current_platform.is_device_capability(90):
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        return bool(
+            vllm_config is not None and vllm_config.attention_config._hopper_fa4_fp8
+        )
     return False
 
 

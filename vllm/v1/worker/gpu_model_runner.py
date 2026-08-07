@@ -993,6 +993,9 @@ class GPUModelRunner(
             if cache_tensor is not None:
                 cache_tensor.zero_()
 
+        if self.vllm_config.attention_config._hopper_fa4_fp8:
+            return
+
         k_attr_names = ("_k_scale", "k_scale")
         v_attr_names = ("_v_scale", "v_scale")
 

@@ -1,0 +1,26 @@
+# Reusable FlashAttention FP8-cache benchmark.
+
+provenance:
+  geometries:
+    - model_id: nm-testing/Llama-3.1-8B-Instruct-KV-FP8-tensor-static_minmax
+      role: D128 GQA4 static per-tensor FP8 KV serving geometry
+      synthetic: false
+
+model:
+  num_layers: 32
+  num_q_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  block_size: 16
+  max_model_len: 8192
+
+batch_specs:
+  - "q512"
+  - "q2k"
+  - "8q1s1k"
+  - "16q1s2k"
+
+device: "cuda:0"
+kv_cache_dtype: fp8
+cuda_graphs: true
+profile_memory: false
