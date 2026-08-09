@@ -5822,17 +5822,23 @@ class GPUModelRunner(
 
     @contextmanager
     def maybe_randomize_inputs(
-        self, input_ids: torch.Tensor | None, inputs_embeds: torch.Tensor | None
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        randomize_inputs: bool = False,
     ):
         """
-        Randomize input_ids if VLLM_RANDOMIZE_DP_DUMMY_INPUTS is set.
+        Randomize dummy inputs when explicitly requested or when
+        VLLM_RANDOMIZE_DP_DUMMY_INPUTS is set for data parallelism.
         This is to help balance expert-selection
          - during profile_run
          - during DP rank dummy run
         """
 
         dp_size = self.vllm_config.parallel_config.data_parallel_size
-        randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and dp_size > 1
+        randomize_inputs = randomize_inputs or (
+            envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and dp_size > 1
+        )
         if not randomize_inputs:
             yield
         elif input_ids is not None:
@@ -5909,6 +5915,8 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        *,
+        randomize_inputs: bool = False,
         num_reqs: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -5937,6 +5945,7 @@ class GPUModelRunner(
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            randomize_inputs: If True, randomize the dummy model inputs.
             num_reqs: If provided, distribute tokens across exactly this many
                 requests instead of the scheduler maximum.
         """
@@ -5973,6 +5982,7 @@ class GPUModelRunner(
         max_num_reqs = self.scheduler_config.max_num_seqs
         if num_reqs is not None:
             assert not create_mixed_batch
+            assert not uniform_decode
             assert 0 < num_reqs <= min(num_tokens, max_num_reqs)
             max_num_reqs = num_reqs
         if create_mixed_batch:
@@ -6213,7 +6223,9 @@ class GPUModelRunner(
                     num_tokens_across_dp[:] = num_tokens_padded
 
             with (
-                self.maybe_randomize_inputs(input_ids, inputs_embeds),
+                self.maybe_randomize_inputs(
+                    input_ids, inputs_embeds, randomize_inputs=randomize_inputs
+                ),
                 set_forward_context(
                     attn_metadata,
                     self.vllm_config,
