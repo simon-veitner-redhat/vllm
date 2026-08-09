@@ -33,33 +33,64 @@ def test_mixed_warmup_skipped_for_single_seq(max_num_reqs):
     )
 
 
-def test_mixed_warmup_builds_multiple_decodes():
+def test_mixed_warmup_multi_decode_lookahead_exact_capacity():
     connector = MagicMock()
     runner = SimpleNamespace(
         is_pooling_model=False,
         max_num_reqs=3,
+        max_model_len=128,
+        model_state=SimpleNamespace(max_encoder_len=0),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=1),
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=[
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=4))
             ],
-            num_blocks=128,
+            num_blocks=6,
         ),
         kv_connector=connector,
     )
     outputs = []
 
+    # Two 4-token decodes plus one lookahead token need two blocks each;
+    # the 7-token prefill plus lookahead needs two more. Block zero is not
+    # allocated, so exactly six available blocks must skip the six-block run.
+    assert not run_mixed_prefill_decode_warmup(
+        runner,
+        worker_execute_model=_fail,
+        worker_sample_tokens=_fail,
+        num_tokens=9,
+        decode_prompt_len=3,
+        num_decode_reqs=2,
+    )
+
+    runner.kv_cache_config.num_blocks = 7
     assert run_mixed_prefill_decode_warmup(
         runner,
         worker_execute_model=outputs.append,
         worker_sample_tokens=lambda _: None,
         num_tokens=9,
+        decode_prompt_len=3,
         num_decode_reqs=2,
-        decode_scheduled_tokens=2,
     )
 
     mixed = outputs[2]
     assert len(mixed.scheduled_cached_reqs.req_ids) == 2
-    assert sorted(mixed.num_scheduled_tokens.values()) == [2, 2, 5]
+    assert sorted(mixed.num_scheduled_tokens.values()) == [1, 1, 7]
+    allocated_ids = {
+        block_id
+        for output in outputs[:3]
+        for new_req in output.scheduled_new_reqs
+        for block_ids in new_req.block_ids
+        for block_id in block_ids
+    }
+    allocated_ids.update(
+        block_id
+        for new_block_ids in mixed.scheduled_cached_reqs.new_block_ids
+        if new_block_ids is not None
+        for block_ids in new_block_ids
+        for block_id in block_ids
+    )
+    assert allocated_ids == set(range(1, runner.kv_cache_config.num_blocks))
     assert len(outputs[3].finished_req_ids) == 3
     assert connector.set_disabled.call_args_list == [call(True), call(False)]
 
