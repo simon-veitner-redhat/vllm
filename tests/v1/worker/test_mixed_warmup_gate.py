@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, call
 import pytest
 
 from vllm.model_executor.warmup import fa4_cutedsl_warmup as fa4_warmup
+from vllm.v1.worker.gpu import warmup as gpu_warmup
 from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
 
 
@@ -95,6 +96,48 @@ def test_mixed_warmup_multi_decode_lookahead_exact_capacity():
     assert connector.set_disabled.call_args_list == [call(True), call(False)]
 
 
+def test_v2_fa4_warmup_uses_smallest_valid_long_mixed_batch(monkeypatch):
+    monkeypatch.setattr(
+        fa4_warmup.current_platform,
+        "is_device_capability",
+        lambda _: True,
+    )
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(flash_attn_version=4),
+        model_config=SimpleNamespace(use_mla=False, max_model_len=8192),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+    )
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        vllm_config=config,
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+    )
+    worker = SimpleNamespace(
+        model_runner=runner,
+        use_v2_model_runner=True,
+        execute_model=MagicMock(),
+        sample_tokens=MagicMock(),
+    )
+    mixed_warmup = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        gpu_warmup,
+        "run_mixed_prefill_decode_warmup",
+        mixed_warmup,
+    )
+
+    fa4_warmup.fa4_cutedsl_warmup(worker)
+
+    mixed_warmup.assert_called_once_with(
+        runner,
+        worker.execute_model,
+        worker.sample_tokens,
+        num_tokens=3,
+        decode_prompt_len=4096,
+        decode_scheduled_tokens=1,
+        req_id_prefix="_fa4_warmup_8192",
+    )
+
+
 def test_v1_fa4_mla_warmup_covers_mixed_and_batch_one(monkeypatch):
     is_sm90 = False
     monkeypatch.setattr(
@@ -133,6 +176,11 @@ def test_v1_fa4_mla_warmup_covers_mixed_and_batch_one(monkeypatch):
 
     kernel.reset_mock()
     is_sm90 = True
+    fa4_warmup.fa4_cutedsl_warmup(worker)
+    kernel.warmup.assert_called_once_with(config)
+    runner._dummy_run.assert_not_called()
+
+    kernel.reset_mock()
     config.attention_config.flash_attn_version = 4
     fa4_warmup.fa4_cutedsl_warmup(worker)
 

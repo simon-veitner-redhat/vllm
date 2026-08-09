@@ -19,26 +19,6 @@ def fa4_cutedsl_warmup(worker: Worker) -> None:
         return
 
     vllm_config = runner.vllm_config
-    if not current_platform.is_device_capability(90):
-        if not vllm_config.model_config.use_mla:
-            return
-        try:
-            backend_cls = get_mla_prefill_backend(vllm_config)
-        except ValueError:
-            # Fall back to the top-k MQA prefill path.
-            return
-        if backend_cls.get_name() != "FLASH_ATTN":
-            return
-
-        from vllm.v1.attention.backends.mla.prefill import flash_attn
-
-        flash_attn.FA4_MLA_PREFILL_KERNEL.warmup(vllm_config)
-        return
-    if vllm_config.attention_config.flash_attn_version != 4:
-        return
-
-    from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
-
     if vllm_config.model_config.use_mla:
         try:
             backend_cls = get_mla_prefill_backend(vllm_config)
@@ -50,9 +30,15 @@ def fa4_cutedsl_warmup(worker: Worker) -> None:
 
         from vllm.v1.attention.backends.mla.prefill import flash_attn
 
-        if not flash_attn.FA4_MLA_PREFILL_KERNEL.get_warmup_keys(vllm_config):
-            return
         flash_attn.FA4_MLA_PREFILL_KERNEL.warmup(vllm_config)
+
+    if (
+        not current_platform.is_device_capability(90)
+        or vllm_config.attention_config.flash_attn_version != 4
+    ):
+        return
+
+    from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
 
     if not worker.use_v2_model_runner:
         if vllm_config.model_config.use_mla:
@@ -115,17 +101,16 @@ def fa4_cutedsl_warmup(worker: Worker) -> None:
             req_id_prefix=f"_fa4_mla_warmup_{absorbed_tokens}",
         )
 
-    # Long prefill compilation and long-context batched decode select scheduler
-    # modes that the existing short-context model-runner warmup does not reach.
-    num_long_decodes = min(4, runner.max_num_reqs - 1)
-    decode_scheduled_tokens = 2
+    # Warm the smallest valid long-context mixed batch: one cached request
+    # decodes one token while one new request prefills two tokens.
+    decode_tokens_per_req = 1
+    min_prefill_tokens = 2
     run_mixed_prefill_decode_warmup(
         runner,
         worker.execute_model,
         worker.sample_tokens,
-        num_long_decodes * decode_scheduled_tokens + 17,
+        num_tokens=decode_tokens_per_req + min_prefill_tokens,
         decode_prompt_len=max_warmup_tokens // 2,
-        num_decode_reqs=num_long_decodes,
-        decode_scheduled_tokens=decode_scheduled_tokens,
+        decode_scheduled_tokens=decode_tokens_per_req,
         req_id_prefix=f"_fa4_warmup_{max_warmup_tokens}",
     )
