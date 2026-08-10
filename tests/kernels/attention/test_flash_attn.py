@@ -4,6 +4,7 @@
 
 import sys
 from types import ModuleType
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from vllm.utils.torch_utils import set_random_seed
 try:
     from vllm.vllm_flash_attn import (
         fa_version_unsupported_reason,
+        flash_attn_interface,
         flash_attn_varlen_func,
         is_fa_version_supported,
     )
@@ -74,6 +76,19 @@ def test_fa4_dcp_forwards_native_cp_args(monkeypatch: pytest.MonkeyPatch) -> Non
     assert forwarded_kwargs["cp_world_size"] == 2
     assert forwarded_kwargs["cp_rank"] == 1
     assert forwarded_kwargs["cp_tot_seqused_k"] is cp_tot_seqused_k
+
+
+def test_fa4_cutedsl_probe_imports_interface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import_module = MagicMock(side_effect=ModuleNotFoundError("no cutlass"))
+    monkeypatch.setattr(flash_attn_interface, "import_module", import_module)
+
+    assert (
+        flash_attn_interface.fa4_cutedsl_import_error()
+        == "ModuleNotFoundError: no cutlass"
+    )
+    import_module.assert_called_once_with("vllm.vllm_flash_attn.cute.interface")
 
 
 def ref_paged_attn(

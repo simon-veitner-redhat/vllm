@@ -4,7 +4,7 @@
 # ruff: noqa: E501
 
 
-from functools import cache
+from importlib import import_module
 
 import torch
 
@@ -51,9 +51,16 @@ except (ImportError, ModuleNotFoundError) as e:
 DEFAULT_FA_VERSION = 2
 
 
-@cache
-def _is_sm90(device: torch.device) -> bool:
-    return torch.cuda.get_device_capability(device) == (9, 0)
+def fa4_cutedsl_import_error() -> str | None:
+    """Import FA4's CuTeDSL entry point after device setup.
+
+    The transitive imports may initialize CUDA.
+    """
+    try:
+        import_module("vllm.vllm_flash_attn.cute.interface")
+    except Exception as error:
+        return f"{type(error).__name__}: {error}"
+    return None
 
 
 def _is_fa2_supported() -> tuple[bool, str | None]:
@@ -298,7 +305,8 @@ def flash_attn_varlen_func(
         assert len(window_size) == 2
         real_window_size = (window_size[0], window_size[1])
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    if fa_version == 4 and q_v is not None and _is_sm90(q.device):
+    is_sm90 = fa_version == 4 and torch.cuda.get_device_capability(q.device) == (9, 0)
+    if q_v is not None and is_sm90:
         q_v = maybe_contiguous(q_v)
 
     dummy_cu_seqlens_k = torch.empty_like(cu_seqlens_q)
@@ -407,15 +415,14 @@ def flash_attn_varlen_func(
 
         from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
 
-        sm90 = _is_sm90(q.device)
         num_splits_dynamic_ptr = None
-        if sm90 and scheduler_metadata is not None and num_splits > 1:
+        if is_sm90 and scheduler_metadata is not None and num_splits > 1:
             num_splits_dynamic_ptr = scheduler_metadata
         out, softmax_lse, _, _ = _flash_attn_fwd(
             q,
             k,
             v,
-            qv=q_v if sm90 else None,
+            qv=q_v if is_sm90 else None,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             seqused_k=seqused_k,
@@ -438,9 +445,9 @@ def flash_attn_varlen_func(
             aux_tensors=aux_tensors,
             aux_tensor_leading_dims=aux_tensor_leading_dims,
             output_scale=output_scale,
-            cp_world_size=cp_world_size if sm90 else 1,
-            cp_rank=cp_rank if sm90 else 0,
-            cp_tot_seqused_k=cp_tot_seqused_k if sm90 else None,
+            cp_world_size=cp_world_size if is_sm90 else 1,
+            cp_rank=cp_rank if is_sm90 else 0,
+            cp_tot_seqused_k=cp_tot_seqused_k if is_sm90 else None,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")

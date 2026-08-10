@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from importlib import import_module
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_cutedsl
 
 logger = init_logger(__name__)
 
@@ -20,15 +21,6 @@ if TYPE_CHECKING:
 # This module-level flag avoids repeated import attempts and ensures
 # consistent behavior (similar to IS_AITER_FOUND in _aiter_ops.py).
 _ROCM_FLASH_ATTN_AVAILABLE = False
-
-
-def _fa4_cute_import_error() -> str | None:
-    """Import the real CuTeDSL entry point used by FA4 kernels."""
-    try:
-        import_module("vllm.vllm_flash_attn.cute.interface")
-    except Exception as error:
-        return f"{type(error).__name__}: {error}"
-    return None
 
 
 def _uses_generic_sparse_mla_fa3(vllm_config: "VllmConfig") -> bool:
@@ -69,23 +61,39 @@ def _requires_fa4(vllm_config: "VllmConfig") -> bool:
     return get_head_size is not None and get_head_size() > 256
 
 
-def _collect_fallback_reasons(reasons: list[str]) -> list[str]:
-    """Return the ordered union of fallback reasons from every worker rank."""
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return reasons
+class _FA4FallbackState(NamedTuple):
+    reasons: list[str]
+    requires_fa4: bool
+    fa3_supported: bool
 
-    world_size = torch.distributed.get_world_size()
+
+def _collect_fallback_state(local: _FA4FallbackState) -> _FA4FallbackState:
+    """Collect the FA4 fallback state from every worker rank."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return local
+
+    from vllm.distributed.parallel_state import get_world_group
+
+    world_group = get_world_group()
+    world_size = world_group.world_size
     if world_size == 1:
-        return reasons
-    gathered_reasons: list[list[str] | None] = [None] * world_size
-    torch.distributed.all_gather_object(gathered_reasons, reasons)
-    return list(
-        dict.fromkeys(
-            reason
-            for rank_reasons in gathered_reasons
-            if rank_reasons is not None
-            for reason in rank_reasons
-        )
+        return local
+
+    gathered: list[_FA4FallbackState | None] = [None] * world_size
+    torch.distributed.all_gather_object(
+        gathered,
+        local,
+        group=world_group.cpu_group,
+    )
+    states = [state for state in gathered if state is not None]
+    return _FA4FallbackState(
+        reasons=list(
+            dict.fromkeys(
+                reason for state in states for reason in state.reasons
+            )
+        ),
+        requires_fa4=any(state.requires_fa4 for state in states),
+        fa3_supported=all(state.fa3_supported for state in states),
     )
 
 
@@ -97,40 +105,68 @@ def resolve_flash_attn_version(vllm_config: "VllmConfig") -> int | None:
     """
     requested = vllm_config.attention_config.flash_attn_version
     capability = current_platform.get_device_capability()
-    if capability is None:
-        return requested
     if requested == 3:
-        if capability.major == 9:
+        if capability is not None and capability.major == 9:
             logger.info_once(
                 "FlashAttention version resolved for the whole server: "
                 "requested=FA3, effective=FA3.",
                 scope="global",
             )
         return 3
-    if capability.major != 9 or requested != 4:
+    if requested != 4:
         return requested
+
     reasons: list[str] = []
-    if import_error := _fa4_cute_import_error():
-        reasons.append(f"the FA4 CuTeDSL interface failed to import ({import_error})")
-    if envs.VLLM_BATCH_INVARIANT:
-        reasons.append("FA4 does not support batch-invariant serving on Hopper")
+    is_hopper = capability is not None and capability.major == 9
+    if is_hopper:
+        if not has_cutedsl():
+            reasons.append("the CuTeDSL dependency is not available")
+        else:
+            fa4_interface = import_module(
+                "vllm.vllm_flash_attn.flash_attn_interface"
+            )
 
-    cache_config = vllm_config.cache_config
-    if cache_config is not None and cache_config.cache_dtype in ("fp8", "fp8_e4m3"):
-        reasons.append("FA4 does not support FP8 KV cache on Hopper")
-    if _uses_generic_sparse_mla_fa3(vllm_config):
-        reasons.append("FA4 does not support the generic sparse-MLA FA3 route")
+            if import_error := fa4_interface.fa4_cutedsl_import_error():
+                reasons.append(
+                    "the FA4 CuTeDSL interface failed to import "
+                    f"({import_error})"
+                )
+        if envs.VLLM_BATCH_INVARIANT:
+            reasons.append("FA4 does not support batch-invariant serving on Hopper")
 
-    reasons = _collect_fallback_reasons(reasons)
-    if reasons:
-        if _requires_fa4(vllm_config):
+        cache_config = vllm_config.cache_config
+        if cache_config is not None and cache_config.cache_dtype in (
+            "fp8",
+            "fp8_e4m3",
+        ):
+            reasons.append("FA4 does not support FP8 KV cache on Hopper")
+        if _uses_generic_sparse_mla_fa3(vllm_config):
+            reasons.append("FA4 does not support the generic sparse-MLA FA3 route")
+
+    # The requested version comes from replicated VllmConfig, so every
+    # explicit-FA4 rank joins before any rank-local capability return.
+    state = _collect_fallback_state(
+        _FA4FallbackState(
+            reasons=reasons,
+            requires_fa4=is_hopper and _requires_fa4(vllm_config),
+            fa3_supported=is_hopper and is_fa_version_supported(3),
+        )
+    )
+    if state.reasons:
+        if state.requires_fa4:
             raise ValueError(
                 "The model requires FA4, but the requested Hopper FA4 "
-                f"configuration cannot use it: {'; '.join(reasons)}"
+                f"configuration cannot use it: {'; '.join(state.reasons)}"
+            )
+        if not state.fa3_supported:
+            raise ValueError(
+                "The requested Hopper FA4 configuration cannot use FA4, and "
+                "server-wide fallback is unsafe because FA3 is not supported "
+                f"on every rank: {'; '.join(state.reasons)}"
             )
         vllm_config.attention_config.flash_attn_version = 3
         vllm_config.attention_config._flash_attn_version_fallback = True
-        for reason in reasons:
+        for reason in state.reasons:
             logger.warning_once(
                 "%s; the whole server is using FA3 "
                 "(requested=FA4, effective=FA3).",
@@ -138,6 +174,9 @@ def resolve_flash_attn_version(vllm_config: "VllmConfig") -> int | None:
                 scope="global",
             )
         return 3
+
+    if not is_hopper:
+        return 4
 
     logger.info_once(
         "FlashAttention version resolved for the whole server: "

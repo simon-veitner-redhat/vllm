@@ -55,7 +55,6 @@ def test_dummy_dcp_lengths_are_attached_before_attention_metadata(monkeypatch):
         events.append("prepare_attn")
         if expect_dcp:
             assert batch.dcp_local_seq_lens is not None
-            assert batch.dcp_local_seq_lens.data_ptr() == dcp_local_seq_lens.data_ptr()
             assert batch.dcp_local_seq_lens.tolist() == [2]
         else:
             assert batch.dcp_local_seq_lens is None

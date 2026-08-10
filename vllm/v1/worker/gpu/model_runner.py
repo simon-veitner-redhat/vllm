@@ -1338,6 +1338,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_desc.num_tokens,
                 self.input_buffers,
             )
+            # Dummy batches bypass normal input preparation, so Hopper FA4
+            # DCP metadata needs rank-local sequence lengths populated here.
             if (
                 self.use_dcp
                 and self.vllm_config.attention_config.flash_attn_version == 4

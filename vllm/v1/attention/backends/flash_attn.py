@@ -442,6 +442,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 SplitSchedulerPlanner,
             )
 
+            # Hopper FA4 uses per-request SplitKV scheduling; retaining the
+            # planner also keeps its workspace stable for CUDA graph capture.
             self.fa4_split_planner = SplitSchedulerPlanner(
                 device=self.device,
                 max_batch_size=max(
@@ -685,8 +687,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 causal=causal,
             )
             if (
-                self.fa_version == 4
-                and current_platform.is_device_capability(90)
+                self.fa4_split_planner is not None
                 and common_attn_metadata.query_start_loc_cpu is not None
                 and common_attn_metadata.seq_lens_cpu_upper_bound is not None
             ):
@@ -705,7 +706,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     if use_graph_bound
                     else None
                 )
-                assert self.fa4_split_planner is not None
                 split_plan = self.fa4_split_planner(
                     common_attn_metadata.query_start_loc_cpu[: num_reqs + 1],
                     common_attn_metadata.seq_lens_cpu_upper_bound[:num_reqs],

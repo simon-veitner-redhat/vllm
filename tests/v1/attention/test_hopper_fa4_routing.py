@@ -50,7 +50,17 @@ def hopper(monkeypatch: pytest.MonkeyPatch):
         lambda: DeviceCapability(major=9, minor=0),
     )
     monkeypatch.setattr(fa_utils.envs, "VLLM_BATCH_INVARIANT", False)
-    monkeypatch.setattr(fa_utils, "_fa4_cute_import_error", lambda: None)
+    monkeypatch.setattr(fa_utils, "has_cutedsl", lambda: True)
+    monkeypatch.setattr(
+        fa_utils, "is_fa_version_supported", lambda version: version in (3, 4)
+    )
+    fake_interface = SimpleNamespace(fa4_cutedsl_import_error=lambda: None)
+    monkeypatch.setattr(
+        fa_utils,
+        "import_module",
+        lambda name: fake_interface,
+    )
+    return fake_interface
 
 
 def test_default_hopper_flash_attn_version_is_unchanged(hopper):
@@ -169,7 +179,11 @@ def test_fa4_gap_falls_back_the_whole_server(
     config = _config(**config_kwargs)
     warning_once = MagicMock()
     monkeypatch.setattr(fa_utils.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
-    monkeypatch.setattr(fa_utils, "_fa4_cute_import_error", lambda: import_error)
+    monkeypatch.setattr(
+        hopper,
+        "fa4_cutedsl_import_error",
+        lambda: import_error,
+    )
     monkeypatch.setattr(fa_utils.logger, "warning_once", warning_once)
 
     assert fa_utils.resolve_flash_attn_version(config) == 3
@@ -217,8 +231,8 @@ def test_each_distinct_fallback_reason_uses_warning_once(
     warning_once = MagicMock()
     monkeypatch.setattr(fa_utils.envs, "VLLM_BATCH_INVARIANT", True)
     monkeypatch.setattr(
-        fa_utils,
-        "_fa4_cute_import_error",
+        hopper,
+        "fa4_cutedsl_import_error",
         lambda: "ModuleNotFoundError: no cutlass",
     )
     monkeypatch.setattr(fa_utils.logger, "warning_once", warning_once)
@@ -241,10 +255,20 @@ def test_fallback_reasons_are_collected_from_all_ranks(
     monkeypatch.setattr(fa_utils.logger, "warning_once", warning_once)
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    cpu_group = object()
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_world_group",
+        lambda: SimpleNamespace(cpu_group=cpu_group, world_size=2),
+    )
 
-    def all_gather_object(gathered, local):
-        gathered[:] = [local, ["remote FA4 dependency failure"]]
+    def all_gather_object(gathered, local, *, group):
+        assert group is cpu_group
+        gathered[:] = [
+            local,
+            fa_utils._FA4FallbackState(
+                ["remote FA4 dependency failure"], False, True
+            ),
+        ]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
 
@@ -253,12 +277,40 @@ def test_fallback_reasons_are_collected_from_all_ranks(
     assert "remote FA4 dependency failure" in warning_once.call_args.args[1]
 
 
-def test_cute_probe_imports_kernel_entrypoint(monkeypatch: pytest.MonkeyPatch):
-    import_module = MagicMock(side_effect=ModuleNotFoundError("no cutlass"))
-    monkeypatch.setattr(fa_utils, "import_module", import_module)
+def test_non_hopper_rank_joins_and_rejects_unsafe_fallback(
+    hopper, monkeypatch: pytest.MonkeyPatch
+):
+    config = _config()
+    monkeypatch.setattr(
+        fa_utils.current_platform, "get_device_capability", lambda: None
+    )
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    cpu_group = object()
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_world_group",
+        lambda: SimpleNamespace(cpu_group=cpu_group, world_size=2),
+    )
+    gathered_local = None
 
-    assert fa_utils._fa4_cute_import_error() == "ModuleNotFoundError: no cutlass"
-    import_module.assert_called_once_with("vllm.vllm_flash_attn.cute.interface")
+    def all_gather_object(gathered, local, *, group):
+        nonlocal gathered_local
+        assert group is cpu_group
+        gathered_local = local
+        gathered[:] = [
+            local,
+            fa_utils._FA4FallbackState(
+                ["remote FA4 dependency failure"], False, True
+            ),
+        ]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+
+    with pytest.raises(ValueError, match="FA3 is not supported on every rank"):
+        fa_utils.resolve_flash_attn_version(config)
+    assert gathered_local == fa_utils._FA4FallbackState([], False, False)
+    assert config.attention_config.flash_attn_version == 4
+    assert not config.attention_config._flash_attn_version_fallback
 
 
 @pytest.mark.parametrize(
