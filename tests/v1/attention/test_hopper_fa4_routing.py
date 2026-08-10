@@ -323,35 +323,25 @@ def test_fallback_rejects_layer_that_requires_fa4(
         fa_utils.get_flash_attn_version(head_size=512)
 
 
-def test_mla_decode_consumes_frozen_version(hopper, monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("version", (3, 4))
+def test_mla_decode_consumes_frozen_version(
+    hopper, monkeypatch: pytest.MonkeyPatch, version: int
+):
     from vllm.v1.attention.backends.mla import flashattn_mla
 
-    config = _config(version=3)
+    config = _config(version=version)
     monkeypatch.setattr(flashattn_mla, "is_fa_version_supported", lambda version: True)
 
-    assert flashattn_mla._get_mla_fa_version(config) == 3
+    assert flashattn_mla._get_mla_fa_version(config) == version
 
-    monkeypatch.setattr(
-        flashattn_mla.current_platform,
-        "is_device_capability_family",
-        lambda capability: capability == 90,
-    )
-    monkeypatch.setattr(
-        flashattn_mla.current_platform,
-        "is_device_capability",
-        lambda capability: capability == 90,
-    )
-    config.attention_config.flash_attn_version = 4
-    assert flashattn_mla._get_mla_fa_version(config) == 4
 
-    monkeypatch.setattr(
-        flashattn_mla.current_platform, "is_device_capability", lambda _: False
-    )
-    assert flashattn_mla._get_mla_fa_version(config) == 3
+def test_flash_attn_mla_backend_supports_hopper():
+    from vllm.v1.attention.backends.mla.flashattn_mla import FlashAttnMLABackend
 
-    monkeypatch.setattr(
-        flashattn_mla.current_platform,
-        "is_device_capability_family",
-        lambda _: False,
+    assert FlashAttnMLABackend.supports_compute_capability(DeviceCapability(9, 0))
+    assert not FlashAttnMLABackend.supports_compute_capability(
+        DeviceCapability(8, 9)
     )
-    assert flashattn_mla._get_mla_fa_version(config) == 4
+    assert not FlashAttnMLABackend.supports_compute_capability(
+        DeviceCapability(10, 0)
+    )

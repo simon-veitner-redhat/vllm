@@ -1024,7 +1024,9 @@ class GPUModelRunner(
         """
         Re-initialize the KV cache and FP8 scales after waking from sleep.
         1. Zero out the KV cache tensors to remove garbage data from re-allocation.
-        2. Reset FP8 scaling factors to 1.0.
+        2. Reset Attention layer scaling factors (_k_scale, _v_scale) to 1.0.
+          If these are left at 0.0 (default after wake_up), all KV cache values
+          become effectively zero, causing gibberish output.
         """
         if not is_quantized_kv_cache(self.cache_config.cache_dtype):
             return

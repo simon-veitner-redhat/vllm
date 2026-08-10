@@ -100,14 +100,14 @@ def resolve_flash_attn_version(vllm_config: "VllmConfig") -> int | None:
     if capability is None:
         return requested
     if requested == 3:
-        if capability.major == 9 and capability.minor == 0:
+        if capability.major == 9:
             logger.info_once(
                 "FlashAttention version resolved for the whole server: "
                 "requested=FA3, effective=FA3.",
                 scope="global",
             )
         return 3
-    if (capability.major, capability.minor) != (9, 0) or requested != 4:
+    if capability.major != 9 or requested != 4:
         return requested
     reasons: list[str] = []
     if import_error := _fa4_cute_import_error():
@@ -406,11 +406,8 @@ def flash_attn_supports_mla():
                 is_fa_version_supported,
             )
 
-            if current_platform.is_device_capability(90):
-                return is_fa_version_supported(3) or is_fa_version_supported(4)
-            return (
-                current_platform.is_device_capability_family(90)
-                and is_fa_version_supported(3)
+            return current_platform.is_device_capability_family(90) and (
+                is_fa_version_supported(3) or is_fa_version_supported(4)
             )
 
         except (ImportError, AssertionError):

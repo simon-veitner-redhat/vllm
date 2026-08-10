@@ -18,7 +18,6 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
     QueryLenSupport,
 )
-from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -51,12 +50,6 @@ def _get_mla_fa_version(vllm_config: VllmConfig | None = None) -> int:
     )
     if fa_version not in (3, 4) and is_fa_version_supported(4):
         fa_version = 4
-    if (
-        fa_version == 4
-        and current_platform.is_device_capability_family(90)
-        and not current_platform.is_device_capability(90)
-    ):
-        fa_version = 3
     if fa_version not in (3, 4):
         raise NotImplementedError(
             f"FlashAttention MLA decode requires FA3 or FA4, got FA{fa_version}"
@@ -163,12 +156,7 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
         )
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.fa_version = _get_mla_fa_version(vllm_config)
-        self.fa_aot_schedule = (
-            get_flash_attn_version() == 3
-            if current_platform.is_device_capability_family(90)
-            and not current_platform.is_device_capability(90)
-            else self.fa_version == 3
-        )
+        self.fa_aot_schedule = self.fa_version == 3
 
         self.use_full_cuda_graph = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
