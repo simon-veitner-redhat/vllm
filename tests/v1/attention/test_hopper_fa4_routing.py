@@ -108,9 +108,7 @@ def test_internal_resolution_state_survives_config_replace():
 
 
 @pytest.mark.parametrize("required_by_model", [False, True])
-def test_fa4_only_route_rejects_incompatible_fallback(
-    hopper, required_by_model: bool
-):
+def test_fa4_only_route_rejects_incompatible_fallback(hopper, required_by_model: bool):
     config = _config(kv_cache_dtype="fp8")
     config.attention_config._flash_attn_version_required = required_by_model
     if not required_by_model:
@@ -121,14 +119,16 @@ def test_fa4_only_route_rejects_incompatible_fallback(
     assert not config.attention_config._flash_attn_version_fallback
 
 
-def test_model_required_fa4_rejects_fallback(
-    hopper, monkeypatch: pytest.MonkeyPatch
-):
+def test_model_required_fa4_rejects_fallback(hopper, monkeypatch: pytest.MonkeyPatch):
     config = _config(version=None, kv_cache_dtype="fp8")
     config.model_config.hf_text_config = SimpleNamespace(
-        head_dim=128,
-        global_head_dim=256,
+        layer_types=["sliding_attention", "full_attention"],
     )
+    config.model_config.model_arch_config = MagicMock(total_num_hidden_layers=2)
+    config.model_config.model_arch_config.__getitem__.side_effect = [
+        SimpleNamespace(head_size=128),
+        SimpleNamespace(head_size=256),
+    ]
     monkeypatch.setattr(fa_utils, "is_fa_version_supported", lambda version: True)
 
     Gemma4Config.verify_and_update_config(config)
@@ -242,8 +242,7 @@ def test_each_distinct_fallback_reason_uses_warning_once(
     reasons = [call.args[1] for call in warning_once.call_args_list]
     assert len(reasons) == len(set(reasons)) == 3
     assert all(
-        call.kwargs == {"scope": "global"}
-        for call in warning_once.call_args_list
+        call.kwargs == {"scope": "global"} for call in warning_once.call_args_list
     )
 
 
@@ -265,9 +264,7 @@ def test_fallback_reasons_are_collected_from_all_ranks(
         assert group is cpu_group
         gathered[:] = [
             local,
-            fa_utils._FA4FallbackState(
-                ["remote FA4 dependency failure"], False, True
-            ),
+            fa_utils._FA4FallbackState(["remote FA4 dependency failure"], False, True),
         ]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
@@ -299,9 +296,7 @@ def test_non_hopper_rank_joins_and_rejects_unsafe_fallback(
         gathered_local = local
         gathered[:] = [
             local,
-            fa_utils._FA4FallbackState(
-                ["remote FA4 dependency failure"], False, True
-            ),
+            fa_utils._FA4FallbackState(["remote FA4 dependency failure"], False, True),
         ]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
@@ -329,9 +324,7 @@ def test_standard_selector_consumes_frozen_version(
     effective_version: int,
 ):
     config = _config(version=configured_version)
-    fake_interface = types.ModuleType(
-        "vllm.vllm_flash_attn.flash_attn_interface"
-    )
+    fake_interface = types.ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
     fake_interface.is_fa_version_supported = lambda version: version in (3, 4)
     fake_interface.fa_version_unsupported_reason = lambda version: None
     monkeypatch.setitem(
@@ -354,9 +347,7 @@ def test_fallback_rejects_layer_that_requires_fa4(
 ):
     config = _config(version=3)
     config.attention_config._flash_attn_version_fallback = True
-    fake_interface = types.ModuleType(
-        "vllm.vllm_flash_attn.flash_attn_interface"
-    )
+    fake_interface = types.ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
     fake_interface.is_fa_version_supported = lambda version: version in (3, 4)
     fake_interface.fa_version_unsupported_reason = lambda version: None
     monkeypatch.setitem(
@@ -391,9 +382,5 @@ def test_flash_attn_mla_backend_supports_hopper():
     from vllm.v1.attention.backends.mla.flashattn_mla import FlashAttnMLABackend
 
     assert FlashAttnMLABackend.supports_compute_capability(DeviceCapability(9, 0))
-    assert not FlashAttnMLABackend.supports_compute_capability(
-        DeviceCapability(8, 9)
-    )
-    assert not FlashAttnMLABackend.supports_compute_capability(
-        DeviceCapability(10, 0)
-    )
+    assert not FlashAttnMLABackend.supports_compute_capability(DeviceCapability(8, 9))
+    assert not FlashAttnMLABackend.supports_compute_capability(DeviceCapability(10, 0))
