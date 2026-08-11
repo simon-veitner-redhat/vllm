@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Warm up FA4 CuTeDSL attention kernels."""
+"""Warm up FA4 CuTeDSL kernels."""
 
 from __future__ import annotations
 
@@ -30,8 +30,7 @@ def _causal_warmup_query_lens(
     """
     query_lens = {_MIN_CAUSAL_QUERY_LEN, max_warmup_tokens // 2}
     query_lens.update(
-        _PACK_GQA_SMALL_TILE_MAX_ROWS // ratio + 1
-        for ratio in num_queries_per_kv
+        _PACK_GQA_SMALL_TILE_MAX_ROWS // ratio + 1 for ratio in num_queries_per_kv
     )
     return tuple(
         sorted(
@@ -44,9 +43,7 @@ def _causal_warmup_query_lens(
 
 def _loaded_fa4_num_queries_per_kv(vllm_config: object) -> tuple[int, ...]:
     compilation_config = getattr(vllm_config, "compilation_config", None)
-    static_forward_context = getattr(
-        compilation_config, "static_forward_context", None
-    )
+    static_forward_context = getattr(compilation_config, "static_forward_context", None)
     layers = getattr(static_forward_context, "values", None)
     if not callable(layers):
         return ()
@@ -64,7 +61,28 @@ def _loaded_fa4_num_queries_per_kv(vllm_config: object) -> tuple[int, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def fa4_cutedsl_warmup(worker: Worker) -> None:
+def _warm_fa4_mla_prefill(worker: Worker) -> None:
+    runner = worker.model_runner
+    if runner.is_pooling_model:
+        return
+
+    vllm_config = runner.vllm_config
+    if not vllm_config.model_config.use_mla:
+        return
+    try:
+        backend_cls = get_mla_prefill_backend(vllm_config)
+    except ValueError:
+        # Fall back to the top-k MQA prefill path.
+        return
+    if backend_cls.get_name() != "FLASH_ATTN":
+        return
+
+    from vllm.v1.attention.backends.mla.prefill import flash_attn
+
+    flash_attn.FA4_MLA_PREFILL_KERNEL.warmup(vllm_config)
+
+
+def _warm_fa4_runtime_attention(worker: Worker) -> None:
     runner = worker.model_runner
     if runner.is_pooling_model:
         return
@@ -78,10 +96,6 @@ def fa4_cutedsl_warmup(worker: Worker) -> None:
             return
         if backend_cls.get_name() != "FLASH_ATTN":
             return
-
-        from vllm.v1.attention.backends.mla.prefill import flash_attn
-
-        flash_attn.FA4_MLA_PREFILL_KERNEL.warmup(vllm_config)
 
     if (
         not current_platform.is_device_capability(90)
@@ -216,9 +230,7 @@ def fa4_cutedsl_warmup(worker: Worker) -> None:
                     num_tokens=_MIXED_WARMUP_TOKENS,
                     decode_prompt_len=query_len,
                     decode_scheduled_tokens=1,
-                    req_id_prefix=(
-                        f"_fa4_warmup_{max_warmup_tokens}_{query_len}"
-                    ),
+                    req_id_prefix=(f"_fa4_warmup_{max_warmup_tokens}_{query_len}"),
                 )
             if not mixed_warmed:
                 runner._dummy_run(
@@ -227,3 +239,23 @@ def fa4_cutedsl_warmup(worker: Worker) -> None:
                     is_profile=True,
                     num_reqs=1,
                 )
+
+
+def _warm_inkling_fa4_rel_attention(worker: Worker) -> None:
+    from vllm.models.inkling.configs import InklingMMConfig, InklingModelConfig
+    from vllm.models.inkling.nvidia.ops.fa4_rel_attention import (
+        INKLING_FA4_REL_ATTENTION_KERNEL,
+    )
+
+    vllm_config = worker.vllm_config
+    hf_config = vllm_config.model_config.hf_config
+    if not isinstance(hf_config, (InklingMMConfig, InklingModelConfig)):
+        return
+
+    INKLING_FA4_REL_ATTENTION_KERNEL.warmup(vllm_config)
+
+
+def fa4_cutedsl_warmup(worker: Worker) -> None:
+    _warm_fa4_mla_prefill(worker)
+    _warm_fa4_runtime_attention(worker)
+    _warm_inkling_fa4_rel_attention(worker)
