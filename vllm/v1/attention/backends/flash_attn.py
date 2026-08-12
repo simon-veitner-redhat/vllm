@@ -355,20 +355,24 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
     # to FULL_AND_PIECEWISE.
     # TODO(luka, lucas): audit FA2 as part of:
     #  https://github.com/vllm-project/vllm/issues/22945
-    _cudagraph_support = (
-        AttentionCGSupport.ALWAYS
-        if get_flash_attn_version() == 3
-        else AttentionCGSupport.UNIFORM_BATCH
-    )
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     supports_update_block_table: bool = True
 
-    @classmethod
-    def get_cudagraph_support(
-        cls,
+    @staticmethod
+    def _get_effective_fa_version(
         vllm_config: "VllmConfig",
         kv_cache_spec: "KVCacheSpec",
-    ) -> AttentionCGSupport:
-        return cls._cudagraph_support
+    ) -> int | None:
+        model_config = vllm_config.model_config
+        head_size = getattr(kv_cache_spec, "head_size", None)
+        return get_flash_attn_version(
+            requires_alibi=model_config is not None and model_config.uses_alibi,
+            requires_local_attention=(
+                getattr(kv_cache_spec, "sliding_window", None) is not None
+            ),
+            head_size=head_size,
+            head_size_v=getattr(kv_cache_spec, "head_size_v", head_size),
+        )
 
     def _get_scheduler_metadata(
         self,
@@ -444,7 +448,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.block_size = kv_cache_spec.block_size
 
         self.max_num_splits = 0  # No upper bound on the number of splits.
-        self.fa_version = get_flash_attn_version()
+        self.fa_version = self._get_effective_fa_version(vllm_config, kv_cache_spec)
         self.aot_schedule = self.fa_version == 3
 
         try:
@@ -597,6 +601,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 elif len(sliding_window_configs) > 1:
                     self.aot_schedule = False
                     aot_schedule = False
+
+        # Symmetrize the spec's sliding_window for non-causal attention.
+        group_sliding_window = getattr(self.kv_cache_spec, "sliding_window", None)
+        base_window = (
+            (-1, -1) if group_sliding_window is None else (group_sliding_window - 1, 0)
+        )
+        effective_sliding_window = _maybe_symmetrize_window(base_window, causal)
 
         max_num_splits = 0  # 0 means use FA3's heuristics, not CG compatible
         if (
@@ -760,6 +771,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     head_dim_v=self.headdim,
                     has_qv=False,
                     cp_world_size=self.dcp_world_size,
+                    window_size=effective_sliding_window,
                     cuda_graph_max_num_splits=cuda_graph_max_num_splits,
                     fast_build=fast_build,
                 )
@@ -770,13 +782,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         if isinstance(causal, torch.Tensor) and causal.dtype != torch.int32:
             causal = causal.to(torch.int32)
-
-        # Symmetrize the spec's sliding_window for non-causal attention
-        group_sliding_window = getattr(self.kv_cache_spec, "sliding_window", None)
-        base_window = (
-            (-1, -1) if group_sliding_window is None else (group_sliding_window - 1, 0)
-        )
-        effective_sliding_window = _maybe_symmetrize_window(base_window, causal)
 
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,

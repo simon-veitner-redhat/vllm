@@ -14,6 +14,7 @@ from vllm.model_executor.models.config import Gemma4Config
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends import fa_utils
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.vllm_flash_attn.cute.split_scheduler import plan_hopper_split_schedule
 
 
 def _config(
@@ -61,6 +62,37 @@ def hopper(monkeypatch: pytest.MonkeyPatch):
         lambda name: fake_interface,
     )
     return fake_interface
+
+
+
+def test_mixed_graph_schedule_ignores_padded_query_rows(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    device = torch.device("cuda")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=132),
+    )
+
+    plan = plan_hopper_split_schedule(
+        torch.tensor([0, 1, 64, 64, 64], dtype=torch.int32),
+        torch.tensor([1024, 1024, 1024, 1024], dtype=torch.int32),
+        device=device,
+        num_heads_q=32,
+        num_heads_kv=8,
+        head_dim=128,
+        head_dim_v=128,
+        has_qv=False,
+        cp_world_size=1,
+        window_size=None,
+        cuda_graph_max_num_splits=32,
+    )
+
+    assert plan is not None
+    assert plan.split_counts is not None
+    assert len(plan.split_counts) == 4
 
 
 def test_default_hopper_flash_attn_version_is_unchanged(hopper):
