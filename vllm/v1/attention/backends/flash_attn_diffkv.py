@@ -4,6 +4,8 @@
 
 import torch
 
+from vllm.config import get_current_vllm_config_or_none
+
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
@@ -13,6 +15,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version,
+    get_sm90_fa4_fp8_attention_mode,
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
@@ -131,6 +134,23 @@ class FlashAttentionDiffKVImpl(FlashAttentionImpl):
             head_size_v=FlashAttentionDiffKVBackend.head_size_v,
             has_sinks=self.sinks is not None,
         )
+        vllm_config = get_current_vllm_config_or_none()
+        self.native_fp8_out_dtype = (
+            vllm_config.model_config.dtype if vllm_config is not None else None
+        )
+        self.sm90_fa4_fp8_mode = (
+            get_sm90_fa4_fp8_attention_mode(
+                fa_version=self.vllm_flash_attn_version,
+                kv_cache_dtype=self.kv_cache_dtype,
+                head_size=self.head_size,
+                head_size_v=FlashAttentionDiffKVBackend.head_size_v,
+                out_dtype=self.native_fp8_out_dtype,
+            )
+            if current_platform.is_device_capability_family(90)
+            else None
+        )
+        if self.sm90_fa4_fp8_mode == "native":
+            self.supports_quant_query_input = True
 
     def do_kv_cache_update(
         self,
@@ -182,9 +202,8 @@ class FlashAttentionDiffKVImpl(FlashAttentionImpl):
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size_v]
-        NOTE: FP8 quantization, flash-attn expect the size of
-              {q,k,v}_descale to be (num_sequences, num_kv_heads).
-              We use torch's .expand() to avoid duplicating values
+        NOTE: Native FP8 FA4 consumes rank-0 layer descales directly. Other
+              FlashAttention versions retain the existing expanded scale views.
         """
         assert self.vllm_flash_attn_version is not None, (
             "FlashAttention version not detected."
@@ -250,6 +269,33 @@ class FlashAttentionDiffKVImpl(FlashAttentionImpl):
             key_cache = key_cache.view(current_platform.fp8_dtype())
             value_cache = value_cache.view(current_platform.fp8_dtype())
 
+        native_fp8 = self.sm90_fa4_fp8_mode == "native"
+        if native_fp8:
+            if output.dtype not in (torch.bfloat16, torch.float16):
+                raise ValueError(
+                    "Native FP8 FA4 output must be torch.bfloat16 or "
+                    f"torch.float16, got {output.dtype}"
+                )
+            if (
+                self.native_fp8_out_dtype is not None
+                and output.dtype != self.native_fp8_out_dtype
+            ):
+                raise ValueError(
+                    f"Preallocated output dtype {output.dtype} does not match "
+                    f"configured model dtype {self.native_fp8_out_dtype}"
+                )
+            out_dtype = output.dtype
+        else:
+            out_dtype = None
+
+        dynamic_scheduler_counter = None
+        if native_fp8:
+            if self._dynamic_scheduler_counter is None:
+                self._dynamic_scheduler_counter = torch.zeros(
+                    (1,), dtype=torch.int32, device=query.device
+                )
+            dynamic_scheduler_counter = self._dynamic_scheduler_counter
+
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
@@ -257,8 +303,27 @@ class FlashAttentionDiffKVImpl(FlashAttentionImpl):
             max_seqlen_k = attn_metadata.max_seq_len
             block_table = attn_metadata.block_table
             scheduler_metadata = attn_metadata.scheduler_metadata
+            if scheduler_metadata is not None and scheduler_metadata.numel() == 0:
+                scheduler_metadata = None
 
-            descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+            q_descale = layer._q_scale if self.supports_quant_query_input else None
+            if native_fp8:
+                q_descale_arg = q_descale
+                k_descale_arg = layer._k_scale
+                v_descale_arg = layer._v_scale
+            else:
+                descale_shape = (
+                    cu_seqlens_q.shape[0] - 1,
+                    self.num_kv_heads,
+                )
+                q_descale_arg = (
+                    q_descale.expand(descale_shape)
+                    if q_descale is not None
+                    else None
+                )
+                k_descale_arg = layer._k_scale.expand(descale_shape)
+                v_descale_arg = layer._v_scale.expand(descale_shape)
+                out_dtype = None
 
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
@@ -269,9 +334,11 @@ class FlashAttentionDiffKVImpl(FlashAttentionImpl):
                     value_cache,
                     output[:num_actual_tokens],
                     attn_metadata,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
+                    q_descale=q_descale_arg,
+                    k_descale=k_descale_arg,
+                    v_descale=v_descale_arg,
+                    out_dtype=out_dtype,
+                    dynamic_scheduler_counter=dynamic_scheduler_counter,
                 )
                 return output
             else:
@@ -297,15 +364,30 @@ class FlashAttentionDiffKVImpl(FlashAttentionImpl):
                     softcap=self.logits_soft_cap,
                     scheduler_metadata=scheduler_metadata,
                     fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
+                    q_descale=q_descale_arg,
+                    k_descale=k_descale_arg,
+                    v_descale=v_descale_arg,
+                    out_dtype=out_dtype,
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
+                    dynamic_scheduler_counter=dynamic_scheduler_counter,
                 )
                 return output
 
         # Cascade attention (rare case).
+        prefix_scheduler_metadata = attn_metadata.prefix_scheduler_metadata
+        if (
+            prefix_scheduler_metadata is not None
+            and prefix_scheduler_metadata.numel() == 0
+        ):
+            prefix_scheduler_metadata = None
+        suffix_scheduler_metadata = attn_metadata.scheduler_metadata
+        if (
+            suffix_scheduler_metadata is not None
+            and suffix_scheduler_metadata.numel() == 0
+        ):
+            suffix_scheduler_metadata = None
+
         cascade_attention(
             output[:num_actual_tokens],
             query[:num_actual_tokens],
@@ -325,11 +407,13 @@ class FlashAttentionDiffKVImpl(FlashAttentionImpl):
             common_prefix_len=attn_metadata.common_prefix_len,
             max_num_splits=attn_metadata.max_num_splits,
             fa_version=self.vllm_flash_attn_version,
-            prefix_scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
-            suffix_scheduler_metadata=attn_metadata.scheduler_metadata,
-            q_descale=layer._q_scale,
+            prefix_scheduler_metadata=prefix_scheduler_metadata,
+            suffix_scheduler_metadata=suffix_scheduler_metadata,
+            q_descale=layer._q_scale if self.supports_quant_query_input else None,
             k_descale=layer._k_scale,
             v_descale=layer._v_scale,
             s_aux=self.sinks,
+            out_dtype=out_dtype,
+            dynamic_scheduler_counter=dynamic_scheduler_counter,
         )
         return output

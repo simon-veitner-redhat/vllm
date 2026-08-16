@@ -27,6 +27,7 @@ from vllm.v1.attention.backends.fa_utils import (
     flash_attn_supports_kv_cache_dtype,
     flash_attn_supports_quant_query_input,
     get_flash_attn_version,
+    get_sm90_fa4_fp8_attention_mode,
     is_fa_version_supported,
     is_flash_attn_varlen_func_available,
 )
@@ -227,7 +228,7 @@ class FlashAttentionBackend(AttentionBackend):
             and not flash_attn_supports_kv_cache_dtype(
                 kv_cache_dtype,
                 head_size=head_size,
-                head_size_v=head_size,
+                head_size_v=getattr(cls, "head_size_v", head_size),
                 has_sinks=has_sink,
             )
         ):
@@ -401,6 +402,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             num_heads_q=self.num_heads_q * self.dcp_world_size,
             num_heads_kv=self.num_heads_kv,
             headdim=self.headdim,
+            headdim_v=self.headdim_v,
             cache_seqlens=seqlens,
             qkv_dtype=qkv_dtype,
             cu_seqlens_q=cu_query_lens,
@@ -445,6 +447,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.num_heads_kv = self.model_config.get_num_kv_heads(self.parallel_config)
         self.kv_cache_dtype = kv_cache_spec.dtype
         self.headdim = self.model_config.get_head_size()
+        spec_head_size_v = getattr(kv_cache_spec, "head_size_v", None)
+        self.headdim_v = (
+            self.headdim if spec_head_size_v is None else spec_head_size_v
+        )
         self.block_size = kv_cache_spec.block_size
 
         self.max_num_splits = 0  # No upper bound on the number of splits.
@@ -503,7 +509,21 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 self.attention_config.flash_attn_max_num_splits_for_cuda_graph
             )
 
-        if self.fa_version == 4 and current_platform.is_device_capability(90):
+        if (
+            self.fa_version == 4
+            and current_platform.is_device_capability(90)
+            and (
+                not is_quantized_kv_cache(self.cache_config.cache_dtype)
+                or get_sm90_fa4_fp8_attention_mode(
+                    fa_version=self.fa_version,
+                    kv_cache_dtype=self.cache_config.cache_dtype,
+                    head_size=self.headdim,
+                    head_size_v=self.headdim_v,
+                    out_dtype=vllm_config.model_config.dtype,
+                )
+                == "native"
+            )
+        ):
             from vllm.vllm_flash_attn.cute.split_scheduler import (
                 SplitSchedulerPlanner,
             )
@@ -768,7 +788,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     num_heads_q=self.num_heads_q,
                     num_heads_kv=self.num_heads_kv,
                     head_dim=self.headdim,
-                    head_dim_v=self.headdim,
+                    head_dim_v=self.headdim_v,
                     has_qv=False,
                     cp_world_size=self.dcp_world_size,
                     window_size=effective_sliding_window,
@@ -779,6 +799,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         if split_plan is not None:
             max_num_splits = split_plan.num_splits
             scheduler_metadata = split_plan.scheduler_metadata
+            if scheduler_metadata is not None and scheduler_metadata.numel() == 0:
+                scheduler_metadata = None
 
         if isinstance(causal, torch.Tensor) and causal.dtype != torch.int32:
             causal = causal.to(torch.int32)
@@ -969,8 +991,22 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         self.supports_quant_query_input = flash_attn_supports_quant_query_input()
-
         vllm_config = get_current_vllm_config_or_none()
+        self.model_dtype = (
+            vllm_config.model_config.dtype if vllm_config is not None else None
+        )
+        self.sm90_fa4_fp8_mode = (
+            get_sm90_fa4_fp8_attention_mode(
+                fa_version=self.vllm_flash_attn_version,
+                kv_cache_dtype=self.kv_cache_dtype,
+                head_size=self.head_size,
+                head_size_v=self.head_size,
+                out_dtype=self.model_dtype,
+            )
+            if self.model_dtype is not None
+            else None
+        )
+        self._dynamic_scheduler_counter: torch.Tensor | None = None
         dcp_a2a = (
             vllm_config is not None
             and vllm_config.parallel_config.decode_context_parallel_size > 1
@@ -1076,6 +1112,27 @@ class FlashAttentionImpl(AttentionImpl):
             # queries are quantized in the attention layer
             key_cache = key_cache.view(current_platform.fp8_dtype())
             value_cache = value_cache.view(current_platform.fp8_dtype())
+        native_out_dtype = None
+        if self.sm90_fa4_fp8_mode == "native":
+            # Attention.forward allocates output before quantizing query, so
+            # its dtype preserves the authoritative pre-quantization Q dtype.
+            native_out_dtype = output.dtype
+            assert native_out_dtype in (torch.float16, torch.bfloat16), (
+                "Native Hopper FA4 FP8 attention requires an FP16 or BF16 "
+                f"pre-quantization query dtype, got {native_out_dtype}."
+            )
+            assert native_out_dtype == self.model_dtype, (
+                "Native Hopper FA4 FP8 output dtype must match the configured "
+                f"model dtype: output={native_out_dtype}, model={self.model_dtype}."
+            )
+
+            if self._dynamic_scheduler_counter is None:
+                self._dynamic_scheduler_counter = torch.zeros(
+                    (1,), dtype=torch.int32, device=query.device
+                )
+            dynamic_scheduler_counter = self._dynamic_scheduler_counter
+        else:
+            dynamic_scheduler_counter = None
 
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
@@ -1084,16 +1141,24 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_k = attn_metadata.max_seq_len
             block_table = attn_metadata.block_table
             scheduler_metadata = attn_metadata.scheduler_metadata
+            if scheduler_metadata is not None and scheduler_metadata.numel() == 0:
+                scheduler_metadata = None
 
-            descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
-
-            q_descale = (
-                layer._q_scale.expand(descale_shape)
-                if self.supports_quant_query_input
-                else None
-            )
-            k_descale = layer._k_scale.expand(descale_shape)
-            v_descale = layer._v_scale.expand(descale_shape)
+            if self.sm90_fa4_fp8_mode == "native":
+                q_descale = (
+                    layer._q_scale if self.supports_quant_query_input else None
+                )
+                k_descale = layer._k_scale
+                v_descale = layer._v_scale
+            else:
+                descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
+                q_descale = (
+                    layer._q_scale.expand(descale_shape)
+                    if self.supports_quant_query_input
+                    else None
+                )
+                k_descale = layer._k_scale.expand(descale_shape)
+                v_descale = layer._v_scale.expand(descale_shape)
 
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
@@ -1107,6 +1172,8 @@ class FlashAttentionImpl(AttentionImpl):
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    out_dtype=native_out_dtype,
+                    dynamic_scheduler_counter=dynamic_scheduler_counter,
                 )
                 return output
             else:
@@ -1213,6 +1280,7 @@ class FlashAttentionImpl(AttentionImpl):
                     softcap=self.logits_soft_cap,
                     scheduler_metadata=scheduler_metadata,
                     fa_version=self.vllm_flash_attn_version,
+                    out_dtype=native_out_dtype,
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
@@ -1221,6 +1289,7 @@ class FlashAttentionImpl(AttentionImpl):
                     s_aux=self.sinks,
                     mask_mod=rswa_mask_mod_fn or mm_mask_mod,
                     aux_tensors=rswa_aux or mm_aux,
+                    dynamic_scheduler_counter=dynamic_scheduler_counter,
                 )
                 return output
 
@@ -1246,10 +1315,12 @@ class FlashAttentionImpl(AttentionImpl):
             fa_version=self.vllm_flash_attn_version,
             prefix_scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
             suffix_scheduler_metadata=attn_metadata.scheduler_metadata,
-            q_descale=layer._q_scale,
+            q_descale=layer._q_scale if self.supports_quant_query_input else None,
             k_descale=layer._k_scale,
             v_descale=layer._v_scale,
+            out_dtype=native_out_dtype,
             s_aux=self.sinks,
+            dynamic_scheduler_counter=dynamic_scheduler_counter,
         )
         return output
 
@@ -1301,6 +1372,8 @@ class FlashAttentionImpl(AttentionImpl):
         q_descale: torch.Tensor | None = None,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
+        out_dtype: torch.dtype | None = None,
+        dynamic_scheduler_counter: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.vllm_flash_attn_version is not None, (
             "FlashAttention version not detected."
@@ -1330,10 +1403,12 @@ class FlashAttentionImpl(AttentionImpl):
                 softcap=self.logits_soft_cap,
                 return_softmax_lse=True,
                 fa_version=self.vllm_flash_attn_version,
+                out_dtype=out_dtype,
                 q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
                 num_splits=attn_metadata.max_num_splits,
+                dynamic_scheduler_counter=dynamic_scheduler_counter,
             )
             return output
 
@@ -1420,10 +1495,12 @@ class FlashAttentionImpl(AttentionImpl):
                 return_softmax_lse=True,
                 scheduler_metadata=attn_metadata.scheduler_metadata,
                 fa_version=self.vllm_flash_attn_version,
+                out_dtype=out_dtype,
                 q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
                 num_splits=attn_metadata.max_num_splits,
+                dynamic_scheduler_counter=dynamic_scheduler_counter,
             )
         # FA returns LSE in shape [ H, B ] but DCP combine wants [ B, H ]
         context_attn_out_cor, context_lse_cor = self.dcp_combine(
@@ -1450,10 +1527,12 @@ class FlashAttentionImpl(AttentionImpl):
             softcap=self.logits_soft_cap,
             return_softmax_lse=True,
             fa_version=self.vllm_flash_attn_version,
+            out_dtype=out_dtype,
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
             num_splits=attn_metadata.max_num_splits,
+            dynamic_scheduler_counter=dynamic_scheduler_counter,
         )
         assert context_attn_out_cor.shape == query_attn_out.shape
         assert context_lse_cor.shape == query_lse.shape
@@ -1801,6 +1880,8 @@ def cascade_attention(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     s_aux: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    dynamic_scheduler_counter: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert alibi_slopes is None, "Cascade attention does not support ALiBi."
     # TODO: Support sliding window.
@@ -1814,6 +1895,7 @@ def cascade_attention(
     num_common_kv_blocks = common_prefix_len // block_size
     assert num_common_kv_blocks > 0
     descale_shape = (cu_prefix_query_lens.shape[0] - 1, key_cache.shape[-2])
+    expand_descales = out_dtype is None
 
     # Process shared prefix.
     prefix_output, prefix_lse = flash_attn_varlen_func(
@@ -1832,13 +1914,27 @@ def cascade_attention(
         return_softmax_lse=True,
         scheduler_metadata=prefix_scheduler_metadata,
         fa_version=fa_version,
-        q_descale=q_descale.expand(descale_shape) if q_descale is not None else None,
-        k_descale=k_descale.expand(descale_shape) if k_descale is not None else None,
-        v_descale=v_descale.expand(descale_shape) if v_descale is not None else None,
+        out_dtype=out_dtype,
+        q_descale=(
+            q_descale.expand(descale_shape)
+            if expand_descales and q_descale is not None
+            else q_descale
+        ),
+        k_descale=(
+            k_descale.expand(descale_shape)
+            if expand_descales and k_descale is not None
+            else k_descale
+        ),
+        v_descale=(
+            v_descale.expand(descale_shape)
+            if expand_descales and v_descale is not None
+            else v_descale
+        ),
         # s_aux is incorporated into prefix_lse inside the GPU kernel,
         # enabling its effect during the final attention merge.
         s_aux=s_aux,
         num_splits=1 if envs.VLLM_BATCH_INVARIANT else max_num_splits,
+        dynamic_scheduler_counter=dynamic_scheduler_counter,
     )
 
     descale_shape = (cu_query_lens.shape[0] - 1, key_cache.shape[-2])
@@ -1860,10 +1956,24 @@ def cascade_attention(
         return_softmax_lse=True,
         scheduler_metadata=suffix_scheduler_metadata,
         fa_version=fa_version,
-        q_descale=q_descale.expand(descale_shape) if q_descale is not None else None,
-        k_descale=k_descale.expand(descale_shape) if k_descale is not None else None,
-        v_descale=v_descale.expand(descale_shape) if v_descale is not None else None,
+        out_dtype=out_dtype,
+        q_descale=(
+            q_descale.expand(descale_shape)
+            if expand_descales and q_descale is not None
+            else q_descale
+        ),
+        k_descale=(
+            k_descale.expand(descale_shape)
+            if expand_descales and k_descale is not None
+            else k_descale
+        ),
+        v_descale=(
+            v_descale.expand(descale_shape)
+            if expand_descales and v_descale is not None
+            else v_descale
+        ),
         num_splits=1 if envs.VLLM_BATCH_INVARIANT else max_num_splits,
+        dynamic_scheduler_counter=dynamic_scheduler_counter,
     )
 
     # Merge prefix and suffix outputs, and store the result in output.

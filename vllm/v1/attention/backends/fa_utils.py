@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from importlib import import_module
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import torch
 
@@ -59,6 +59,41 @@ def _requires_fa4(vllm_config: "VllmConfig") -> bool:
         return False
     get_head_size = getattr(model_config, "get_head_size", None)
     return get_head_size is not None and get_head_size() > 256
+
+
+def get_sm90_fa4_fp8_attention_mode(
+    *,
+    fa_version: int | None,
+    kv_cache_dtype: str,
+    head_size: int,
+    head_size_v: int | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> Literal["native"] | None:
+    """Classify the explicitly supported native Hopper FA4 E4M3 cell."""
+    capability = current_platform.get_device_capability()
+    if (
+        fa_version != 4
+        or capability is None
+        or capability.major != 9
+        or kv_cache_dtype not in ("fp8", "fp8_e4m3")
+        or (
+            out_dtype is not None
+            and out_dtype not in (torch.float16, torch.bfloat16)
+        )
+    ):
+        return None
+
+    head_size_v = head_size if head_size_v is None else head_size_v
+    if (head_size, head_size_v) in {
+        (64, 64),
+        (96, 96),
+        (128, 128),
+        (192, 192),
+        (256, 256),
+        (192, 128),
+    }:
+        return "native"
+    return None
 
 
 class _FA4FallbackState(NamedTuple):
@@ -135,11 +170,27 @@ def resolve_flash_attn_version(vllm_config: "VllmConfig") -> int | None:
             reasons.append("FA4 does not support batch-invariant serving on Hopper")
 
         cache_config = vllm_config.cache_config
-        if cache_config is not None and cache_config.cache_dtype in (
-            "fp8",
-            "fp8_e4m3",
+        model_config = vllm_config.model_config
+        if (
+            cache_config is not None
+            and cache_config.cache_dtype in ("fp8", "fp8_e4m3")
+            and model_config is not None
         ):
-            reasons.append("FA4 does not support FP8 KV cache on Hopper")
+            get_head_size = getattr(model_config, "get_head_size", None)
+            head_size = get_head_size() if get_head_size is not None else -1
+            if (
+                get_sm90_fa4_fp8_attention_mode(
+                    fa_version=4,
+                    kv_cache_dtype=cache_config.cache_dtype,
+                    head_size=head_size,
+                    out_dtype=getattr(model_config, "dtype", None),
+                )
+                is None
+            ):
+                reasons.append(
+                    "Hopper FA4 FP8 attention has no proven native E4M3 "
+                    f"kernel cell for head_size={head_size}"
+                )
         if _uses_generic_sparse_mla_fa3(vllm_config):
             reasons.append("FA4 does not support the generic sparse-MLA FA3 route")
 
@@ -300,11 +351,44 @@ def get_flash_attn_version(
             )
             fa_version = 2
 
+        is_sm90_fp8_attention = (
+            fa_version == 4
+            and device_capability.major == 9
+            and head_size is not None
+            and vllm_config is not None
+            and vllm_config.cache_config is not None
+            and vllm_config.cache_config.cache_dtype in ("fp8", "fp8_e4m3")
+        )
+        sm90_fp8_mode = (
+            get_sm90_fa4_fp8_attention_mode(
+                fa_version=fa_version,
+                kv_cache_dtype=vllm_config.cache_config.cache_dtype,
+                head_size=head_size,
+                head_size_v=head_size_v,
+                out_dtype=getattr(vllm_config.model_config, "dtype", None),
+            )
+            if is_sm90_fp8_attention
+            and vllm_config is not None
+            and vllm_config.cache_config is not None
+            and head_size is not None
+            else None
+        )
+        if is_sm90_fp8_attention and sm90_fp8_mode is None:
+            logger.info_once(
+                "Hopper FA4 FP8 attention has no proven native E4M3 kernel cell "
+                "for (head_size, head_size_v)=(%d, %s); using FA3 for this layer.",
+                head_size,
+                head_size_v if head_size_v is not None else head_size,
+                scope="local",
+            )
+            fa_version = 3
+
         # Some FA3 unsupported SM90 cases can use FA4 when available.
         if (
             fa_version == 3
             and device_capability.major == 9
             and is_fa_version_supported(4)
+            and not (is_sm90_fp8_attention and sm90_fp8_mode is None)
         ):
             upgrade_reason = None
             if head_size is not None and head_size > 256:
@@ -421,6 +505,18 @@ def flash_attn_supports_kv_cache_dtype(
     )
     if fa_version == 3 and current_platform.is_device_capability_family(90):
         return True
+    if fa_version == 4 and current_platform.is_device_capability_family(90):
+        if head_size is None:
+            return kv_cache_dtype in ("fp8", "fp8_e4m3")
+        return (
+            get_sm90_fa4_fp8_attention_mode(
+                fa_version=fa_version,
+                kv_cache_dtype=kv_cache_dtype,
+                head_size=head_size,
+                head_size_v=head_size_v,
+            )
+            == "native"
+        )
     if fa_version == 4 and current_platform.is_device_capability_family(100):
         return True
     return False

@@ -4,6 +4,7 @@
 # ruff: noqa: E501
 
 
+from functools import cache
 from importlib import import_module
 
 import torch
@@ -131,6 +132,48 @@ def fa_version_unsupported_reason(fa_version: int) -> str | None:
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
+@cache
+def _is_sm90_device(device: torch.device) -> bool:
+    """Cache the immutable compute capability used by every FA4 layer call."""
+    return torch.cuda.get_device_capability(device) == (9, 0)
+
+
+def _validate_native_fp8_descale(
+    descale: torch.Tensor | None,
+    *,
+    name: str,
+    batch_size: int,
+    num_kv_heads: int,
+    device: torch.device,
+) -> None:
+    if descale is None:
+        return
+    if descale.dtype != torch.float32:
+        raise ValueError(f"{name} must have dtype torch.float32")
+    if descale.device != device:
+        raise ValueError(f"{name} must be on device {device}")
+    if descale.ndim == 0:
+        return
+    expected_shape = (batch_size, num_kv_heads)
+    if descale.ndim != 2 or tuple(descale.shape) != expected_shape:
+        raise ValueError(f"{name} must be scalar or have shape {expected_shape}")
+    batch_stride, head_stride = descale.stride()
+    valid_layout = (
+        (batch_stride == 0 and head_stride == 0)
+        or (batch_stride == 0 and head_stride == 1)
+        or (batch_stride > 0 and head_stride == 0)
+        or (
+            batch_stride != 0
+            and head_stride != 0
+            and descale.is_contiguous()
+        )
+    )
+    if not valid_layout:
+        raise ValueError(
+            f"{name} has unsupported strides {descale.stride()}; expected "
+            "both-broadcast, batch-broadcast, head-broadcast, or contiguous"
+        )
+
 
 # NOTE only used in FA3
 def get_scheduler_metadata(
@@ -208,8 +251,9 @@ def flash_attn_varlen_func(
     block_table=None,
     return_softmax_lse=False,
     out=None,
-    # FA3 Only
-    scheduler_metadata=None,
+    out_dtype: torch.dtype | None = None,
+    # FA3 and SM90 FA4 FP8
+    scheduler_metadata=None,  # FA3, and SM90 FA4 split scheduling
     q_descale=None,
     k_descale=None,
     v_descale=None,
@@ -228,6 +272,7 @@ def flash_attn_varlen_func(
     aux_tensors=None,
     aux_tensor_leading_dims=None,
     dynamic_causal: "torch.Tensor | None" = None,
+    dynamic_scheduler_counter: "torch.Tensor | None" = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -305,13 +350,13 @@ def flash_attn_varlen_func(
         assert len(window_size) == 2
         real_window_size = (window_size[0], window_size[1])
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    is_sm90 = fa_version == 4 and torch.cuda.get_device_capability(q.device) == (9, 0)
+    is_sm90 = fa_version == 4 and _is_sm90_device(q.device)
     if q_v is not None and is_sm90:
         q_v = maybe_contiguous(q_v)
 
-    dummy_cu_seqlens_k = torch.empty_like(cu_seqlens_q)
 
     if fa_version == 2:
+        dummy_cu_seqlens_k = torch.empty_like(cu_seqlens_q)
         if (
             scheduler_metadata is not None
             and q_descale is not None
@@ -413,11 +458,74 @@ def flash_attn_varlen_func(
                 "instead of passing None"
             )
 
-        from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
+        fa4_native_fp8 = (
+            is_sm90
+            and q.dtype == torch.float8_e4m3fn
+            and k.dtype == torch.float8_e4m3fn
+            and v.dtype == torch.float8_e4m3fn
+        )
+        resolved_out_dtype = None
+        if fa4_native_fp8:
+            if out is not None and out.dtype not in (torch.bfloat16, torch.float16):
+                raise ValueError(
+                    "Native FP8 FA4 output must have dtype torch.bfloat16 "
+                    f"or torch.float16, got {out.dtype}"
+                )
+            if out_dtype is not None and out_dtype not in (
+                torch.bfloat16,
+                torch.float16,
+            ):
+                raise ValueError(
+                    "Native FP8 FA4 out_dtype must be torch.bfloat16 or "
+                    f"torch.float16, got {out_dtype}"
+                )
+            if out is not None and out_dtype is not None and out.dtype != out_dtype:
+                raise ValueError(
+                    f"out dtype {out.dtype} does not match out_dtype {out_dtype}"
+                )
+            resolved_out_dtype = (
+                out.dtype
+                if out is not None
+                else out_dtype
+                if out_dtype is not None
+                else torch.bfloat16
+            )
+            batch_size = cu_seqlens_q.shape[0] - 1
+            num_kv_heads = k.shape[-2]
+            for name, descale in (
+                ("q_descale", q_descale),
+                ("k_descale", k_descale),
+                ("v_descale", v_descale),
+            ):
+                _validate_native_fp8_descale(
+                    descale,
+                    name=name,
+                    batch_size=batch_size,
+                    num_kv_heads=num_kv_heads,
+                    device=q.device,
+                )
 
         num_splits_dynamic_ptr = None
-        if is_sm90 and scheduler_metadata is not None and num_splits > 1:
+        if is_sm90 and scheduler_metadata is not None:
+            batch_size = cu_seqlens_q.shape[0] - 1
+            if (
+                scheduler_metadata.dtype != torch.int32
+                or scheduler_metadata.device != q.device
+                or not scheduler_metadata.is_cuda
+                or scheduler_metadata.ndim != 1
+                or scheduler_metadata.shape[0] != batch_size
+            ):
+                raise ValueError(
+                    "FA4 dynamic scheduler metadata must be a CUDA int32 tensor "
+                    f"of shape ({batch_size},)"
+                )
             num_splits_dynamic_ptr = scheduler_metadata
+
+        from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
+
+        fa4_q_descale = q_descale if fa4_native_fp8 else None
+        fa4_k_descale = k_descale if fa4_native_fp8 else None
+        fa4_v_descale = v_descale if fa4_native_fp8 else None
         out, softmax_lse, _, _ = _flash_attn_fwd(
             q,
             k,
@@ -437,13 +545,18 @@ def flash_attn_varlen_func(
             window_size_right=real_window_size[1] if real_window_size[1] >= 0 else None,
             num_splits=num_splits,
             num_splits_dynamic_ptr=num_splits_dynamic_ptr,
+            dynamic_scheduler_counter=dynamic_scheduler_counter,
             return_lse=return_softmax_lse,
             out=out,
+            out_dtype=resolved_out_dtype,
             learnable_sink=s_aux,
             mask_mod=mask_mod,
             block_sparse_tensors=block_sparse_tensors,
             aux_tensors=aux_tensors,
             aux_tensor_leading_dims=aux_tensor_leading_dims,
+            q_descale=fa4_q_descale,
+            k_descale=fa4_k_descale,
+            v_descale=fa4_v_descale,
             output_scale=output_scale,
             cp_world_size=cp_world_size if is_sm90 else 1,
             cp_rank=cp_rank if is_sm90 else 0,
@@ -460,9 +573,28 @@ def compile_flash_attn_varlen_func_from_specs(
     k_shape: tuple[int, ...],
     v_shape: tuple[int, ...],
     q_dtype: torch.dtype,
+    out_dtype: torch.dtype | None = None,
     v_stride: tuple[int, ...] | None = None,
     cu_seqlens_q_shape: tuple[int, ...] | None = None,
     cu_seqlens_k_shape: tuple[int, ...] | None = None,
+    seqused_q_shape: tuple[int, ...] | None = None,
+    seqused_q_stride: tuple[int, ...] | None = None,
+    seqused_k_shape: tuple[int, ...] | None = None,
+    seqused_k_stride: tuple[int, ...] | None = None,
+    page_table_shape: tuple[int, ...] | None = None,
+    page_table_stride: tuple[int, ...] | None = None,
+    num_splits_dynamic_ptr_shape: tuple[int, ...] | None = None,
+    num_splits_dynamic_ptr_stride: tuple[int, ...] | None = None,
+    s_aux_shape: tuple[int, ...] | None = None,
+    s_aux_stride: tuple[int, ...] | None = None,
+    dynamic_scheduler_counter_shape: tuple[int, ...] | None = None,
+    dynamic_scheduler_counter_stride: tuple[int, ...] | None = None,
+    q_descale_shape: tuple[int, ...] | None = None,
+    q_descale_stride: tuple[int, ...] | None = None,
+    k_descale_shape: tuple[int, ...] | None = None,
+    k_descale_stride: tuple[int, ...] | None = None,
+    v_descale_shape: tuple[int, ...] | None = None,
+    v_descale_stride: tuple[int, ...] | None = None,
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
     dropout_p: float = 0.0,
@@ -481,17 +613,32 @@ def compile_flash_attn_varlen_func_from_specs(
     if dropout_p != 0.0:
         raise NotImplementedError("FA4 compile-only wrapper does not support dropout")
     del deterministic
+    if q_dtype == torch.float8_e4m3fn:
+        if out_dtype is not None and out_dtype not in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            raise ValueError(
+                "Native FP8 FA4 out_dtype must be torch.bfloat16 or "
+                f"torch.float16, got {out_dtype}"
+            )
+    elif out_dtype is not None:
+        raise ValueError("out_dtype is only supported for native FP8 FA4")
+
 
     from vllm.vllm_flash_attn.cute.interface import (
         compile_flash_attn_varlen_func_from_specs as _fa4_compile_flash_attn_varlen_func_from_specs,
     )
 
-    real_window_size: tuple[int, int]
+    real_window_size: tuple[int | None, int | None]
     if window_size is None:
-        real_window_size = (-1, -1)
+        real_window_size = (None, None)
     else:
         assert len(window_size) == 2
-        real_window_size = (window_size[0], window_size[1])
+        real_window_size = (
+            window_size[0] if window_size[0] >= 0 else None,
+            window_size[1] if window_size[1] >= 0 else None,
+        )
 
     if softmax_scale is None:
         softmax_scale = q_shape[-1] ** (-0.5)
@@ -501,9 +648,28 @@ def compile_flash_attn_varlen_func_from_specs(
         k_shape=k_shape,
         v_shape=v_shape,
         q_dtype=q_dtype,
+        out_dtype=out_dtype,
         v_stride=v_stride,
         cu_seqlens_q_shape=cu_seqlens_q_shape,
         cu_seqlens_k_shape=cu_seqlens_k_shape,
+        seqused_q_shape=seqused_q_shape,
+        seqused_q_stride=seqused_q_stride,
+        seqused_k_shape=seqused_k_shape,
+        seqused_k_stride=seqused_k_stride,
+        page_table_shape=page_table_shape,
+        page_table_stride=page_table_stride,
+        num_splits_dynamic_ptr_shape=num_splits_dynamic_ptr_shape,
+        num_splits_dynamic_ptr_stride=num_splits_dynamic_ptr_stride,
+        learnable_sink_shape=s_aux_shape,
+        learnable_sink_stride=s_aux_stride,
+        dynamic_scheduler_counter_shape=dynamic_scheduler_counter_shape,
+        dynamic_scheduler_counter_stride=dynamic_scheduler_counter_stride,
+        q_descale_shape=q_descale_shape,
+        q_descale_stride=q_descale_stride,
+        k_descale_shape=k_descale_shape,
+        k_descale_stride=k_descale_stride,
+        v_descale_shape=v_descale_shape,
+        v_descale_stride=v_descale_stride,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         softmax_scale=softmax_scale,

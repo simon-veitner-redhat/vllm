@@ -39,25 +39,69 @@ SOFT_CAPS = [None]
 SLIDING_WINDOWS = [None, 256]
 
 
-def test_fa4_dcp_forwards_native_cp_args(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        torch.cuda, "get_device_capability", lambda _device: (9, 0)
-    )
-
-    forwarded_kwargs = {}
+@pytest.fixture
+def fa4_dispatch(monkeypatch: pytest.MonkeyPatch):
+    flash_attn_interface._is_sm90_device.cache_clear()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (9, 0))
+    forwarded: dict = {}
+    calls: list[dict] = []
 
     def fake_flash_attn_fwd(*args, **kwargs):
-        forwarded_kwargs.update(kwargs)
-        return args[0], None, None, None
+        forwarded.update(kwargs)
+        calls.append(kwargs)
+        result = kwargs.get("out")
+        return (args[0] if result is None else result), None, None, None
 
     fake_interface = ModuleType("vllm.vllm_flash_attn.cute.interface")
     fake_interface._flash_attn_fwd = fake_flash_attn_fwd  # type: ignore[attr-defined]
     monkeypatch.setitem(
         sys.modules, "vllm.vllm_flash_attn.cute.interface", fake_interface
     )
+    try:
+        yield forwarded, calls
+    finally:
+        flash_attn_interface._is_sm90_device.cache_clear()
 
+
+def _native_fa4_inputs(
+    *,
+    device: str = "cpu",
+    num_heads: tuple[int, int] = (8, 2),
+    out_dtype: torch.dtype = torch.bfloat16,
+    descale_layout: str = "scalar",
+) -> dict:
+    num_query_heads, num_kv_heads = num_heads
+    tensor = lambda *args, **kwargs: torch.empty(*args, device=device, **kwargs)
+    if descale_layout == "scalar":
+        scale_shape = ()
+    else:
+        scale_shape = (2, num_kv_heads)
+    return {
+        "q": tensor((2, num_query_heads, 192), dtype=torch.float8_e4m3fn),
+        "k": tensor((4, 16, num_kv_heads, 192), dtype=torch.float8_e4m3fn),
+        "v": tensor((4, 16, num_kv_heads, 128), dtype=torch.float8_e4m3fn),
+        "out": tensor((2, num_query_heads, 128), dtype=out_dtype),
+        "out_dtype": out_dtype,
+        "cu_seqlens_q": torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+        "seqused_k": torch.tensor([31, 23], dtype=torch.int32, device=device),
+        "max_seqlen_q": 1,
+        "max_seqlen_k": 31,
+        "block_table": torch.tensor(
+            [[0, 1], [2, 3]], dtype=torch.int32, device=device
+        ),
+        "num_splits": 2,
+        "fa_version": 4,
+        "q_descale": torch.full(scale_shape, 0.25, dtype=torch.float32, device=device),
+        "k_descale": torch.full(scale_shape, 0.40, dtype=torch.float32, device=device),
+        "v_descale": torch.full(scale_shape, 0.30, dtype=torch.float32, device=device),
+    }
+
+
+def test_fa4_dcp_forwards_native_cp_args(fa4_dispatch) -> None:
+    forwarded, _ = fa4_dispatch
     q = torch.empty((1, 1, 64))
     cp_tot_seqused_k = torch.tensor([2], dtype=torch.int32)
+    dynamic_scheduler_counter = torch.zeros((1,), dtype=torch.int32)
     result = flash_attn_varlen_func(
         q=q,
         k=torch.empty_like(q),
@@ -70,12 +114,106 @@ def test_fa4_dcp_forwards_native_cp_args(monkeypatch: pytest.MonkeyPatch) -> Non
         cp_world_size=2,
         cp_rank=1,
         cp_tot_seqused_k=cp_tot_seqused_k,
+        dynamic_scheduler_counter=dynamic_scheduler_counter,
     )
 
     assert result is q
-    assert forwarded_kwargs["cp_world_size"] == 2
-    assert forwarded_kwargs["cp_rank"] == 1
-    assert forwarded_kwargs["cp_tot_seqused_k"] is cp_tot_seqused_k
+    assert forwarded["cp_world_size"] == 2
+    assert forwarded["cp_rank"] == 1
+    assert forwarded["cp_tot_seqused_k"] is cp_tot_seqused_k
+    assert forwarded["dynamic_scheduler_counter"] is dynamic_scheduler_counter
+
+
+@pytest.mark.parametrize("descale_layout", ["scalar", "rank2"])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_heads", [(4, 4), (8, 2), (8, 1)])
+def test_fa4_native_fp8_forwards_diffkv_dtype_descales_and_static_splits(
+    fa4_dispatch,
+    num_heads: tuple[int, int],
+    out_dtype: torch.dtype,
+    descale_layout: str,
+) -> None:
+    forwarded, _ = fa4_dispatch
+    inputs = _native_fa4_inputs(
+        num_heads=num_heads, out_dtype=out_dtype, descale_layout=descale_layout
+    )
+    flash_attn_varlen_func(**inputs)
+
+    assert forwarded["out"] is inputs["out"]
+    assert forwarded["out_dtype"] is out_dtype
+    for name in ("q_descale", "k_descale", "v_descale"):
+        assert forwarded[name] is inputs[name]
+    assert forwarded["num_splits"] == 2
+    assert forwarded["num_splits_dynamic_ptr"] is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fa4_native_fp8_forwards_dynamic_split_counts(fa4_dispatch) -> None:
+    forwarded, _ = fa4_dispatch
+    inputs = _native_fa4_inputs(device="cuda")
+    scheduler_metadata = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+    inputs.update(scheduler_metadata=scheduler_metadata, num_splits=3)
+    flash_attn_varlen_func(**inputs)
+
+    assert forwarded["num_splits"] == 3
+    assert forwarded["num_splits_dynamic_ptr"] is scheduler_metadata
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fa4_rejects_invalid_dynamic_split_shape_before_dispatch(
+    fa4_dispatch,
+) -> None:
+    _, calls = fa4_dispatch
+    inputs = _native_fa4_inputs(device="cuda")
+    inputs.update(
+        scheduler_metadata=torch.empty((2, 1), dtype=torch.int32, device="cuda"),
+        num_splits=3,
+    )
+    with pytest.raises(ValueError, match=r"shape \(2,\)"):
+        flash_attn_varlen_func(**inputs)
+    assert not calls
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fa4_native_fp8_diffkv_reaches_real_flash_attn_fwd() -> None:
+    if not is_fa_version_supported(4):
+        pytest.skip(fa_version_unsupported_reason(4))
+
+    q = torch.randn((2, 8, 192), device="cuda").clamp(-2, 2).to(torch.float8_e4m3fn)
+    k = torch.randn((16, 2, 192), device="cuda").clamp(-2, 2).to(torch.float8_e4m3fn)
+    v = torch.randn((16, 2, 128), device="cuda").clamp(-2, 2).to(torch.float8_e4m3fn)
+    scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+
+    out = flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        out_dtype=torch.float16,
+        cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda"),
+        cu_seqlens_k=torch.tensor([0, 8, 16], dtype=torch.int32, device="cuda"),
+        max_seqlen_q=1,
+        max_seqlen_k=8,
+        fa_version=4,
+        q_descale=scale,
+        k_descale=scale,
+        v_descale=scale,
+        num_splits=1,
+    )
+
+    assert out.dtype == torch.float16
+    assert out.shape == (2, 8, 128)
+    assert torch.isfinite(out).all()
+
+
+def test_fa4_native_fp8_rejects_output_dtype_mismatch_before_dispatch(
+    fa4_dispatch,
+) -> None:
+    _, calls = fa4_dispatch
+    inputs = _native_fa4_inputs(out_dtype=torch.float16)
+    inputs["out_dtype"] = torch.bfloat16
+    with pytest.raises(ValueError, match="does not match"):
+        flash_attn_varlen_func(**inputs)
+    assert not calls
 
 
 def test_fa4_cutedsl_probe_imports_interface(

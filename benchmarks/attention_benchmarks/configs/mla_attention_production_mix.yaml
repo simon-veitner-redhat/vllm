@@ -1,135 +1,31 @@
 description: "Production-path mixed MLA attention"
 
-provenance:
-  geometries:
-    - model_id: mistralai/Mistral-Small-4-119B-2603
-      role: 320/256 MLA TP2 shard geometry, page 32
-      synthetic: false
-    - model_id: deepseek-ai/DeepSeek-V3
-      role: 576/512 MLA TP8 shard geometry, page 32
-      synthetic: false
-    - model_id: moonshotai/Kimi-K3
-      role: 576/512 MLA TP1 full-attention geometry, page 32
-      synthetic: false
-    - model_id: deepseek-ai/DeepSeek-V3
-      role: 576/512 MLA TP8 shard geometry, page 128
-      synthetic: false
-    - model_id: deepseek-ai/DeepSeek-V3
-      role: 576/512 MLA TP1 geometry, page 128
-      synthetic: false
-    - model_id: mistralai/Mistral-Small-4-119B-2603
-      role: 320/256 MLA TP2 shard geometry, page 128
-      synthetic: false
-    - model_id: deepseek-ai/DeepSeek-V3
-      role: 576/512 MLA TP4 shard geometry, page 32
-      synthetic: false
-    - model_id: deepseek-ai/DeepSeek-V3
-      role: 576/512 MLA TP2 shard geometry, page 32
-      synthetic: false
-    - model_id: moonshotai/Kimi-K3
-      role: 576/512 MLA TP1 full-attention geometry, page 128
-      synthetic: false
+backends: [FLASH_ATTN_MLA_ALL_FA3, FLASH_ATTN_MLA_ALL_FA4]
 
-model:
-  num_layers: 60
-  block_size: 32
-  head_dim: 576
-  kv_lora_rank: 512
-  qk_nope_head_dim: 128
-  qk_rope_head_dim: 64
-  num_q_heads: 16
-  num_kv_heads: 1
+model: {}
 
 model_parameter_sweep:
   values:
-    # Mistral Small 4 119B TP2.
+    # Mistral Small 4 119B TP2, page 32.
     # https://huggingface.co/mistralai/Mistral-Small-4-119B-2603/blob/main/params.json
-    - num_layers: 36
-      head_dim: 320
-      kv_lora_rank: 256
-      qk_nope_head_dim: 64
-      qk_rope_head_dim: 64
-      v_head_dim: 128
-      num_q_heads: 16
-      num_kv_heads: 1
-      block_size: 32
-    # DeepSeek-V3 TP8.
+    - { num_layers: 36, head_dim: 320, kv_lora_rank: 256, qk_nope_head_dim: 64, qk_rope_head_dim: 64, v_head_dim: 128, num_q_heads: 16, num_kv_heads: 1, block_size: 32 }
+    # DeepSeek-V3 TP8, page 32.
     # https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json
-    - num_layers: 61
-      head_dim: 576
-      kv_lora_rank: 512
-      qk_nope_head_dim: 128
-      qk_rope_head_dim: 64
-      v_head_dim: 128
-      num_q_heads: 16
-      num_kv_heads: 1
-      block_size: 32
-    # Kimi K3 TP1 full-attention layer geometry. The q_lora projection and
-    # output gate are outside this attention-kernel benchmark.
+    - { num_layers: 61, head_dim: 576, kv_lora_rank: 512, qk_nope_head_dim: 128, qk_rope_head_dim: 64, v_head_dim: 128, num_q_heads: 16, num_kv_heads: 1, block_size: 32 }
+    # Kimi K3 TP1 full-attention layer, page 32. Q-LoRA and output gating
+    # are outside this attention-kernel benchmark.
     # https://huggingface.co/moonshotai/Kimi-K3/blob/main/config.json
-    - num_layers: 24
-      head_dim: 576
-      kv_lora_rank: 512
-      qk_nope_head_dim: 128
-      qk_rope_head_dim: 64
-      v_head_dim: 128
-      num_q_heads: 96
-      num_kv_heads: 1
-      block_size: 32
-    - num_layers: 61
-      head_dim: 576
-      kv_lora_rank: 512
-      qk_nope_head_dim: 128
-      qk_rope_head_dim: 64
-      v_head_dim: 128
-      num_q_heads: 16
-      num_kv_heads: 1
-      block_size: 128
-    - num_layers: 61
-      head_dim: 576
-      kv_lora_rank: 512
-      qk_nope_head_dim: 128
-      qk_rope_head_dim: 64
-      v_head_dim: 128
-      num_q_heads: 128
-      num_kv_heads: 1
-      block_size: 128
-    - num_layers: 36
-      head_dim: 320
-      kv_lora_rank: 256
-      qk_nope_head_dim: 64
-      qk_rope_head_dim: 64
-      v_head_dim: 128
-      num_q_heads: 16
-      num_kv_heads: 1
-      block_size: 128
-    - num_layers: 61
-      head_dim: 576
-      kv_lora_rank: 512
-      qk_nope_head_dim: 128
-      qk_rope_head_dim: 64
-      v_head_dim: 128
-      num_q_heads: 32
-      num_kv_heads: 1
-      block_size: 32
-    - num_layers: 61
-      head_dim: 576
-      kv_lora_rank: 512
-      qk_nope_head_dim: 128
-      qk_rope_head_dim: 64
-      v_head_dim: 128
-      num_q_heads: 64
-      num_kv_heads: 1
-      block_size: 32
-    - num_layers: 24
-      head_dim: 576
-      kv_lora_rank: 512
-      qk_nope_head_dim: 128
-      qk_rope_head_dim: 64
-      v_head_dim: 128
-      num_q_heads: 96
-      num_kv_heads: 1
-      block_size: 128
+    - { num_layers: 24, head_dim: 576, kv_lora_rank: 512, qk_nope_head_dim: 128, qk_rope_head_dim: 64, v_head_dim: 128, num_q_heads: 96, num_kv_heads: 1, block_size: 32 }
+    # DeepSeek-V3 TP8 and TP1, page 128.
+    - { num_layers: 61, head_dim: 576, kv_lora_rank: 512, qk_nope_head_dim: 128, qk_rope_head_dim: 64, v_head_dim: 128, num_q_heads: 16, num_kv_heads: 1, block_size: 128 }
+    - { num_layers: 61, head_dim: 576, kv_lora_rank: 512, qk_nope_head_dim: 128, qk_rope_head_dim: 64, v_head_dim: 128, num_q_heads: 128, num_kv_heads: 1, block_size: 128 }
+    # Mistral Small 4 119B TP2, page 128.
+    - { num_layers: 36, head_dim: 320, kv_lora_rank: 256, qk_nope_head_dim: 64, qk_rope_head_dim: 64, v_head_dim: 128, num_q_heads: 16, num_kv_heads: 1, block_size: 128 }
+    # DeepSeek-V3 TP4 and TP2, page 32.
+    - { num_layers: 61, head_dim: 576, kv_lora_rank: 512, qk_nope_head_dim: 128, qk_rope_head_dim: 64, v_head_dim: 128, num_q_heads: 32, num_kv_heads: 1, block_size: 32 }
+    - { num_layers: 61, head_dim: 576, kv_lora_rank: 512, qk_nope_head_dim: 128, qk_rope_head_dim: 64, v_head_dim: 128, num_q_heads: 64, num_kv_heads: 1, block_size: 32 }
+    # Kimi K3 TP1 full-attention layer, page 128.
+    - { num_layers: 24, head_dim: 576, kv_lora_rank: 512, qk_nope_head_dim: 128, qk_rope_head_dim: 64, v_head_dim: 128, num_q_heads: 96, num_kv_heads: 1, block_size: 128 }
   label_format: "{backend}_cache{head_dim}_h{num_q_heads}_b{block_size}"
 
 batch_specs:

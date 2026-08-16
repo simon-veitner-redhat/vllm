@@ -1,50 +1,22 @@
 description: "Production-path standard attention mix"
 
-provenance:
-  geometries:
-    - model_id: tiiuae/falcon-7b
-      role: D64 MQA selector with reduced query-head count
-      synthetic: true
-    - model_id: meta-llama/Llama-3.1-8B
-      role: D128 GQA production geometry
-      synthetic: false
-    - model_id: microsoft/Phi-3-mini-128k-instruct
-      role: D96 MHA production geometry
-      synthetic: false
-    - model_id: google/gemma-2-9b
-      role: D256 GQA production geometry
-      synthetic: false
+backends: [FLASH_ATTN_FA3, FLASH_ATTN_FA4]
 
-model:
-  num_layers: 60
-  block_size: 32
+model: { block_size: 32 }
 
 model_parameter_sweep:
   values:
-    # Representative MQA geometry for the D64 selector family.
-    - num_layers: 32
-      head_dim: 64
-      num_q_heads: 16
-      num_kv_heads: 1
+    # tiiuae/falcon-7b: synthetic reduced-Q D64 MQA selector geometry.
+    - { num_layers: 32, head_dim: 64, num_q_heads: 16, num_kv_heads: 1 }
     # Llama 3.1 8B TP1.
     # https://huggingface.co/meta-llama/Llama-3.1-8B/blob/main/config.json
-    - num_layers: 32
-      head_dim: 128
-      num_q_heads: 32
-      num_kv_heads: 8
+    - { num_layers: 32, head_dim: 128, num_q_heads: 32, num_kv_heads: 8 }
     # Phi-3 Mini 128K TP1.
     # https://huggingface.co/microsoft/Phi-3-mini-128k-instruct/blob/main/config.json
-    - num_layers: 32
-      head_dim: 96
-      num_q_heads: 32
-      num_kv_heads: 32
-    # Gemma 2 9B TP1 geometry. This suite does not claim local-window or
-    # attention-softcap coverage.
+    - { num_layers: 32, head_dim: 96, num_q_heads: 32, num_kv_heads: 32 }
+    # Gemma 2 9B TP1; local-window and attention-softcap are out of scope.
     # https://huggingface.co/google/gemma-2-9b/blob/main/config.json
-    - num_layers: 42
-      head_dim: 256
-      num_q_heads: 16
-      num_kv_heads: 8
+    - { num_layers: 42, head_dim: 256, num_q_heads: 16, num_kv_heads: 8 }
   label_format: "{backend}_d{head_dim}_h{num_q_heads}_kv{num_kv_heads}"
 
 batch_specs:

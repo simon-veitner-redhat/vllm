@@ -84,11 +84,12 @@ async def call_vllm_api(
     stop: list[str] | None = None,
     url: str | None = None,
     seed: int | None = None,
-) -> tuple[str, int]:
+) -> tuple[str | None, int | None, str | None]:
     """Call vLLM's OpenAI-compatible completions endpoint.
 
     Returns:
-        Tuple of (response_text, completion_tokens)
+        Tuple of (response_text, completion_tokens, request_error). Missing
+        usage is represented by ``None`` completion tokens.
     """
     data = {
         "prompt": prompt,
@@ -104,11 +105,12 @@ async def call_vllm_api(
             response.raise_for_status()
             result = await response.json()
             text = result["choices"][0]["text"]
-            completion_tokens = result.get("usage", {}).get("completion_tokens", 0)
-            return text, completion_tokens
+            completion_tokens = result.get("usage", {}).get("completion_tokens")
+            return text, completion_tokens, None
     except Exception as e:
-        print(f"Error calling vLLM API ({type(e).__name__}): {e}")
-        return "", 0
+        error = f"{type(e).__name__}: {e}"
+        print(f"Error calling vLLM API ({error})")
+        return None, None, error
 
 
 async def call_vllm_chat_api(
@@ -120,7 +122,7 @@ async def call_vllm_chat_api(
     stop: list[str] | None = None,
     url: str | None = None,
     seed: int | None = None,
-) -> tuple[str, int]:
+) -> tuple[str | None, int | None, str | None]:
     """Call vLLM's OpenAI-compatible chat completions endpoint."""
     data = {
         "model": model,
@@ -136,12 +138,13 @@ async def call_vllm_chat_api(
         async with session.post(f"{url}/v1/chat/completions", json=data) as response:
             response.raise_for_status()
             result = await response.json()
-            text = result["choices"][0]["message"]["content"] or ""
-            completion_tokens = result.get("usage", {}).get("completion_tokens", 0)
-            return text, completion_tokens
+            text = result["choices"][0]["message"]["content"]
+            completion_tokens = result.get("usage", {}).get("completion_tokens")
+            return text, completion_tokens, None
     except Exception as e:
-        print(f"Error calling vLLM chat API ({type(e).__name__}): {e}")
-        return "", 0
+        error = f"{type(e).__name__}: {e}"
+        print(f"Error calling vLLM chat API ({error})")
+        return None, None, error
 
 
 def _build_gsm8k_prompts(
@@ -153,6 +156,10 @@ def _build_gsm8k_prompts(
     if num_questions == 0:
         return [], []
     train_data, test_data = load_gsm8k_data()
+    if num_questions == 1319:
+        assert len(test_data) == 1319, (
+            f"Expected exactly 1319 GSM8K test questions, loaded {len(test_data)}"
+        )
     num_questions = min(num_questions, len(test_data))
 
     few_shot_examples = ""
@@ -176,24 +183,59 @@ def _build_gsm8k_prompts(
 
 
 def _score_gsm8k(
-    states: list[str],
-    output_tokens: list[int],
+    states: list[str | None],
+    output_tokens: list[int | None],
     labels: list[int],
     num_shots: int,
     max_tokens: int,
     latency: float,
-) -> dict[str, float | int]:
-    """Score GSM8K responses and return a results dict."""
+    request_errors: list[str | None] | None = None,
+) -> dict[str, object]:
+    """Score GSM8K responses and return aggregate and per-example results."""
     num_questions = len(labels)
-    preds = [get_answer_value(state) for state in states]
-    accuracy = np.mean(np.array(preds) == np.array(labels))
-    invalid_rate = np.mean(np.array(preds) == INVALID)
-    total_output_tokens = sum(output_tokens)
-    tokens_per_second = total_output_tokens / latency if latency > 0 else 0.0
+    if request_errors is None:
+        request_errors = [None] * num_questions
+    preds = [
+        get_answer_value(state) if state is not None else INVALID for state in states
+    ]
+    correctness = [pred == label for pred, label in zip(preds, labels)]
+    invalid_response_count = sum(pred == INVALID for pred in preds)
+    total_output_tokens = (
+        None
+        if any(tokens is None for tokens in output_tokens)
+        else sum(tokens for tokens in output_tokens if tokens is not None)
+    )
+    tokens_per_second = (
+        total_output_tokens / latency
+        if total_output_tokens is not None and latency > 0
+        else None
+    )
+    examples = [
+        {
+            "prompt_index": index,
+            "generated_output": state,
+            "parsed_answer": pred,
+            "expected_answer": label,
+            "correctness": correct,
+            "token_count": tokens,
+            "request_error": request_error,
+        }
+        for index, (state, pred, label, correct, tokens, request_error) in enumerate(
+            zip(
+                states,
+                preds,
+                labels,
+                correctness,
+                output_tokens,
+                request_errors,
+            )
+        )
+    ]
 
     return {
-        "accuracy": accuracy,
-        "invalid_rate": invalid_rate,
+        "accuracy": np.mean(correctness),
+        "invalid_rate": np.mean(np.array(preds) == INVALID),
+        "invalid_response_count": invalid_response_count,
         "latency": latency,
         "questions_per_second": num_questions / latency if latency > 0 else 0.0,
         "total_output_tokens": total_output_tokens,
@@ -202,6 +244,7 @@ def _score_gsm8k(
         "num_shots": num_shots,
         "max_tokens": max_tokens,
         "timestamp": time.time(),
+        "results": examples,
     }
 
 
@@ -218,26 +261,30 @@ def evaluate_gsm8k(
     request_timeout_seconds: float = 600,
     gen_prefix: str = "",
     max_concurrency: int | None = None,
-) -> dict[str, float | int]:
+) -> dict[str, object]:
     """
     Evaluate GSM8K accuracy using vLLM serve endpoint.
 
-    Returns dict with accuracy, invalid_rate, latency, etc.
+    Returns dict with accuracy, invalid counts, per-example results, and
+    throughput statistics.
     """
     base_url = f"{host}:{port}"
     prompts, labels = _build_gsm8k_prompts(num_questions, num_shots, gen_prefix)
     num_questions = len(prompts)
 
     async def run_async_evaluation():
-        states: list[str] = [""] * num_questions
-        output_tokens: list[int] = [0] * num_questions
+        states: list[str | None] = [None] * num_questions
+        output_tokens: list[int | None] = [None] * num_questions
+        request_errors: list[str | None] = [None] * num_questions
 
-        async def get_answer(session: aiohttp.ClientSession, i: int) -> tuple[str, int]:
+        async def get_answer(
+            session: aiohttp.ClientSession, i: int
+        ) -> tuple[str | None, int | None, str | None]:
             stop = ["Question", "Assistant:", "<|separator|>"]
             if use_chat_completions:
                 if model is None:
                     raise ValueError("model is required for chat completions")
-                answer, tokens = await call_vllm_chat_api(
+                answer, tokens, request_error = await call_vllm_chat_api(
                     session=session,
                     model=model,
                     prompt=prompts[i],
@@ -248,7 +295,7 @@ def evaluate_gsm8k(
                     seed=seed,
                 )
             else:
-                answer, tokens = await call_vllm_api(
+                answer, tokens, request_error = await call_vllm_api(
                     session=session,
                     prompt=prompts[i],
                     temperature=temperature,
@@ -259,7 +306,8 @@ def evaluate_gsm8k(
                 )
             states[i] = answer
             output_tokens[i] = tokens
-            return answer, tokens
+            request_errors[i] = request_error
+            return answer, tokens, request_error
 
         timeout = aiohttp.ClientTimeout(total=request_timeout_seconds)
         connector = (
@@ -273,15 +321,23 @@ def evaluate_gsm8k(
             tasks = [get_answer(session, i) for i in range(num_questions)]
             await tqdm.gather(*tasks, desc="Evaluating")
 
-        return states, output_tokens
+        return states, output_tokens, request_errors
 
     print(f"Running GSM8K evaluation: {num_questions} questions, {num_shots}-shot")
 
     tic = time.perf_counter()
-    states, output_tokens = asyncio.run(run_async_evaluation())
+    states, output_tokens, request_errors = asyncio.run(run_async_evaluation())
     latency = time.perf_counter() - tic
 
-    return _score_gsm8k(states, output_tokens, labels, num_shots, max_tokens, latency)
+    return _score_gsm8k(
+        states,
+        output_tokens,
+        labels,
+        num_shots,
+        max_tokens,
+        latency,
+        request_errors,
+    )
 
 
 def evaluate_gsm8k_offline(
@@ -293,7 +349,7 @@ def evaluate_gsm8k_offline(
     gen_prefix: str = "",
     use_chat_completions: bool = False,
     chat_template_kwargs: dict[str, object] | None = None,
-) -> dict[str, float | int]:
+) -> dict[str, object]:
     """Evaluate GSM8K accuracy using an offline vllm.LLM object.
 
     Same prompts and scoring as evaluate_gsm8k(), but runs generation
@@ -380,11 +436,17 @@ def main() -> None:
     # Print results to terminal
     print("\nResults:")
     print(f"Accuracy: {result['accuracy']:.3f}")
-    print(f"Invalid responses: {result['invalid_rate']:.3f}")
+    print(
+        f"Invalid responses: {result['invalid_response_count']} "
+        f"({result['invalid_rate']:.3f})"
+    )
     print(f"Total latency: {result['latency']:.3f} s")
     print(f"Questions per second: {result['questions_per_second']:.3f}")
     print(f"Total output tokens: {result['total_output_tokens']}")
-    print(f"Output tokens per second: {result['tokens_per_second']:.3f}")
+    if result["tokens_per_second"] is None:
+        print("Output tokens per second: unavailable (missing token usage)")
+    else:
+        print(f"Output tokens per second: {result['tokens_per_second']:.3f}")
 
     # Optional file saving
     if args.save_results:
