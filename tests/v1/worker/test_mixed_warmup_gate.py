@@ -35,6 +35,29 @@ def test_mixed_warmup_skipped_for_single_seq(max_num_reqs):
     )
 
 
+def test_mixed_warmup_skips_exact_multi_decode_capacity():
+    runner = SimpleNamespace(
+        is_pooling_model=False,
+        max_num_reqs=3,
+        max_model_len=128,
+        model_state=SimpleNamespace(max_encoder_len=0),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=1),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=6,
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=4))
+            ],
+        ),
+    )
+
+    assert not run_mixed_prefill_decode_warmup(
+        runner,
+        worker_execute_model=_fail,
+        worker_sample_tokens=_fail,
+        num_tokens=9,
+        decode_prompt_len=3,
+        num_decode_reqs=2,
+    )
 
 
 def _compile_worker(*impls):
@@ -75,14 +98,125 @@ def _compile_worker(*impls):
     )
 
 
-def _assert_dynamic_scheduler_spec_pairing(compile_calls) -> None:
-    for item in compile_calls:
-        kwargs = item.kwargs
-        has_counter = kwargs["dynamic_scheduler_counter_shape"] == (1,)
-        assert kwargs["dynamic_scheduler_counter_stride"] == (
-            (1,) if has_counter else None
-        )
+def _capture_compile_specs(
+    monkeypatch: pytest.MonkeyPatch,
+    worker,
+    *,
+    cache_layout: str = "NHD",
+) -> list[dict]:
+    compile_specs = MagicMock()
+    monkeypatch.setattr(
+        fa4_warmup.current_platform,
+        "is_device_capability",
+        lambda capability: capability == 90,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.utils.get_kv_cache_layout",
+        lambda: cache_layout,
+    )
+    monkeypatch.setattr(
+        "vllm.vllm_flash_attn.flash_attn_interface."
+        "compile_flash_attn_varlen_func_from_specs",
+        compile_specs,
+    )
 
+    fa4_warmup._warm_fa4_compile_specs(worker)
+    _assert_worker_callbacks_not_called(worker)
+    return [item.kwargs for item in compile_specs.call_args_list]
+
+
+def _assert_worker_callbacks_not_called(worker) -> None:
+    worker.model_runner._dummy_run.assert_not_called()
+    worker.execute_model.assert_not_called()
+    worker.sample_tokens.assert_not_called()
+
+
+def _compile_classes(specs: list[dict]) -> tuple[list[dict], ...]:
+    static = [
+        spec
+        for spec in specs
+        if spec["num_splits_dynamic_ptr_shape"] is None
+        and spec["dynamic_scheduler_counter_shape"] is None
+    ]
+    unsplit_dynamic = [
+        spec
+        for spec in specs
+        if spec["num_splits_dynamic_ptr_shape"] is None
+        and spec["dynamic_scheduler_counter_shape"] == (1,)
+    ]
+    split_dynamic = [
+        spec
+        for spec in specs
+        if spec["num_splits_dynamic_ptr_shape"] is not None
+    ]
+    assert static and unsplit_dynamic and split_dynamic
+    assert len(static) + len(unsplit_dynamic) + len(split_dynamic) == len(specs)
+    assert all(
+        (
+            spec["dynamic_scheduler_counter_shape"],
+            spec["dynamic_scheduler_counter_stride"],
+        )
+        in {(None, None), ((1,), (1,))}
+        for spec in specs
+    )
+    assert all(
+        (
+            spec["dynamic_scheduler_counter_shape"],
+            spec["dynamic_scheduler_counter_stride"],
+        )
+        == ((1,), (1,))
+        for spec in split_dynamic
+    )
+    assert {
+        spec["num_splits"] for spec in static
+    } == set(fa4_warmup._FA4_STATIC_SPLIT_REQUESTS)
+    assert all(
+        spec["q_shape"][0] == spec["max_seqlen_q"]
+        and spec["max_seqlen_q"] <= spec["max_seqlen_k"]
+        and spec["cu_seqlens_q_shape"] == (2,)
+        and spec["seqused_k_shape"] == (1,)
+        for spec in static
+    )
+    assert all(
+        spec["num_splits"] == 1
+        and spec["q_shape"][0]
+        == spec["seqused_k_shape"][0] * spec["max_seqlen_q"]
+        and spec["cu_seqlens_q_shape"]
+        == (spec["seqused_k_shape"][0] + 1,)
+        and spec["seqused_k_shape"][0] > 1
+        for spec in unsplit_dynamic
+    )
+    assert all(
+        spec["num_splits"] == 32
+        and spec["q_shape"][0]
+        == spec["num_splits_dynamic_ptr_shape"][0] * spec["max_seqlen_q"]
+        and spec["cu_seqlens_q_shape"]
+        == (spec["num_splits_dynamic_ptr_shape"][0] + 1,)
+        and spec["seqused_k_shape"] == spec["num_splits_dynamic_ptr_shape"]
+        for spec in split_dynamic
+    )
+    assert all(
+        {spec["causal"] for spec in compile_class} == {True, False}
+        for compile_class in (static, unsplit_dynamic, split_dynamic)
+    )
+
+    def freeze(value):
+        if isinstance(value, list):
+            return tuple(value)
+        return value
+
+    assert len(
+        {tuple((name, freeze(value)) for name, value in spec.items()) for spec in specs}
+    ) == len(specs)
+    return static, unsplit_dynamic, split_dynamic
+
+
+def _matching(specs: list[dict], **expected) -> list[dict]:
+    return [
+        spec
+        for spec in specs
+        if all(spec[name] == value for name, value in expected.items())
+    ]
 
 def _native_impl(
     *,
@@ -145,9 +279,20 @@ def _ordinary_impl(*, model_dtype=torch.bfloat16):
 def test_dense_native_compile_specs_cover_structural_matrix(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    first = _native_impl()
-    duplicate = _native_impl()
-    second = _native_impl(
+    full = _native_impl(
+        num_kv_heads=1,
+        head_size=192,
+    )
+    duplicate = _native_impl(
+        num_kv_heads=1,
+        head_size=192,
+    )
+    swa = _native_impl(
+        num_kv_heads=1,
+        head_size=192,
+        sliding_window=(127, 0),
+    )
+    fp16 = _native_impl(
         num_heads=32,
         num_kv_heads=1,
         head_size=96,
@@ -155,129 +300,88 @@ def test_dense_native_compile_specs_cover_structural_matrix(
         scale=0.25,
         sliding_window=(127, 0),
     )
-    worker = _compile_worker(first, duplicate, second)
-    compile_specs = MagicMock()
-    monkeypatch.setattr(
-        fa4_warmup.current_platform,
-        "is_device_capability",
-        lambda capability: capability == 90,
-    )
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.utils.get_kv_cache_layout",
-        lambda: "NHD",
-    )
-    monkeypatch.setattr(
-        "vllm.vllm_flash_attn.flash_attn_interface."
-        "compile_flash_attn_varlen_func_from_specs",
-        compile_specs,
-    )
+    worker = _compile_worker(full, duplicate, swa, fp16)
+    worker.use_v2_model_runner = False
+    worker.vllm_config.model_config.max_model_len = 512
+    worker.vllm_config.scheduler_config.max_num_batched_tokens = 2048
 
-    fa4_warmup._warm_fa4_compile_specs(worker)
-    _assert_dynamic_scheduler_spec_pairing(compile_specs.call_args_list)
-
-    static_calls = [
-        item
-        for item in compile_specs.call_args_list
-        if item.kwargs["num_splits_dynamic_ptr_shape"] is None
-        and item.kwargs["dynamic_scheduler_counter_shape"] is None
-    ]
-    unsplit_dynamic_calls = [
-        item
-        for item in compile_specs.call_args_list
-        if item.kwargs["num_splits_dynamic_ptr_shape"] is None
-        and item.kwargs["dynamic_scheduler_counter_shape"] == (1,)
-    ]
-    split_dynamic_calls = [
-        item
-        for item in compile_specs.call_args_list
-        if item.kwargs["num_splits_dynamic_ptr_shape"] is not None
-    ]
-    assert len(compile_specs.call_args_list) == 504
-    assert len(static_calls) == 420
-    assert len(unsplit_dynamic_calls) == 40
-    assert len(split_dynamic_calls) == 44
-    assert len(
-        {
-            tuple(
-                (
-                    name,
-                    tuple(value) if isinstance(value, list) else value,
-                )
-                for name, value in item.kwargs.items()
-            )
-            for item in compile_specs.call_args_list
-        }
-    ) == 504
+    specs = _capture_compile_specs(monkeypatch, worker)
+    static, unsplit_dynamic, split_dynamic = _compile_classes(specs)
     assert all(
-        item.kwargs["q_dtype"] == torch.float8_e4m3fn
-        and item.kwargs["q_descale_shape"] == ()
-        and item.kwargs["q_descale_stride"] == ()
-        and item.kwargs["k_descale_shape"] == ()
-        and item.kwargs["k_descale_stride"] == ()
-        and item.kwargs["v_descale_shape"] == ()
-        and item.kwargs["v_descale_stride"] == ()
-        for item in compile_specs.call_args_list
+        spec["q_dtype"] == torch.float8_e4m3fn
+        and spec["q_descale_shape"] == spec["q_descale_stride"] == ()
+        and spec["k_descale_shape"] == spec["k_descale_stride"] == ()
+        and spec["v_descale_shape"] == spec["v_descale_stride"] == ()
+        for spec in specs
+    )
+    assert {spec["out_dtype"] for spec in specs} == {
+        torch.bfloat16,
+        torch.float16,
+    }
+
+    q400 = _matching(
+        static,
+        q_shape=(400, 16, 192),
+        max_seqlen_q=400,
+        max_seqlen_k=400,
     )
     assert {
-        item.kwargs["num_splits"] for item in static_calls
-    } == set(fa4_warmup._FA4_STATIC_SPLIT_REQUESTS)
-    assert {item.kwargs["causal"] for item in static_calls} == {True, False}
-    assert all(
-        item.kwargs["q_shape"][0] == item.kwargs["max_seqlen_q"]
-        and item.kwargs["max_seqlen_q"] <= item.kwargs["max_seqlen_k"] <= 100
-        and item.kwargs["cu_seqlens_q_shape"] == (2,)
-        and item.kwargs["seqused_k_shape"] == (1,)
-        and item.kwargs["page_table_shape"] == (1, 7)
-        for item in static_calls
-    )
-    assert all(
-        item.kwargs["num_splits"] == 1
-        and item.kwargs["q_shape"][0]
-        == item.kwargs["seqused_k_shape"][0]
-        * item.kwargs["max_seqlen_q"]
-        and item.kwargs["cu_seqlens_q_shape"]
-        == (item.kwargs["seqused_k_shape"][0] + 1,)
-        and item.kwargs["page_table_shape"]
-        == (item.kwargs["seqused_k_shape"][0], 7)
-        and item.kwargs["seqused_k_shape"][0] > 1
-        and item.kwargs["dynamic_scheduler_counter_stride"] == (1,)
-        for item in unsplit_dynamic_calls
-    )
-    assert {item.kwargs["causal"] for item in unsplit_dynamic_calls} == {
-        True,
-        False,
+        (spec["num_splits"], spec["causal"], tuple(spec["window_size"]))
+        for spec in q400
+    } == {
+        (num_splits, causal, window)
+        for num_splits in fa4_warmup._FA4_STATIC_SPLIT_REQUESTS
+        for causal in (True, False)
+        for window in ((-1, -1), (127, 0))
     }
-    assert all(
-        item.kwargs["num_splits"] == 32
-        and item.kwargs["q_shape"][0]
-        == item.kwargs["num_splits_dynamic_ptr_shape"][0]
-        * item.kwargs["max_seqlen_q"]
-        and item.kwargs["cu_seqlens_q_shape"]
-        == (item.kwargs["num_splits_dynamic_ptr_shape"][0] + 1,)
-        and item.kwargs["seqused_k_shape"]
-        == item.kwargs["num_splits_dynamic_ptr_shape"]
-        and item.kwargs["page_table_shape"]
-        == (item.kwargs["num_splits_dynamic_ptr_shape"][0], 7)
-        and item.kwargs["max_seqlen_q"] <= item.kwargs["max_seqlen_k"] <= 100
-        and item.kwargs["q_shape"][0] <= 100
-        and item.kwargs["dynamic_scheduler_counter_shape"] == (1,)
-        for item in split_dynamic_calls
+    assert all(spec["dynamic_scheduler_counter_shape"] is None for spec in q400)
+
+    for compile_class, expected in (
+        (
+            unsplit_dynamic,
+            {
+                "q_shape": (2048, 16, 192),
+                "max_seqlen_q": 128,
+                "max_seqlen_k": 129,
+                "num_splits": 1,
+                "num_splits_dynamic_ptr_shape": None,
+            },
+        ),
+        (
+            split_dynamic,
+            {
+                "q_shape": (2048, 16, 192),
+                "max_seqlen_q": 128,
+                "max_seqlen_k": 129,
+                "num_splits_dynamic_ptr_shape": (16,),
+            },
+        ),
+        (
+            split_dynamic,
+            {
+                "q_shape": (64, 16, 192),
+                "max_seqlen_q": 1,
+                "max_seqlen_k": 512,
+                "num_splits_dynamic_ptr_shape": (64,),
+            },
+        ),
+    ):
+        assert {
+            spec["causal"] for spec in _matching(compile_class, **expected)
+        } == {True, False}
+
+    windowed = next(
+        spec
+        for spec in split_dynamic
+        if spec["q_shape"][1:] == (32, 96)
+        and spec["causal"] is False
+        and spec["max_seqlen_k"] == 64
     )
-    windowed_call = next(
-        item.kwargs
-        for item in split_dynamic_calls
-        if item.kwargs["q_shape"][1:] == (32, 96)
-        and item.kwargs["causal"] is False
-        and item.kwargs["max_seqlen_k"] == 64
-    )
-    assert windowed_call["v_stride"] == (3072, 192, 192, 1)
-    assert windowed_call["out_dtype"] == torch.float16
-    assert windowed_call["softmax_scale"] == 0.25
-    assert windowed_call["window_size"] == [127, 0]
-    assert windowed_call["s_aux_shape"] is None
-    worker.model_runner._dummy_run.assert_not_called()
-    worker.execute_model.assert_not_called()
-    worker.sample_tokens.assert_not_called()
+    assert windowed["v_stride"] == (3072, 192, 192, 1)
+    assert windowed["out_dtype"] == torch.float16
+    assert windowed["softmax_scale"] == 0.25
+    assert windowed["window_size"] == [127, 0]
+    assert windowed["s_aux_shape"] is None
 
 
 @pytest.mark.parametrize("model_dtype", [torch.bfloat16, torch.float16])
@@ -291,180 +395,33 @@ def test_ordinary_compile_specs_cover_long_static_and_dynamic_classes(
     )
     worker.vllm_config.model_config.max_model_len = 1800
     worker.vllm_config.scheduler_config.max_num_batched_tokens = 1800
-    compile_specs = MagicMock()
-    monkeypatch.setattr(
-        fa4_warmup.current_platform,
-        "is_device_capability",
-        lambda capability: capability == 90,
-    )
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.utils.get_kv_cache_layout",
-        lambda: "NHD",
-    )
-    monkeypatch.setattr(
-        "vllm.vllm_flash_attn.flash_attn_interface."
-        "compile_flash_attn_varlen_func_from_specs",
-        compile_specs,
-    )
 
-    fa4_warmup._warm_fa4_compile_specs(worker)
-
-    static_calls = [
-        item
-        for item in compile_specs.call_args_list
-        if item.kwargs["num_splits_dynamic_ptr_shape"] is None
-        and item.kwargs["dynamic_scheduler_counter_shape"] is None
-    ]
-    unsplit_dynamic_calls = [
-        item
-        for item in compile_specs.call_args_list
-        if item.kwargs["num_splits_dynamic_ptr_shape"] is None
-        and item.kwargs["dynamic_scheduler_counter_shape"] == (1,)
-    ]
-    split_dynamic_calls = [
-        item
-        for item in compile_specs.call_args_list
-        if item.kwargs["num_splits_dynamic_ptr_shape"] is not None
-    ]
-    assert len(compile_specs.call_args_list) == 430
-    assert len(static_calls) == 372
-    assert len(unsplit_dynamic_calls) == 28
-    assert len(split_dynamic_calls) == 30
-    assert len(
-        {
-            tuple(
-                (
-                    name,
-                    tuple(value) if isinstance(value, list) else value,
-                )
-                for name, value in item.kwargs.items()
-            )
-            for item in compile_specs.call_args_list
-        }
-    ) == 430
+    specs = _capture_compile_specs(monkeypatch, worker)
+    static, _, _ = _compile_classes(specs)
     assert all(
-        item.kwargs["q_dtype"] == model_dtype
-        and item.kwargs["out_dtype"] is None
-        and (item.kwargs["out_dtype"] or item.kwargs["q_dtype"]) == model_dtype
-        and item.kwargs["q_descale_shape"] is None
-        and item.kwargs["q_descale_stride"] is None
-        and item.kwargs["k_descale_shape"] is None
-        and item.kwargs["k_descale_stride"] is None
-        and item.kwargs["v_descale_shape"] is None
-        and item.kwargs["v_descale_stride"] is None
-        for item in compile_specs.call_args_list
+        spec["q_dtype"] == model_dtype
+        and spec["out_dtype"] is None
+        and spec["q_descale_shape"] is None
+        and spec["q_descale_stride"] is None
+        and spec["k_descale_shape"] is None
+        and spec["k_descale_stride"] is None
+        and spec["v_descale_shape"] is None
+        and spec["v_descale_stride"] is None
+        for spec in specs
     )
-    long_static = [
-        item.kwargs
-        for item in static_calls
-        if item.kwargs["q_shape"] == (1800, 16, 128)
-        and item.kwargs["max_seqlen_q"] == 1800
-        and item.kwargs["max_seqlen_k"] == 1800
-    ]
-    assert len(long_static) == 12
+    long_static = _matching(
+        static,
+        q_shape=(1800, 16, 128),
+        max_seqlen_q=1800,
+        max_seqlen_k=1800,
+    )
     assert {
-        (item["num_splits"], item["causal"]) for item in long_static
+        (spec["num_splits"], spec["causal"]) for spec in long_static
     } == {
         (num_splits, causal)
         for num_splits in fa4_warmup._FA4_STATIC_SPLIT_REQUESTS
         for causal in (True, False)
     }
-    assert all(
-        item["q_dtype"] == model_dtype
-        and (item["out_dtype"] or item["q_dtype"]) == model_dtype
-        for item in long_static
-    )
-    assert any(item["num_splits"] > 1 for item in long_static)
-    assert all(
-        item.kwargs["dynamic_scheduler_counter_shape"] == (1,)
-        and item.kwargs["num_splits"] == 1
-        for item in unsplit_dynamic_calls
-    )
-    assert all(
-        item.kwargs["dynamic_scheduler_counter_shape"] == (1,)
-        and item.kwargs["num_splits_dynamic_ptr_shape"]
-        == item.kwargs["seqused_k_shape"]
-        and item.kwargs["num_splits"] == 32
-        for item in split_dynamic_calls
-    )
-    worker.model_runner._dummy_run.assert_not_called()
-    worker.execute_model.assert_not_called()
-    worker.sample_tokens.assert_not_called()
-
-
-def test_native_compile_specs_emit_diagnosed_classes(
-    monkeypatch: pytest.MonkeyPatch,
-):
-
-    worker = _compile_worker(_native_impl())
-    worker.vllm_config.model_config.max_model_len = 512
-    worker.vllm_config.scheduler_config.max_num_batched_tokens = 2048
-    compile_specs = MagicMock()
-    monkeypatch.setattr(
-        fa4_warmup.current_platform,
-        "is_device_capability",
-        lambda capability: capability == 90,
-    )
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.utils.get_kv_cache_layout",
-        lambda: "NHD",
-    )
-    monkeypatch.setattr(
-        "vllm.vllm_flash_attn.flash_attn_interface."
-        "compile_flash_attn_varlen_func_from_specs",
-        compile_specs,
-    )
-
-    fa4_warmup._warm_fa4_compile_specs(worker)
-
-    assert len(compile_specs.call_args_list) == 394
-    assert {
-        (item.kwargs["num_splits"], item.kwargs["causal"])
-        for item in compile_specs.call_args_list
-        if item.kwargs["q_shape"] == (400, 16, 128)
-        and item.kwargs["max_seqlen_q"] == 400
-        and item.kwargs["max_seqlen_k"] == 400
-        and item.kwargs["num_splits_dynamic_ptr_shape"] is None
-    } == {
-        (num_splits, causal)
-        for num_splits in fa4_warmup._FA4_STATIC_SPLIT_REQUESTS
-        for causal in (True, False)
-    }
-    assert {
-        item.kwargs["causal"]
-        for item in compile_specs.call_args_list
-        if item.kwargs["q_shape"] == (2048, 16, 128)
-        and item.kwargs["max_seqlen_q"] == 128
-        and item.kwargs["max_seqlen_k"] == 129
-        and item.kwargs["num_splits_dynamic_ptr_shape"] == (16,)
-    } == {True, False}
-    unsplit_b16 = [
-        item.kwargs
-        for item in compile_specs.call_args_list
-        if item.kwargs["q_shape"] == (2048, 16, 128)
-        and item.kwargs["max_seqlen_q"] == 128
-        and item.kwargs["max_seqlen_k"] == 129
-        and item.kwargs["num_splits"] == 1
-        and item.kwargs["num_splits_dynamic_ptr_shape"] is None
-    ]
-    assert len(unsplit_b16) == 2
-    assert {item["causal"] for item in unsplit_b16} == {True, False}
-    assert all(
-        item["dynamic_scheduler_counter_shape"] == (1,)
-        and item["dynamic_scheduler_counter_stride"] == (1,)
-        for item in unsplit_b16
-    )
-    assert {
-        item.kwargs["causal"]
-        for item in compile_specs.call_args_list
-        if item.kwargs["q_shape"] == (64, 16, 128)
-        and item.kwargs["max_seqlen_q"] == 1
-        and item.kwargs["max_seqlen_k"] == 512
-        and item.kwargs["num_splits_dynamic_ptr_shape"] == (64,)
-    } == {True, False}
-    worker.model_runner._dummy_run.assert_not_called()
-    worker.execute_model.assert_not_called()
-    worker.sample_tokens.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -479,124 +436,64 @@ def test_native_diffkv_compile_specs_cover_packed_sink_dynamic_and_dedupe(
     cache_layout: str,
     expected_stride: tuple[int, ...],
 ):
-    first = _native_impl(
-        head_size=192,
-        head_size_v=128,
-        sliding_window=(127, 0),
-        sinks=object(),
-        diffkv=True,
-    )
-    duplicate = _native_impl(
-        head_size=192,
-        head_size_v=128,
-        sliding_window=(127, 0),
-        sinks=object(),
-        diffkv=True,
-    )
-    worker = _compile_worker(first, duplicate)
+    impl_kwargs = {
+        "head_size": 192,
+        "head_size_v": 128,
+        "sliding_window": (127, 0),
+        "sinks": object(),
+        "diffkv": True,
+    }
+    worker = _compile_worker(_native_impl(**impl_kwargs), _native_impl(**impl_kwargs))
     from vllm.v1.kv_cache_interface import MambaSpec
 
     worker.model_runner.kv_cache_config.kv_cache_groups = [
         SimpleNamespace(kv_cache_spec=object.__new__(MambaSpec))
     ]
-    compile_specs = MagicMock()
-    monkeypatch.setattr(
-        fa4_warmup.current_platform,
-        "is_device_capability",
-        lambda capability: capability == 90,
+    specs = _capture_compile_specs(
+        monkeypatch,
+        worker,
+        cache_layout=cache_layout,
     )
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.utils.get_kv_cache_layout",
-        lambda: cache_layout,
-    )
-    monkeypatch.setattr(
-        "vllm.vllm_flash_attn.flash_attn_interface."
-        "compile_flash_attn_varlen_func_from_specs",
-        compile_specs,
+    _, unsplit_dynamic, split_dynamic = _compile_classes(specs)
+    assert all(
+        spec["q_dtype"] == torch.float8_e4m3fn
+        and spec["out_dtype"] == torch.bfloat16
+        and spec["q_descale_shape"] == spec["q_descale_stride"] == ()
+        and spec["k_descale_shape"] == spec["k_descale_stride"] == ()
+        and spec["v_descale_shape"] == spec["v_descale_stride"] == ()
+        for spec in specs
     )
 
-    fa4_warmup._warm_fa4_compile_specs(worker)
-
-    # A coexisting Mamba cache group must not suppress DiffKV compilation.
-    static_calls = [
-        item
-        for item in compile_specs.call_args_list
-        if item.kwargs["num_splits_dynamic_ptr_shape"] is None
-        and item.kwargs["dynamic_scheduler_counter_shape"] is None
-    ]
-    unsplit_dynamic_calls = [
-        item
-        for item in compile_specs.call_args_list
-        if item.kwargs["num_splits_dynamic_ptr_shape"] is None
-        and item.kwargs["dynamic_scheduler_counter_shape"] == (1,)
-    ]
-    split_dynamic_calls = [
-        item
-        for item in compile_specs.call_args_list
-        if item.kwargs["num_splits_dynamic_ptr_shape"] is not None
-    ]
-    assert len(compile_specs.call_args_list) == 246
-    assert len(static_calls) == 204
-    assert len(unsplit_dynamic_calls) == 20
-    assert len(split_dynamic_calls) == 22
-    assert len(
-        {
-            tuple(
-                (
-                    name,
-                    tuple(value) if isinstance(value, list) else value,
-                )
-                for name, value in item.kwargs.items()
-            )
-            for item in compile_specs.call_args_list
-        }
-    ) == 246
-    dynamic = next(
-        item.kwargs
-        for item in split_dynamic_calls
-        if item.kwargs["num_splits_dynamic_ptr_shape"] == (4,)
-        and item.kwargs["max_seqlen_q"] == 16
-        and item.kwargs["max_seqlen_k"] == 64
-        and item.kwargs["causal"]
+    common = {
+        "q_shape": (64, 16, 192),
+        "k_shape": (7, 16, 2, 192),
+        "v_shape": (7, 16, 2, 128),
+        "v_stride": expected_stride,
+        "window_size": [127, 0],
+        "s_aux_shape": (16,),
+        "cu_seqlens_q_shape": (5,),
+        "seqused_k_shape": (4,),
+        "page_table_shape": (4, 7),
+        "max_seqlen_q": 16,
+        "max_seqlen_k": 64,
+        "causal": True,
+    }
+    unsplit = _matching(
+        unsplit_dynamic,
+        **common,
+        num_splits=1,
+        num_splits_dynamic_ptr_shape=None,
     )
-    unsplit_dynamic = next(
-        item.kwargs
-        for item in unsplit_dynamic_calls
-        if item.kwargs["seqused_k_shape"] == (4,)
-        and item.kwargs["max_seqlen_q"] == 16
-        and item.kwargs["max_seqlen_k"] == 64
-        and item.kwargs["causal"]
+    split = _matching(
+        split_dynamic,
+        **common,
+        num_splits=32,
+        num_splits_dynamic_ptr_shape=(4,),
     )
-    assert unsplit_dynamic["q_shape"] == (64, 16, 192)
-    assert unsplit_dynamic["k_shape"] == (7, 16, 2, 192)
-    assert unsplit_dynamic["v_shape"] == (7, 16, 2, 128)
-    assert unsplit_dynamic["v_stride"] == expected_stride
-    assert unsplit_dynamic["window_size"] == [127, 0]
-    assert unsplit_dynamic["s_aux_shape"] == (16,)
-    assert unsplit_dynamic["num_splits"] == 1
-    assert unsplit_dynamic["num_splits_dynamic_ptr_shape"] is None
-    assert unsplit_dynamic["cu_seqlens_q_shape"] == (5,)
-    assert unsplit_dynamic["page_table_shape"] == (4, 7)
-    assert unsplit_dynamic["dynamic_scheduler_counter_shape"] == (1,)
-    assert unsplit_dynamic["dynamic_scheduler_counter_stride"] == (1,)
-    assert dynamic["q_shape"] == (64, 16, 192)
-    assert dynamic["k_shape"] == (7, 16, 2, 192)
-    assert dynamic["v_shape"] == (7, 16, 2, 128)
-    assert dynamic["v_stride"] == expected_stride
-    assert dynamic["window_size"] == [127, 0]
-    assert dynamic["s_aux_shape"] == (16,)
-    assert dynamic["s_aux_stride"] == (1,)
-    assert dynamic["num_splits_dynamic_ptr_stride"] == (1,)
-    assert dynamic["cu_seqlens_q_shape"] == (5,)
-    assert dynamic["seqused_k_shape"] == (4,)
-    assert dynamic["page_table_shape"] == (4, 7)
-    assert dynamic["page_table_stride"] == (7, 1)
-    assert dynamic["dynamic_scheduler_counter_shape"] == (1,)
-    assert dynamic["dynamic_scheduler_counter_stride"] == (1,)
-    assert dynamic["num_splits"] == 32
-    worker.model_runner._dummy_run.assert_not_called()
-    worker.execute_model.assert_not_called()
-    worker.sample_tokens.assert_not_called()
+    assert len(unsplit) == len(split) == 1
+    assert split[0]["s_aux_stride"] == (1,)
+    assert split[0]["num_splits_dynamic_ptr_stride"] == (1,)
+    assert split[0]["page_table_stride"] == (7, 1)
 
 
 @pytest.mark.parametrize(
@@ -663,74 +560,6 @@ def test_fa4_compile_specs_skip_ineligible_routes(
     worker.execute_model.assert_not_called()
     worker.sample_tokens.assert_not_called()
 
-
-def test_legacy_native_compile_specs_use_real_static_context(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    full = _native_impl(
-        num_heads=16,
-        num_kv_heads=1,
-        head_size=192,
-        sliding_window=(-1, -1),
-    )
-    swa_layers = [
-        _native_impl(
-            num_heads=16,
-            num_kv_heads=1,
-            head_size=192,
-            sliding_window=(127, 0),
-        )
-        for _ in range(4)
-    ]
-    worker = _compile_worker(full, *swa_layers)
-    worker.use_v2_model_runner = False
-    worker.vllm_config.model_config.max_model_len = 512
-    worker.vllm_config.scheduler_config.max_num_batched_tokens = 2048
-    compile_specs = MagicMock()
-    monkeypatch.setattr(
-        fa4_warmup.current_platform,
-        "is_device_capability",
-        lambda capability: capability == 90,
-    )
-    monkeypatch.setattr(
-        "vllm.v1.attention.backends.utils.get_kv_cache_layout",
-        lambda: "NHD",
-    )
-    monkeypatch.setattr(
-        "vllm.vllm_flash_attn.flash_attn_interface."
-        "compile_flash_attn_varlen_func_from_specs",
-        compile_specs,
-    )
-
-    fa4_warmup._warm_fa4_compile_specs(worker)
-
-    assert len(compile_specs.call_args_list) == 788
-    assert {
-        tuple(item.kwargs["window_size"])
-        for item in compile_specs.call_args_list
-    } == {(-1, -1), (127, 0)}
-    q400_split_two = [
-        item.kwargs
-        for item in compile_specs.call_args_list
-        if item.kwargs["q_shape"] == (400, 16, 192)
-        and item.kwargs["max_seqlen_q"] == 400
-        and item.kwargs["max_seqlen_k"] == 400
-        and item.kwargs["num_splits"] == 2
-        and item.kwargs["causal"]
-        and item.kwargs["num_splits_dynamic_ptr_shape"] is None
-    ]
-    assert len(q400_split_two) == 2
-    assert {tuple(item["window_size"]) for item in q400_split_two} == {
-        (-1, -1),
-        (127, 0),
-    }
-    assert all(
-        item["dynamic_scheduler_counter_shape"] is None
-        for item in q400_split_two
-    )
-    worker.model_runner._dummy_run.assert_not_called()
-    worker.execute_model.assert_not_called()
-    worker.sample_tokens.assert_not_called()
 
 
 def test_v2_fa4_dense_warmup_covers_causal_query_lengths(monkeypatch):

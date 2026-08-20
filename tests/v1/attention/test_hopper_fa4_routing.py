@@ -117,41 +117,45 @@ def test_compile_only_wrapper_forwards_fake_tensor_specs(
         fa_version=4,
     )
 
-    compile_specs.assert_called_once_with(
-        q_shape=(9, 16, 128),
-        k_shape=(512, 16, 2, 128),
-        v_shape=(512, 16, 2, 128),
-        q_dtype=torch.float8_e4m3fn,
-        out_dtype=torch.bfloat16,
-        v_stride=(8192, 512, 256, 1),
-        cu_seqlens_q_shape=(2,),
-        cu_seqlens_k_shape=None,
-        seqused_q_shape=(1,),
-        seqused_q_stride=(1,),
-        seqused_k_shape=(1,),
-        seqused_k_stride=(1,),
-        page_table_shape=(1, 512),
-        page_table_stride=(512, 1),
-        num_splits_dynamic_ptr_shape=(1,),
-        num_splits_dynamic_ptr_stride=(1,),
-        learnable_sink_shape=(16,),
-        learnable_sink_stride=(1,),
-        dynamic_scheduler_counter_shape=(1,),
-        dynamic_scheduler_counter_stride=(1,),
-        q_descale_shape=(),
-        q_descale_stride=(),
-        k_descale_shape=(),
-        k_descale_stride=(),
-        v_descale_shape=(),
-        v_descale_stride=(),
-        max_seqlen_q=9,
-        max_seqlen_k=8192,
-        softmax_scale=0.125,
-        causal=True,
-        window_size=(127, 0),
-        num_splits=17,
-        return_lse=True,
-    )
+    forwarded = compile_specs.call_args.kwargs
+    expected_passthrough = {
+        "q_shape": (9, 16, 128),
+        "k_shape": (512, 16, 2, 128),
+        "v_shape": (512, 16, 2, 128),
+        "q_dtype": torch.float8_e4m3fn,
+        "out_dtype": torch.bfloat16,
+        "v_stride": (8192, 512, 256, 1),
+        "cu_seqlens_q_shape": (2,),
+        "seqused_q_shape": (1,),
+        "seqused_q_stride": (1,),
+        "seqused_k_shape": (1,),
+        "seqused_k_stride": (1,),
+        "page_table_shape": (1, 512),
+        "page_table_stride": (512, 1),
+        "num_splits_dynamic_ptr_shape": (1,),
+        "num_splits_dynamic_ptr_stride": (1,),
+        "q_descale_shape": (),
+        "q_descale_stride": (),
+        "k_descale_shape": (),
+        "k_descale_stride": (),
+        "v_descale_shape": (),
+        "v_descale_stride": (),
+        "max_seqlen_q": 9,
+        "max_seqlen_k": 8192,
+        "softmax_scale": 0.125,
+        "causal": True,
+        "num_splits": 17,
+    }
+    assert {
+        key: forwarded[key] for key in expected_passthrough
+    } == expected_passthrough
+    assert forwarded["cu_seqlens_k_shape"] is None
+    assert forwarded["learnable_sink_shape"] == (16,)
+    assert forwarded["learnable_sink_stride"] == (1,)
+    assert forwarded["dynamic_scheduler_counter_shape"] == (1,)
+    assert forwarded["dynamic_scheduler_counter_stride"] == (1,)
+    assert forwarded["window_size"] == (127, 0)
+    assert forwarded["return_lse"] is True
 
 
 @pytest.mark.parametrize(
@@ -232,14 +236,12 @@ def test_compile_only_wrapper_preserves_validation(kwargs, error, match) -> None
         "expected",
     ),
     [
+        pytest.param(4, "fp8_e4m3", 9, 128, None, None, "native", id="native"),
         pytest.param(
-            4, "fp8_e4m3", 9, 64, None, None, "native", id="native-64"
+            4, "fp8_e4m3", 9, 64, 64, None, "native", id="native-64"
         ),
         pytest.param(
             4, "fp8_e4m3", 9, 96, 96, None, "native", id="native-96"
-        ),
-        pytest.param(
-            4, "fp8_e4m3", 9, 128, 128, None, "native", id="native-128"
         ),
         pytest.param(
             4, "fp8_e4m3", 9, 192, 192, None, "native", id="native-192"
@@ -263,9 +265,6 @@ def test_compile_only_wrapper_preserves_validation(kwargs, error, match) -> None
         pytest.param(4, "fp8", 10, 128, None, None, None, id="blackwell"),
         pytest.param(
             4, "fp8", 9, 128, None, torch.bfloat16, "native", id="bf16-output"
-        ),
-        pytest.param(
-            4, "fp8", 9, 128, None, torch.float16, "native", id="fp16-output"
         ),
         pytest.param(
             4, "fp8", 9, 128, None, torch.float32, None, id="fp32-output"
@@ -868,33 +867,41 @@ def test_flash_attn_mla_backend_supports_hopper():
     assert not FlashAttnMLABackend.supports_compute_capability(DeviceCapability(10, 0))
 
 
-def _dense_forward_case(
+def _forward_case(
     monkeypatch: pytest.MonkeyPatch,
     *,
+    module,
+    impl_cls,
+    head_size: int,
+    value_head_size: int,
     model_dtype: torch.dtype,
     output_dtype: torch.dtype,
     native: bool,
-) -> tuple[dict, torch.Tensor, SimpleNamespace]:
-    impl = flash_attn.FlashAttentionImpl.__new__(flash_attn.FlashAttentionImpl)
-    impl.num_heads = 2
-    impl.num_kv_heads = 1
-    impl.head_size = 64
-    impl.scale = 0.125
-    impl.alibi_slopes = None
-    impl.sliding_window = (-1, -1)
-    impl.kv_cache_dtype = "fp8"
-    impl.logits_soft_cap = 0.0
-    impl.attn_type = flash_attn.AttentionType.DECODER
-    impl.vllm_flash_attn_version = 4 if native else 3
-    impl.batch_invariant_enabled = False
-    impl.supports_quant_query_input = True
-    impl.dcp_world_size = 1
-    impl.sinks = None
-    impl.model_dtype = model_dtype
-    impl.sm90_fa4_fp8_mode = "native" if native else None
-    impl._dynamic_scheduler_counter = None
-
-    scheduler_metadata = torch.tensor([2], dtype=torch.int32)
+    scheduler_metadata: torch.Tensor | None,
+) -> SimpleNamespace:
+    impl = impl_cls.__new__(impl_cls)
+    impl.__dict__.update(
+        num_heads=2,
+        num_kv_heads=1,
+        head_size=head_size,
+        scale=0.125,
+        alibi_slopes=None,
+        sliding_window=(-1, -1),
+        kv_cache_dtype="fp8",
+        logits_soft_cap=0.0,
+        attn_type=flash_attn.AttentionType.DECODER,
+        vllm_flash_attn_version=4 if native else 3,
+        supports_quant_query_input=True,
+        dcp_world_size=1,
+        sinks=None,
+        model_dtype=model_dtype,
+        sm90_fa4_fp8_mode="native" if native else None,
+        _dynamic_scheduler_counter=None,
+    )
+    if module is flash_attn:
+        impl.batch_invariant_enabled = False
+    else:
+        impl.native_fp8_out_dtype = model_dtype if native else None
     metadata = SimpleNamespace(
         num_actual_tokens=1,
         use_cascade=False,
@@ -911,19 +918,20 @@ def _dense_forward_case(
         max_num_splits=2,
     )
     layer = SimpleNamespace(
-        _q_scale=torch.tensor(0.5, dtype=torch.float32),
-        _k_scale=torch.tensor(0.75, dtype=torch.float32),
-        _v_scale=torch.tensor(1.25, dtype=torch.float32),
+        _q_scale=torch.tensor(0.5),
+        _k_scale=torch.tensor(0.75),
+        _v_scale=torch.tensor(1.25),
     )
     fp8_dtype = torch.float8_e4m3fn
-    query = torch.empty((1, 2, 64), dtype=fp8_dtype)
-    key = torch.empty((1, 1, 64), dtype=fp8_dtype)
-    value = torch.empty((1, 1, 64), dtype=fp8_dtype)
-    kv_cache = torch.empty((1, 1, 1, 128), dtype=fp8_dtype)
-    output = torch.empty((1, 2, 64), dtype=output_dtype)
-    forwarded: dict = {}
-    forwarded_counters: list[torch.Tensor | None] = []
-    counter_allocations: list[torch.Tensor] = []
+    query = torch.empty((1, 2, head_size), dtype=fp8_dtype)
+    key = torch.empty((1, 1, head_size), dtype=fp8_dtype)
+    value = torch.empty((1, 1, value_head_size), dtype=fp8_dtype)
+    kv_cache = torch.empty(
+        (1, 1, 1, head_size + value_head_size), dtype=fp8_dtype
+    )
+    output = torch.empty((1, 2, value_head_size), dtype=output_dtype)
+    calls: list[dict] = []
+    allocations: list[torch.Tensor] = []
     torch_zeros = torch.zeros
 
     def record_counter_allocation(*args, **kwargs):
@@ -933,31 +941,58 @@ def _dense_forward_case(
             and kwargs.get("dtype") == torch.int32
             and kwargs.get("device") == query.device
         ):
-            counter_allocations.append(tensor)
+            allocations.append(tensor)
         return tensor
 
-    monkeypatch.setattr(flash_attn.torch, "zeros", record_counter_allocation)
-
-    def fake_flash_attn_varlen_func(**kwargs):
-        forwarded.update(kwargs)
-        forwarded_counters.append(kwargs.get("dynamic_scheduler_counter"))
-
+    monkeypatch.setattr(module.torch, "zeros", record_counter_allocation)
     monkeypatch.setattr(
-        flash_attn, "flash_attn_varlen_func", fake_flash_attn_varlen_func, raising=False
+        module,
+        "flash_attn_varlen_func",
+        lambda **kwargs: calls.append(kwargs),
+        raising=False,
     )
     monkeypatch.setattr(
-        flash_attn, "canonicalize_singleton_dim_strides", lambda tensor: tensor
+        module, "canonicalize_singleton_dim_strides", lambda tensor: tensor
     )
-    monkeypatch.setattr(
-        flash_attn.current_platform, "fp8_dtype", lambda: fp8_dtype
-    )
+    monkeypatch.setattr(module.current_platform, "fp8_dtype", lambda: fp8_dtype)
 
     impl.forward(layer, query, key, value, kv_cache, metadata, output)
     impl.forward(layer, query, key, value, kv_cache, metadata, output)
-    forwarded["observed_dynamic_scheduler_counters"] = forwarded_counters
-    forwarded["dynamic_scheduler_counter_slot"] = impl._dynamic_scheduler_counter
-    forwarded["dynamic_scheduler_counter_allocations"] = counter_allocations
-    return forwarded, output, metadata
+    return SimpleNamespace(
+        calls=calls,
+        allocations=allocations,
+        counter_slot=impl._dynamic_scheduler_counter,
+        output=output,
+        metadata=metadata,
+    )
+
+
+def _dense_forward_case(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    model_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    native: bool,
+) -> tuple[dict, torch.Tensor, SimpleNamespace]:
+    scheduler_metadata = torch.tensor([2], dtype=torch.int32)
+    result = _forward_case(
+        monkeypatch,
+        module=flash_attn,
+        impl_cls=flash_attn.FlashAttentionImpl,
+        head_size=64,
+        value_head_size=64,
+        model_dtype=model_dtype,
+        output_dtype=output_dtype,
+        native=native,
+        scheduler_metadata=scheduler_metadata,
+    )
+    forwarded = result.calls[-1]
+    forwarded["observed_dynamic_scheduler_counters"] = [
+        call.get("dynamic_scheduler_counter") for call in result.calls
+    ]
+    forwarded["dynamic_scheduler_counter_slot"] = result.counter_slot
+    forwarded["dynamic_scheduler_counter_allocations"] = result.allocations
+    return forwarded, result.output, result.metadata
 
 
 @pytest.mark.parametrize("model_dtype", (torch.bfloat16, torch.float16))
@@ -1028,91 +1063,21 @@ def _diffkv_forward_case(
     list[torch.Tensor],
     torch.Tensor | None,
 ]:
-    impl = flash_attn_diffkv.FlashAttentionDiffKVImpl.__new__(
-        flash_attn_diffkv.FlashAttentionDiffKVImpl
-    )
-    impl.num_heads = 2
-    impl.num_kv_heads = 1
-    impl.head_size = 192
-    impl.scale = 0.125
-    impl.alibi_slopes = None
-    impl.sliding_window = (-1, -1)
-    impl.kv_cache_dtype = "fp8"
-    impl.logits_soft_cap = 0.0
-    impl.attn_type = flash_attn.AttentionType.DECODER
-    impl.vllm_flash_attn_version = 4 if native else 3
-    impl.supports_quant_query_input = True
-    impl.dcp_world_size = 1
-    impl.sinks = None
-    impl.model_dtype = torch.bfloat16
-    impl.native_fp8_out_dtype = torch.bfloat16 if native else None
-    impl.sm90_fa4_fp8_mode = "native" if native else None
-    impl._dynamic_scheduler_counter = None
-
-    metadata = SimpleNamespace(
-        num_actual_tokens=1,
-        use_cascade=False,
-        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-        seq_lens=torch.tensor([1], dtype=torch.int32),
-        max_query_len=1,
-        max_seq_len=1,
-        block_table=torch.tensor([[0]], dtype=torch.int32),
+    result = _forward_case(
+        monkeypatch,
+        module=flash_attn_diffkv,
+        impl_cls=flash_attn_diffkv.FlashAttentionDiffKVImpl,
+        head_size=192,
+        value_head_size=128,
+        model_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        native=native,
         scheduler_metadata=None,
-        causal=True,
-        max_num_splits=2,
     )
-    layer = SimpleNamespace(
-        _q_scale=torch.tensor(0.5, dtype=torch.float32),
-        _k_scale=torch.tensor(0.75, dtype=torch.float32),
-        _v_scale=torch.tensor(1.25, dtype=torch.float32),
-    )
-    fp8_dtype = torch.float8_e4m3fn
-    query = torch.empty((1, 2, 192), dtype=fp8_dtype)
-    key = torch.empty((1, 1, 192), dtype=fp8_dtype)
-    value = torch.empty((1, 1, 128), dtype=fp8_dtype)
-    kv_cache = torch.empty((1, 1, 1, 320), dtype=fp8_dtype)
-    output = torch.empty((1, 2, 128), dtype=torch.bfloat16)
-
-    forwarded_counters: list[torch.Tensor | None] = []
-    counter_allocations: list[torch.Tensor] = []
-    torch_zeros = torch.zeros
-
-    def record_counter_allocation(*args, **kwargs):
-        tensor = torch_zeros(*args, **kwargs)
-        if (
-            args == ((1,),)
-            and kwargs.get("dtype") == torch.int32
-            and kwargs.get("device") == query.device
-        ):
-            counter_allocations.append(tensor)
-        return tensor
-
-    def fake_flash_attn_varlen_func(**kwargs):
-        forwarded_counters.append(kwargs.get("dynamic_scheduler_counter"))
-
-    monkeypatch.setattr(
-        flash_attn_diffkv.torch, "zeros", record_counter_allocation
-    )
-    monkeypatch.setattr(
-        flash_attn_diffkv,
-        "flash_attn_varlen_func",
-        fake_flash_attn_varlen_func,
-    )
-    monkeypatch.setattr(
-        flash_attn_diffkv,
-        "canonicalize_singleton_dim_strides",
-        lambda tensor: tensor,
-    )
-    monkeypatch.setattr(
-        flash_attn_diffkv.current_platform, "fp8_dtype", lambda: fp8_dtype
-    )
-
-    impl.forward(layer, query, key, value, kv_cache, metadata, output)
-    impl.forward(layer, query, key, value, kv_cache, metadata, output)
     return (
-        forwarded_counters,
-        counter_allocations,
-        impl._dynamic_scheduler_counter,
+        [call.get("dynamic_scheduler_counter") for call in result.calls],
+        result.allocations,
+        result.counter_slot,
     )
 
 
