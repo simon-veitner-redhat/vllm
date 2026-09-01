@@ -41,6 +41,9 @@ if not current_platform.is_cuda():
     )
 
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
+    FlashAttnMLASparseFA4Backend,
+)
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseTRTLLMBackend,
 )
@@ -186,8 +189,12 @@ def _quantize_dequantize_fp8_ds_mla(
 
 @pytest.mark.parametrize(
     "backend_cls",
-    [FlashMLASparseBackend, FlashInferMLASparseTRTLLMBackend],
-    ids=["FlashMLA", "FlashInferTRTLLM"],
+    [
+        FlashMLASparseBackend,
+        FlashInferMLASparseTRTLLMBackend,
+        FlashAttnMLASparseFA4Backend,
+    ],
+    ids=["FlashMLA", "FlashInferTRTLLM", "FlashAttnFA4"],
 )
 @pytest.mark.parametrize("batch_name", list(SPARSE_BACKEND_BATCH_SPECS.keys()))
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8", "fp8_ds_mla"])
@@ -235,6 +242,19 @@ def test_sparse_backend_decode_correctness(
             device_capability
         ):
             pytest.skip("FlashInferMLASparseTRTLLMBackend requires SM 10.x capability")
+    elif backend_cls == FlashAttnMLASparseFA4Backend:
+        device_capability = current_platform.get_device_capability()
+        if device_capability is None or not backend_cls.supports_compute_capability(
+            device_capability
+        ):
+            pytest.skip("FlashAttnMLASparseFA4Backend requires SM 10.x capability")
+        from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
+            _fa4_cute_mla_available,
+        )
+
+        reason = _fa4_cute_mla_available()
+        if reason is not None:
+            pytest.skip(reason)
 
     batch_spec = SPARSE_BACKEND_BATCH_SPECS[batch_name]
     use_fp8_ds_mla_quantization = kv_cache_dtype == "fp8_ds_mla"
@@ -1352,6 +1372,265 @@ def test_triton_convert_returns_valid_counts(num_topk_tokens: int):
     )
     assert isinstance(result_only, torch.Tensor)
     torch.testing.assert_close(result_only, result, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="FA4 sparse MLA gather kernel requires SM 10.x",
+)
+def test_fa4_sparse_empty_index_rows_are_zero():
+    """A row whose whole top-k list is -1 must come back as exact zeros.
+
+    The FA4 gather kernel is what enforces this (its sentinel bitmask masks
+    every column, so the softmax denominator is 0 and the epilogue writes 0);
+    the backend relies on that instead of masking afterwards.
+    """
+    from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
+        FlashAttnMLASparseFA4Backend,
+        FlashAttnMLASparseFA4Impl,
+        _fa4_cute_mla_available,
+    )
+
+    if (reason := _fa4_cute_mla_available()) is not None:
+        pytest.skip(reason)
+    assert FlashAttnMLASparseFA4Backend.get_name() == "FLASH_ATTN_MLA_SPARSE_FA4"
+
+    device = torch.device(DEVICE_TYPE)
+    torch.manual_seed(0)
+    block_size, num_blocks, num_heads, topk = 64, 8, 128, 128
+    kv_lora_rank, rope_dim = 512, 64
+    num_tokens = 3
+
+    kv_cache = torch.randn(
+        num_blocks,
+        block_size,
+        kv_lora_rank + rope_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    topk_indices = torch.full((num_tokens, topk), -1, dtype=torch.int32, device=device)
+    # token 0: a handful of real rows; token 1: all -1; token 2: one real row.
+    topk_indices[0, :5] = torch.arange(5, dtype=torch.int32, device=device)
+    topk_indices[2, -1] = 3
+
+    ql_nope = torch.randn(
+        num_tokens, num_heads, kv_lora_rank, dtype=torch.bfloat16, device=device
+    )
+    q_pe = torch.randn(
+        num_tokens, num_heads, rope_dim, dtype=torch.bfloat16, device=device
+    )
+    scale = (kv_lora_rank + rope_dim) ** -0.5
+
+    stub_metadata = SimpleNamespace(
+        req_id_per_token=torch.zeros(num_tokens, dtype=torch.int32, device=device),
+        block_table=torch.arange(num_blocks, dtype=torch.int32, device=device).view(
+            1, num_blocks
+        ),
+        block_size=block_size,
+    )
+    stub_impl = SimpleNamespace(
+        topk_indices_buffer=topk_indices,
+        kv_lora_rank=kv_lora_rank,
+        scale=scale,
+        max_varlen_tokens=num_tokens,
+        q_pad_buffers=None,
+        _pad_q_heads=lambda nope, pe: (nope, pe),
+    )
+
+    with torch.inference_mode():
+        out, lse = FlashAttnMLASparseFA4Impl.forward_mqa(
+            stub_impl, (ql_nope, q_pe), kv_cache, stub_metadata, None
+        )
+
+    assert lse is None
+    assert out.shape == (num_tokens, num_heads, kv_lora_rank)
+    assert (out[1] == 0).all()
+
+    kv_flat = kv_cache.view(-1, kv_lora_rank + rope_dim).float()
+    q_full = torch.cat([ql_nope, q_pe], dim=-1).float()
+    for tok in (0, 2):
+        rows = topk_indices[tok][topk_indices[tok] >= 0].long()
+        keys = kv_flat[rows]
+        probs = torch.softmax(q_full[tok] @ keys.T * scale, dim=-1)
+        torch.testing.assert_close(
+            out[tok].float(), probs @ keys[:, :kv_lora_rank], rtol=0.01, atol=0.01
+        )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="FA4 sparse MLA gather kernel requires SM 10.x",
+)
+def test_fa4_sparse_passes_topk_valid_length(monkeypatch):
+    """The backend must always hand FA4 the per-row top-k length.
+
+    It is what stops every row from walking the full top-k width, and it is
+    part of FA4's compile key, so it may not be passed only sometimes.
+    """
+    import vllm.v1.attention.backends.mla.flashattn_mla_sparse as fa4_sparse
+    from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
+        FlashAttnMLASparseFA4Impl,
+    )
+
+    device = torch.device(DEVICE_TYPE)
+    block_size, num_blocks, num_heads, topk = 64, 4, 128, 128
+    kv_lora_rank, rope_dim = 512, 64
+    num_tokens = 3
+
+    kv_cache = torch.zeros(
+        num_blocks,
+        block_size,
+        kv_lora_rank + rope_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    topk_indices = torch.full((num_tokens, topk), -1, dtype=torch.int32, device=device)
+    expected_counts = [5, 0, 1]
+    topk_indices[0, :5] = torch.arange(5, dtype=torch.int32, device=device)
+    topk_indices[2, 0] = 3
+
+    captured = {}
+
+    def fake_flash_attn_varlen_func(**kwargs):
+        captured.update(kwargs)
+        return torch.zeros(
+            num_tokens, num_heads, kv_lora_rank, dtype=torch.bfloat16, device=device
+        )
+
+    monkeypatch.setattr(
+        fa4_sparse, "flash_attn_varlen_func", fake_flash_attn_varlen_func
+    )
+
+    stub_metadata = SimpleNamespace(
+        req_id_per_token=torch.zeros(num_tokens, dtype=torch.int32, device=device),
+        block_table=torch.arange(num_blocks, dtype=torch.int32, device=device).view(
+            1, num_blocks
+        ),
+        block_size=block_size,
+    )
+    stub_impl = SimpleNamespace(
+        topk_indices_buffer=topk_indices,
+        kv_lora_rank=kv_lora_rank,
+        scale=1.0,
+        max_varlen_tokens=num_tokens,
+        q_pad_buffers=None,
+        _pad_q_heads=lambda nope, pe: (nope, pe),
+    )
+    q = (
+        torch.zeros(
+            num_tokens, num_heads, kv_lora_rank, dtype=torch.bfloat16, device=device
+        ),
+        torch.zeros(
+            num_tokens, num_heads, rope_dim, dtype=torch.bfloat16, device=device
+        ),
+    )
+
+    with torch.inference_mode():
+        FlashAttnMLASparseFA4Impl.forward_mqa(
+            stub_impl, q, kv_cache, stub_metadata, None
+        )
+
+    valid_length = captured["gather_kv_valid_length"]
+    assert valid_length.tolist() == expected_counts
+    assert valid_length.shape == captured["gather_kv_indices"].shape[:-1]
+    assert valid_length.dtype == torch.int32
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="FA4 sparse MLA gather kernel requires SM 10.x",
+)
+def test_fa4_sparse_valid_length_block_boundaries():
+    """Per-row top-k lengths that straddle the kernel's 128-wide index block.
+
+    The sweep above runs at index_topk=128 with fewer than 128 valid entries, so
+    every row walks exactly one block and the early exit never truncates. These
+    counts make it walk 1..16 blocks and land on both sides of each boundary,
+    which is where an off-by-one in the round-up would drop real entries.
+    """
+    from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
+        FlashAttnMLASparseFA4Impl,
+        _fa4_cute_mla_available,
+    )
+
+    if (reason := _fa4_cute_mla_available()) is not None:
+        pytest.skip(reason)
+
+    device = torch.device(DEVICE_TYPE)
+    torch.manual_seed(0)
+    block_size, num_blocks, num_heads, topk = 64, 64, 128, 2048
+    kv_lora_rank, rope_dim = 512, 64
+    counts = [0, 1, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025, 2048]
+    num_tokens = len(counts)
+    num_rows = num_blocks * block_size
+
+    kv_cache = (
+        torch.rand(
+            num_blocks,
+            block_size,
+            kv_lora_rank + rope_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        - 0.5
+    )
+    # Valid entries are a prefix and the padding is -1: the layout the indexer
+    # produces and the only one the per-row length is defined for.
+    topk_indices = torch.full((num_tokens, topk), -1, dtype=torch.int32, device=device)
+    for tok, count in enumerate(counts):
+        if count:
+            topk_indices[tok, :count] = torch.randperm(num_rows, device=device)[
+                :count
+            ].to(torch.int32)
+
+    ql_nope = (
+        torch.rand(
+            num_tokens, num_heads, kv_lora_rank, dtype=torch.bfloat16, device=device
+        )
+        - 0.5
+    )
+    q_pe = (
+        torch.rand(num_tokens, num_heads, rope_dim, dtype=torch.bfloat16, device=device)
+        - 0.5
+    )
+    scale = (kv_lora_rank + rope_dim) ** -0.5
+
+    stub_metadata = SimpleNamespace(
+        req_id_per_token=torch.zeros(num_tokens, dtype=torch.int32, device=device),
+        block_table=torch.arange(num_blocks, dtype=torch.int32, device=device).view(
+            1, num_blocks
+        ),
+        block_size=block_size,
+    )
+    stub_impl = SimpleNamespace(
+        topk_indices_buffer=topk_indices,
+        kv_lora_rank=kv_lora_rank,
+        scale=scale,
+        max_varlen_tokens=num_tokens,
+        q_pad_buffers=None,
+        _pad_q_heads=lambda nope, pe: (nope, pe),
+    )
+
+    with torch.inference_mode():
+        out, _ = FlashAttnMLASparseFA4Impl.forward_mqa(
+            stub_impl, (ql_nope, q_pe), kv_cache, stub_metadata, None
+        )
+
+    kv_flat = kv_cache.view(-1, kv_lora_rank + rope_dim).float()
+    q_full = torch.cat([ql_nope, q_pe], dim=-1).float()
+    for tok, count in enumerate(counts):
+        if count == 0:
+            assert (out[tok] == 0).all()
+            continue
+        keys = kv_flat[topk_indices[tok, :count].long()]
+        probs = torch.softmax(q_full[tok] @ keys.T * scale, dim=-1)
+        torch.testing.assert_close(
+            out[tok].float(),
+            probs @ keys[:, :kv_lora_rank],
+            rtol=0.01,
+            atol=0.01,
+            msg=lambda m, count=count: f"top-k length {count}: {m}",
+        )
 
 
 def test_flashmla_cache_dtype_aliases_use_ds_layout():
