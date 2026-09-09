@@ -251,6 +251,7 @@ def test_gpu_sampler_skips_watermarking_for_repeated_contexts(monkeypatch):
         None,
         None,
         False,
+        False,
     )
 
     assert torch.equal(sampled, torch.tensor([3, 7]))
@@ -289,6 +290,7 @@ def test_gpu_sampler_can_disable_context_deduplication(monkeypatch):
         torch.zeros(2, dtype=torch.int64),
         None,
         None,
+        False,
         False,
     )
 
