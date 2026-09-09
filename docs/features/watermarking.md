@@ -76,6 +76,12 @@ bypass watermarking and emit a warning once per worker.
 
 The naive single-key `gumbel` implementation is not production-ready.
 
+When a generated-token context has already appeared in the same completion,
+generation uses ordinary sampling for that occurrence. Reusing the keyed random
+vector would otherwise correlate token choices and weaken the sequence-level
+distribution-preserving guarantee. The detector applies the matching context
+deduplication described below.
+
 ### Dual-key Gumbel-max
 
 Dual-key Gumbel-max derives independent keys A and B from one configured master
