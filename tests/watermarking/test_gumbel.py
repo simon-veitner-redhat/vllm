@@ -135,3 +135,45 @@ def test_philox_gumbel_sample_skip_mask_matches_separate_samplers(use_fp64: bool
     )
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="requires a CUDA-like accelerator"
+)
+def test_philox_gumbel_sample_skip_mask_handles_padding_rows():
+    torch.manual_seed(0)
+    logits = torch.randn(4, 1031, device="cuda")
+    contexts = torch.randint(0, 248320, (4, 4), dtype=torch.int64, device="cuda")
+    # Padding rows carry -1 in the request mapping; their output is discarded,
+    # but they must be sampled the same way on both paths.
+    req_indices = torch.tensor([0, -1, 2, -1], device="cuda")
+    temperatures = torch.ones(4, dtype=torch.float32, device="cuda")
+    seeds = torch.arange(4, dtype=torch.int64, device="cuda") + 7
+    positions = torch.arange(4, dtype=torch.int64, device="cuda")
+    skip_mask = torch.tensor([True, True, False, True], device="cuda")
+
+    expected = torch.where(
+        skip_mask,
+        gumbel_sample(
+            logits,
+            req_indices,
+            temperatures,
+            seeds,
+            positions,
+            apply_temperature=False,
+            is_drafting=False,
+        ),
+        philox_gumbel_sample(logits, contexts, 42),
+    )
+    actual = philox_gumbel_sample(
+        logits,
+        contexts,
+        42,
+        skip_mask=skip_mask,
+        expanded_idx_mapping=req_indices,
+        temperatures=temperatures,
+        seeds=seeds,
+        positions=positions,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

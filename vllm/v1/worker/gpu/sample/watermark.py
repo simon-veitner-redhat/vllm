@@ -25,7 +25,7 @@ from vllm.v1.watermarking.prfs.philox import (
 from vllm.v1.watermarking.prfs.philox import (
     _UINT32_MASK as _UINT32_MASK_VALUE,
 )
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_block_argmax
 
 if HAS_TRITON:
     from triton.language import math as tl_math
@@ -259,30 +259,33 @@ def _philox_gumbel_kernel(
     groups = block_index * (BLOCK_SIZE // 4) + tl.arange(0, BLOCK_SIZE // 4)
 
     if skip_mask_ptr is not None:
-        req_state_idx = tl.load(expanded_idx_mapping_ptr + row).to(tl.int64)
-        valid_req = req_state_idx >= 0
-        if tl.load(skip_mask_ptr + row):
-            temp = tl.load(temp_ptr + req_state_idx, mask=valid_req, other=0.0).to(
-                tl.float32
-            )
-            seed = tl.load(seeds_ptr + req_state_idx, mask=valid_req, other=0)
-            pos = tl.load(pos_ptr + row)
+        skip_watermark = tl.load(skip_mask_ptr + row)
+        if skip_watermark:
             candidate = block_index * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
             mask = candidate < vocab_size
             logits_row = logits_ptr + row * logits_stride
             logits = tl.load(logits_row + candidate, mask=mask, other=float("-inf")).to(
                 tl.float32
             )
-            value, index = gumbel_noised_argmax(
+            # Skipped rows must match gumbel_sample bit for bit, so read the
+            # sampling state through the same helper it uses.
+            value, index = gumbel_block_argmax(
                 logits,
                 candidate,
                 mask,
-                seed,
-                pos,
-                temp,
+                row,
+                expanded_idx_mapping_ptr,
+                temp_ptr,
+                seeds_ptr,
+                pos_ptr,
+                None,
+                0,
+                0,
+                None,
+                vocab_size,
                 IS_DRAFTING=False,
-                USE_FP64=USE_FP64,
                 APPLY_TEMPERATURE=False,
+                USE_FP64=USE_FP64,
             )
             token_id = block_index * BLOCK_SIZE + index
             tl.store(
