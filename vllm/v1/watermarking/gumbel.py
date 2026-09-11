@@ -115,6 +115,20 @@ class DualKeyGumbelWatermarker(GumbelWatermarker, SupportsSpeculativeDecoding):
         self.key_b_watermarker = GumbelWatermarker(
             derive_watermark_key(key, b"key_b"), context_width, prf
         )
+        self._routing_logits_cache: dict[torch.device, torch.Tensor] = {}
+
+    def _routing_logits(self, device: torch.device) -> torch.Tensor:
+        # Built from a Python list, so a per-call build would stage a pageable
+        # H2D copy that synchronizes the stream.
+        cached = self._routing_logits_cache.get(device)
+        if cached is None:
+            cached = torch.tensor(
+                [1 - self.alpha, self.alpha],
+                dtype=torch.float32,
+                device=device,
+            ).log()
+            self._routing_logits_cache[device] = cached
+        return cached
 
     def sample(
         self,
@@ -129,12 +143,7 @@ class DualKeyGumbelWatermarker(GumbelWatermarker, SupportsSpeculativeDecoding):
 
         key_a_sample = super().sample(logits, contexts, random_sample)
         key_b_sample = self.key_b_watermarker.sample(logits, contexts, random_sample)
-        routing_logits = torch.tensor(
-            [1 - self.alpha, self.alpha],
-            dtype=torch.float32,
-            device=logits.device,
-        ).log()
-        routing_logits = routing_logits.expand(logits.shape[0], -1)
+        routing_logits = self._routing_logits(logits.device).expand(logits.shape[0], -1)
         use_key_a = random_sample(routing_logits) == 0
         return WatermarkSample(
             torch.where(
