@@ -120,22 +120,31 @@ class DualKeyGumbelWatermarker(GumbelWatermarker, SupportsSpeculativeDecoding):
         self,
         logits: torch.Tensor,
         contexts: torch.Tensor,
-        random_sample: RandomSampler,
+        random_sampler: RandomSampler | None = None,
+        skip_mask: torch.Tensor | None = None,
     ) -> WatermarkSample:
         if self.alpha == 0:
-            return super().sample(logits, contexts, random_sample)
+            return super().sample(logits, contexts, random_sampler, skip_mask)
         if self.alpha == 1:
-            return self.key_b_watermarker.sample(logits, contexts, random_sample)
+            return self.key_b_watermarker.sample(
+                logits, contexts, random_sampler, skip_mask
+            )
+        if random_sampler is None:
+            raise ValueError("dual-key Gumbel routing requires a random sampler")
 
-        key_a_sample = super().sample(logits, contexts, random_sample)
-        key_b_sample = self.key_b_watermarker.sample(logits, contexts, random_sample)
+        # Both keyed samples honor skip_mask, so a skipped row carries the same
+        # ordinary draw in either branch and the routing select is a no-op there.
+        key_a_sample = super().sample(logits, contexts, random_sampler, skip_mask)
+        key_b_sample = self.key_b_watermarker.sample(
+            logits, contexts, random_sampler, skip_mask
+        )
         routing_logits = torch.tensor(
             [1 - self.alpha, self.alpha],
             dtype=torch.float32,
             device=logits.device,
         ).log()
         routing_logits = routing_logits.expand(logits.shape[0], -1)
-        use_key_a = random_sample(routing_logits) == 0
+        use_key_a = random_sampler(routing_logits) == 0
         return WatermarkSample(
             torch.where(
                 use_key_a,
