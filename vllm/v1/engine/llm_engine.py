@@ -253,6 +253,9 @@ class LLMEngine:
                     "does not match the EngineCoreRequest.request_id attribute. The "
                     "latter will be used, and the former will be ignored."
                 )
+            request_params = request.params
+            if isinstance(request_params, SamplingParams):
+                self.input_processor._validate_watermarking_params(request_params)
         else:
             request = self.input_processor.process_inputs(
                 request_id,

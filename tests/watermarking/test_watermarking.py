@@ -267,25 +267,16 @@ def test_sampling_params_can_disable_watermarking():
     assert not SamplingParams.from_optional(watermarking=False).watermarking
 
 
-def test_gpu_sampler_warns_when_watermarking_is_enabled_for_greedy(monkeypatch):
+def test_gpu_sampler_rejects_watermarking_for_greedy(monkeypatch):
     sampler = object.__new__(GPUWatermarkSampler)
     sampler.watermarking = SimpleNamespace(np=np.ones(1, dtype=bool))
-    messages: list[str] = []
     monkeypatch.setattr(Sampler, "add_request", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        "vllm.v1.watermarking.gpu_sampler.logger.warning_once", messages.append
-    )
 
-    sampler.add_request(0, 1, SamplingParams(temperature=0))
+    with pytest.raises(ValueError, match="Greedy decoding cannot be used"):
+        sampler.add_request(0, 1, SamplingParams(temperature=0))
+
     sampler.add_request(0, 1, SamplingParams(temperature=1))
     sampler.add_request(0, 1, SamplingParams(temperature=0, watermarking=False))
-
-    assert messages == [
-        (
-            "Watermarking is enabled, but greedy decoding (temperature=0) cannot be "
-            "watermarked. This request will use ordinary greedy sampling."
-        )
-    ]
 
 
 def test_gpu_sampler_respects_mixed_request_watermarking(monkeypatch):
@@ -293,11 +284,12 @@ def test_gpu_sampler_respects_mixed_request_watermarking(monkeypatch):
     sampler.watermarker = StubWatermarker()
     sampler.deduplicate_contexts = "single_turn"
     sampler.watermarking = SimpleNamespace(
-        np=np.array([True, False]), gpu=torch.tensor([True, False])
+        np=np.array([False, True, False, False]),
+        gpu=torch.tensor([False, True, False, False]),
     )
     sampler.sampling_states = SimpleNamespace(
-        temperature=SimpleNamespace(np=np.ones(2), gpu=torch.ones(2)),
-        seeds=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int64)),
+        temperature=SimpleNamespace(np=np.ones(4), gpu=torch.ones(4)),
+        seeds=SimpleNamespace(gpu=torch.zeros(4, dtype=torch.int64)),
     )
     sampler.use_fp64_gumbel = False
     sampler._get_contexts = lambda expanded_idx_mapping: torch.zeros(
@@ -314,17 +306,87 @@ def test_gpu_sampler_respects_mixed_request_watermarking(monkeypatch):
 
     sampled, output_logits = sampler._sample_random(
         logits,
-        torch.tensor([0, 1]),
-        np.array([0, 1]),
+        torch.tensor([3, 1]),
+        np.array([3, 1]),
         torch.zeros(2, dtype=torch.int64),
         None,
         None,
         False,
     )
 
-    assert torch.equal(sampled, torch.tensor([7, 4]))
-    assert torch.equal(output_logits[0], torch.full((8,), 10.0))
-    assert torch.equal(output_logits[1], logits[1])
+    assert torch.equal(sampled, torch.tensor([3, 7]))
+    assert torch.equal(output_logits[0], logits[0])
+    assert torch.equal(output_logits[1], torch.full((8,), 10.0))
+
+
+def test_gpu_sampler_filters_top_k_top_p_before_watermarking(monkeypatch):
+    captured_logits = None
+
+    class CapturingWatermarker:
+        context_width = 1
+
+        def sample(self, logits, contexts, random_sampler=None, skip_mask=None):
+            nonlocal captured_logits
+            captured_logits = logits
+            return WatermarkSample(logits.argmax(dim=-1), logits)
+
+    sampler = object.__new__(GPUWatermarkSampler)
+    sampler.watermarker = CapturingWatermarker()
+    sampler.deduplicate_contexts = "none"
+    sampler.watermarking = SimpleNamespace(
+        np=np.array([True]), gpu=torch.tensor([True])
+    )
+    sampler.sampling_states = SimpleNamespace(
+        temperature=SimpleNamespace(np=np.ones(1), gpu=torch.ones(1)),
+        seeds=SimpleNamespace(gpu=torch.zeros(1, dtype=torch.int64)),
+    )
+    sampler.use_fp64_gumbel = False
+    sampler._get_contexts = lambda expanded_idx_mapping: torch.zeros(
+        1, 1, dtype=torch.int64
+    )
+    logits = torch.tensor([[5.0, 4.0, 3.0, 2.0]])
+
+    sampled, _ = sampler._sample_random(
+        logits,
+        torch.tensor([0]),
+        np.array([0]),
+        torch.zeros(1, dtype=torch.int64),
+        torch.tensor([2]),
+        torch.tensor([0.8]),
+        False,
+    )
+
+    assert captured_logits is not None
+    assert torch.isneginf(captured_logits[0, 2:]).all()
+    assert sampled.item() in (0, 1)
+
+
+def test_watermark_context_ignores_prefix_cache_bookkeeping():
+    sampler = object.__new__(GPUWatermarkSampler)
+    sampler.watermarker = SimpleNamespace(context_width=3)
+    sampler.req_states = SimpleNamespace(
+        total_len=SimpleNamespace(gpu=torch.tensor([4, 0, 5])),
+        prompt_len=SimpleNamespace(gpu=torch.tensor([3, 0, 2])),
+        all_token_ids=SimpleNamespace(
+            gpu=torch.tensor(
+                [
+                    [10, 11, 12, 40, 0, 0],
+                    [0, 0, 0, 0, 0, 0],
+                    [20, 21, 50, 51, 52, 0],
+                ]
+            )
+        ),
+        num_computed_tokens=SimpleNamespace(gpu=torch.tensor([0, 0, 0])),
+    )
+    request_slots = torch.tensor([2, 0])
+
+    cold_contexts = sampler._get_contexts(request_slots)
+    sampler.req_states.num_computed_tokens.gpu[:] = torch.tensor([3, 0, 2])
+    cached_contexts = sampler._get_contexts(request_slots)
+
+    expected = torch.tensor([[50, 51, 52], [-1, -1, 40]])
+    assert torch.equal(cold_contexts, expected)
+    assert torch.equal(cached_contexts, expected)
 
 
 def test_gpu_sampler_skips_watermarking_for_repeated_contexts(monkeypatch):
@@ -840,7 +902,7 @@ def test_gpu_sampler_uses_fused_gumbel_for_repeated_contexts():
     assert output_logits is logits
 
 
-def test_gpu_sampler_skips_watermarking_for_greedy_batch(monkeypatch):
+def test_gpu_sampler_skips_watermarking_for_disabled_greedy_batch(monkeypatch):
     class StubWatermarker:
         context_width = 1
 
@@ -850,7 +912,7 @@ def test_gpu_sampler_skips_watermarking_for_greedy_batch(monkeypatch):
     sampler = object.__new__(GPUWatermarkSampler)
     sampler.watermarker = StubWatermarker()
     sampler.watermarking = SimpleNamespace(
-        np=np.array([True, True]), gpu=torch.tensor([True, True])
+        np=np.array([False, False]), gpu=torch.tensor([False, False])
     )
     sampler.sampling_states = SimpleNamespace(
         temperature=SimpleNamespace(np=np.zeros(2), gpu=torch.zeros(2)),

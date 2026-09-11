@@ -3,6 +3,7 @@
 
 import datetime
 import json
+from typing import Any, cast
 
 import jsonschema
 import openai  # use the official client for correctness check
@@ -152,6 +153,70 @@ def server():
 async def client(server):
     async with server.get_async_client() as async_client:
         yield async_client
+
+
+@pytest.fixture(scope="module")
+def watermarked_server():
+    args = [
+        "--dtype",
+        "half",
+        "--enable-auto-tool-choice",
+        "--structured-outputs-config.backend",
+        "xgrammar",
+        "--tool-call-parser",
+        "hermes",
+        "--reasoning-parser",
+        "qwen3",
+        "--gpu-memory-utilization",
+        "0.4",
+        "--enforce-eager",
+        "--watermark-config",
+        '{"algorithm":"gumbel","key":42}',
+    ] + ROCM_EXTRA_ARGS
+
+    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
+        yield remote_server
+
+
+@pytest_asyncio.fixture
+async def watermarked_client(watermarked_server):
+    async with watermarked_server.get_async_client() as async_client:
+        yield async_client
+
+
+@pytest.mark.asyncio
+async def test_watermarked_named_tool_use(
+    watermarked_client: openai.AsyncOpenAI,
+):
+    tool = cast(dict[str, Any], tools[0])
+    function = cast(dict[str, Any], tool["function"])
+    chat_completion = await watermarked_client.chat.completions.create(
+        messages=[
+            {
+                "role": "user",
+                "content": "What is the weather in Berlin in fahrenheit?",
+            }
+        ],
+        model=MODEL_NAME,
+        tools=[tool],
+        tool_choice={
+            "type": "function",
+            "function": {"name": function["name"]},
+        },
+        temperature=0.8,
+        max_completion_tokens=128,
+        extra_body={
+            "watermarking": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+
+    tool_calls = chat_completion.choices[0].message.tool_calls
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function.name == function["name"]
+    arguments = json.loads(tool_calls[0].function.arguments)
+    jsonschema.validate(arguments, function["parameters"])
 
 
 @pytest.mark.asyncio

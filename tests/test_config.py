@@ -3107,6 +3107,23 @@ def test_gumbel_watermark_rejects_beam_search():
         _watermarked_vllm_config()._check_watermarking_unsupported(beam_search=True)
 
 
+def test_gumbel_watermark_allows_unwatermarked_beam_search():
+    _watermarked_vllm_config()._check_watermarking_unsupported(
+        beam_search=True, watermarking=False
+    )
+
+
+def test_unwatermarked_beam_does_not_bypass_engine_incompatibilities():
+    config = _watermarked_vllm_config()
+    config.speculative_config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=1,
+    )
+
+    with pytest.raises(ValueError, match="Speculative decoding with watermarking"):
+        config._check_watermarking_unsupported(beam_search=True, watermarking=False)
+
+
 def test_gumbel_watermark_rejects_custom_sampler():
     with pytest.raises(ValueError, match="custom samplers are not supported"):
         _watermarked_vllm_config()._check_watermarking_unsupported(custom_sampler=True)

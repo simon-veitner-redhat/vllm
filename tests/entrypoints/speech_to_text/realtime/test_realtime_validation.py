@@ -4,6 +4,7 @@
 import asyncio
 import json
 import warnings
+from types import SimpleNamespace
 
 import numpy as np
 import pybase64 as base64
@@ -12,6 +13,7 @@ import websockets
 
 from tests.utils import ROCM_EXTRA_ARGS, RemoteOpenAIServer
 from vllm.assets.audio import AudioAsset
+from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection
 from vllm.multimodal.media.audio import load_audio
 
 # Increase engine iteration timeout for ROCm where first-use JIT compilation
@@ -30,6 +32,45 @@ MISTRAL_FORMAT_ARGS = [
 ] + ROCM_EXTRA_ARGS
 
 MODEL_NAME = "mistralai/Voxtral-Mini-4B-Realtime-2602"
+
+
+def test_realtime_generation_disables_watermarking():
+    captured = None
+
+    class EngineClient:
+        def generate(self, **kwargs):
+            nonlocal captured
+            captured = kwargs["sampling_params"]
+
+            async def outputs():
+                output: object
+                for output in ():
+                    yield output
+
+            return outputs()
+
+    async def streaming_input():
+        chunk: np.ndarray
+        for chunk in ():
+            yield chunk
+
+    async def send(_event):
+        return None
+
+    connection = object.__new__(RealtimeConnection)
+    connection.connection_id = "test"
+    connection.serving = SimpleNamespace(
+        model_cls=SimpleNamespace(realtime_max_tokens=1),
+        engine_client=EngineClient(),
+    )
+    connection.audio_queue = asyncio.Queue()
+    connection._is_connected = True
+    connection.send = send
+
+    asyncio.run(connection._run_generation(streaming_input(), asyncio.Queue()))
+
+    assert captured is not None
+    assert not captured.watermarking
 
 
 def _get_websocket_url(server: RemoteOpenAIServer) -> str:

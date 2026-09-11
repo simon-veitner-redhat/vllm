@@ -100,6 +100,7 @@ class InputProcessor:
                 self.structured_outputs_config,
                 self.tokenizer,
             )
+            InputProcessor._validate_watermarking_params(self, params)
 
             if self.model_config.return_sampling_mask:
                 if params.temperature <= 0:
@@ -156,6 +157,27 @@ class InputProcessor:
             raise TypeError(
                 f"params must be either SamplingParams or PoolingParams, "
                 f"but got {type(params).__name__}"
+            )
+
+    def _validate_watermarking_params(self, params: SamplingParams) -> None:
+        if (
+            getattr(self.vllm_config, "watermark_config", None) is None
+            or not params.watermarking
+        ):
+            return
+        if params.temperature == 0:
+            raise VLLMValidationError(
+                "Watermarking requires stochastic sampling. Set temperature > 0 "
+                "or watermarking=False.",
+                parameter="temperature",
+                value=params.temperature,
+            )
+        if params.trace_decode_token_ids is not None:
+            raise VLLMValidationError(
+                "Trace replay is not supported with watermarking. "
+                "Remove trace_decode_token_ids or set watermarking=False.",
+                parameter="trace_decode_token_ids",
+                value=params.trace_decode_token_ids,
             )
 
     def _normalize_trace_replay_params(
