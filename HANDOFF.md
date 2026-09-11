@@ -30,6 +30,7 @@ git fetch git@github.com:simon-veitner-redhat/vllm.git 'refs/heads/patches/*:ref
 | `patches/dual-key-routing-cache` | `4b5c170666` | removes a per-step host stall, TPOT 4.32 ms to 2.63 ms |
 | `patches/config-reject-gumbel-specdec` | `1df37d0614` | rejects an unsupported config at validation instead of in the worker |
 | `patches/docs-dual-key` | `98f34ffcb0` | documents the dual-key detector, new fields and limits |
+| `patch/minor` | `3673087e0c` | three lint and warning fixes found by the validation pass, one commit on `1db8717152` |
 | `patches/all` | `1db8717152` + this file | the four fixes cherry-picked onto the base, in that order, verified together; commits after `1db8717152` only add this document |
 
 ### How to pull them in
@@ -174,6 +175,30 @@ draft, recovery or bonus tokens. Files: the docs page and
 
 Verified. The Python snippets and the example compile, `--help` lists `--algorithm`, markdownlint
 reports no issues, ruff clean.
+
+### 5. `patch/minor`, commit `3673087e0c`
+
+Issue. Validation of `patches/all` found three small defects. `DraftWatermarker.sample` passed a
+lambda where the new template method types `RandomSampler | None`, so mypy and the pre-commit
+hook fail; the argument was dead because the draft role is always the plain key-A watermarker.
+`watermarker.py` kept an unused `TypeAlias` import from the rebase, so ruff fails. The
+repetition-loop warning in `WatermarkConfig` was gated on `algorithm == "gumbel"` and silently
+exempted `dual_key_gumbel`, although both of its key streams reuse the keyed vector on a repeated
+context.
+
+Change. Drop the lambda, drop the import, widen the gate to both algorithms and remove
+"Single-key" from the message. The warning test is parametrized over both algorithms, and the
+draft-sampler unit test's stub now matches the real `sample` signature instead of locking in the
+old call. Files: `spec_decode.py`, `watermarker.py`, `config/watermarking.py`,
+`test_watermarking.py` (+12/-11).
+
+Verified. 60 CPU tests, 22 config tests, 145 GPU tests, ruff and mypy clean on the changed files,
+both end-to-end smoke runs detect every watermarked output with negative controls.
+
+Not in this branch: the first watermarked request at temperature 1.0 still JIT-compiles
+`_philox_gumbel_kernel` once per engine, because the sampler warmup only exercises the fp32 logits
+path. That is in the base feature (PR #54053), harmless under the default JIT monitor mode and
+fatal under `--jit-monitor-mode=error`; it is left for a separate follow-up.
 
 ### `patches/all`, commit `1db8717152`
 
