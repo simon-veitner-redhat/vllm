@@ -31,7 +31,7 @@ git fetch git@github.com:simon-veitner-redhat/vllm.git 'refs/heads/patches/*:ref
 | `patches/config-reject-gumbel-specdec` | `1df37d0614` | rejects an unsupported config at validation instead of in the worker |
 | `patches/docs-dual-key` | `98f34ffcb0` | documents the dual-key detector, new fields and limits |
 | `patch/minor` | `3673087e0c` | three lint and warning fixes found by the validation pass, one commit on `1db8717152` |
-| `patch/warmup` | `2b5c95d9bf` | warms the watermark sampler kernel for every specialization the engine launches; fixes a base-feature gap; optional for the merge |
+| `patch/warmup` | `1f23fc2da6` | warms the watermark sampler kernel for every specialization the engine launches; fixes a base-feature gap; optional for the merge |
 | `patches/all` | `1db8717152` + this file | the four fixes cherry-picked onto the base, in that order, verified together; commits after `1db8717152` only add this document |
 
 ### How to pull them in
@@ -201,7 +201,7 @@ Not in this branch: the first watermarked request at temperature 1.0 still JIT-c
 path. That is in the base feature (PR #54053), harmless under the default JIT monitor mode and
 fatal under `--jit-monitor-mode=error`; it is left for a separate follow-up.
 
-### 6. `patch/warmup`, commit `2b5c95d9bf`
+### 6. `patch/warmup`, commit `1f23fc2da6`
 
 Issue. The first watermarked request at temperature 1.0 JIT-compiles `_philox_gumbel_kernel`
 during inference, once per engine, and kills the engine under `--jit-monitor-mode=error`. The
@@ -229,7 +229,7 @@ moving this kernel there means rewriting its runtime launch path. That migration
 as a follow-up for the Philox and rejection-sampler kernels together (`review/warmup/WIRING.md`).
 
 Verified. CPU: 17 warmup tests, 70 watermarking tests, 22 config tests, ruff and mypy clean.
-GPU, end to end at `2b5c95d9bf` under `jit_monitor_mode=error` (`review/warmup/logs/warmup-jit-probe.log`):
+GPU, end to end at `1f23fc2da6` under `jit_monitor_mode=error` (`review/warmup/logs/warmup-jit-probe.log`):
 ordinary dual-key generation, single-key with `deduplicate_contexts="none"` and one opted-out
 request, and dual-key with MTP all complete their first request, with no JIT compilation
 logged after the monitor activated; at head the same probe raised `EngineDeadError`. Engine
