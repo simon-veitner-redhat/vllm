@@ -14,7 +14,11 @@ from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.watermarker import Watermarker, WatermarkSample
 from vllm.v1.worker.gpu.sample.sampler import Sampler
-from vllm.v1.worker.gpu.sample.watermark import repeated_context_mask
+from vllm.v1.worker.gpu.sample.watermark import (
+    _watermark_prep_cpu,
+    repeated_context_mask,
+    watermark_prep,
+)
 
 
 class StubWatermarker(Watermarker):
@@ -126,11 +130,9 @@ def test_gpu_sampler_respects_mixed_request_watermarking(monkeypatch):
         seeds=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int64)),
     )
     sampler.use_fp64_gumbel = False
-    sampler._get_contexts = lambda expanded_idx_mapping: torch.zeros(
-        2, 1, dtype=torch.int64
-    )
-    sampler._get_repeated_contexts = lambda expanded_idx_mapping, contexts: torch.zeros(
-        2, dtype=torch.bool
+    sampler._prepare_watermark_inputs = lambda expanded_idx_mapping: (
+        torch.zeros(2, 1, dtype=torch.int64),
+        torch.tensor([False, True]),
     )
     monkeypatch.setattr(
         "vllm.v1.watermarking.gpu_sampler.gumbel_sample",
@@ -165,11 +167,9 @@ def test_gpu_sampler_skips_watermarking_for_repeated_contexts(monkeypatch):
         seeds=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int64)),
     )
     sampler.use_fp64_gumbel = False
-    sampler._get_contexts = lambda expanded_idx_mapping: torch.zeros(
-        2, 1, dtype=torch.int64
-    )
-    sampler._get_repeated_contexts = lambda expanded_idx_mapping, contexts: (
-        torch.tensor([True, False])
+    sampler._prepare_watermark_inputs = lambda expanded_idx_mapping: (
+        torch.zeros(2, 1, dtype=torch.int64),
+        torch.tensor([True, False]),
     )
     monkeypatch.setattr(
         "vllm.v1.watermarking.gpu_sampler.gumbel_sample",
@@ -201,12 +201,26 @@ def test_gpu_sampler_can_disable_context_deduplication(monkeypatch):
     )
     sampler.sampling_states = SimpleNamespace(
         temperature=SimpleNamespace(np=np.ones(2), gpu=torch.ones(2)),
+        seeds=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int64)),
     )
-    sampler._get_contexts = lambda expanded_idx_mapping: torch.zeros(
-        2, 1, dtype=torch.int64
+    sampler.use_fp64_gumbel = False
+    sampler.deduplicate_contexts_max_history = 8192
+    sampler.req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=torch.tensor([[1, 2], [3, 4]])),
+        prompt_len=SimpleNamespace(gpu=torch.tensor([0, 0])),
+        total_len=SimpleNamespace(gpu=torch.tensor([2, 2])),
     )
-    sampler._get_repeated_contexts = lambda *args: pytest.fail(
-        "context deduplication should not run"
+    scans: list[bool] = []
+    monkeypatch.setattr(
+        "vllm.v1.watermarking.gpu_sampler.watermark_prep",
+        lambda *args, scan, **kwargs: (
+            scans.append(scan),
+            (torch.zeros(2, 1, dtype=torch.int64), torch.tensor([False, False])),
+        )[1],
+    )
+    monkeypatch.setattr(
+        "vllm.v1.watermarking.gpu_sampler.gumbel_sample",
+        lambda *args, **kwargs: torch.tensor([3, 4]),
     )
     logits = torch.zeros(2, 8)
 
@@ -220,6 +234,7 @@ def test_gpu_sampler_can_disable_context_deduplication(monkeypatch):
         False,
     )
 
+    assert scans == [False]
     assert torch.equal(sampled, torch.tensor([7, 7]))
     assert torch.equal(output_logits, torch.full((2, 8), 10.0))
 
@@ -358,6 +373,78 @@ def _unaligned_max_history_inputs() -> tuple[torch.Tensor, ...]:
     )
 
 
+def _watermark_prep_fixture(seed: int, scope: str) -> dict:
+    """A random batch with padding, opted-out, greedy and short-history rows."""
+    generator = torch.Generator().manual_seed(seed)
+    num_reqs = 6
+    context_width = 4
+    max_len = 40
+    all_token_ids = torch.randint(
+        0, 12, (num_reqs, max_len), dtype=torch.int32, generator=generator
+    )
+    prompt_lens = torch.tensor([8, 8, 8, 8, 8, 0], dtype=torch.int32)
+    # Row 4 has fewer generated tokens than context_width, row 5 is empty.
+    total_lens = torch.tensor([40, 33, 27, 12, 10, 0], dtype=torch.int32)
+    # Row 3 is a padding row (req_idx -1); the batch also visits a row twice.
+    req_indices = torch.tensor([0, 1, 2, -1, 4, 5, 2], dtype=torch.int32)
+    watermarking = torch.tensor([True, False, True, True, True, True])
+    temperatures = torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 1.0])
+    # Plant a repeat of row 0's context early in its generated history.
+    context = all_token_ids[0, 40 - context_width : 40].clone()
+    plant_at = 8 if scope != "all" else 2
+    all_token_ids[0, plant_at : plant_at + context_width] = context
+    return dict(
+        all_token_ids=all_token_ids,
+        req_indices=req_indices,
+        prompt_lens=prompt_lens,
+        total_lens=total_lens,
+        context_width=context_width,
+        watermarking=watermarking,
+        temperatures=temperatures,
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="requires a CUDA-like accelerator"
+)
+@pytest.mark.parametrize("scope", ["none", "single_turn", "all"])
+@pytest.mark.parametrize("max_history", [None, 5, 8192])
+@pytest.mark.parametrize("seed", range(20))
+def test_watermark_prep_accelerator_parity(scope: str, max_history, seed: int):
+    fixture = _watermark_prep_fixture(seed, scope)
+    kwargs = dict(
+        max_history=max_history,
+        include_prompt=scope == "all",
+        scan=scope != "none",
+    )
+
+    expected_contexts, expected_skip = _watermark_prep_cpu(
+        fixture["all_token_ids"],
+        fixture["req_indices"],
+        fixture["prompt_lens"],
+        fixture["total_lens"],
+        fixture["context_width"],
+        fixture["watermarking"],
+        fixture["temperatures"],
+        max_history,
+        scope == "all",
+        scope != "none",
+    )
+    contexts, skip = watermark_prep(
+        fixture["all_token_ids"].cuda(),
+        fixture["req_indices"].cuda(),
+        fixture["prompt_lens"].cuda(),
+        fixture["total_lens"].cuda(),
+        fixture["context_width"],
+        watermarking=fixture["watermarking"].cuda(),
+        temperatures=fixture["temperatures"].cuda(),
+        **kwargs,
+    )
+
+    assert torch.equal(contexts.cpu(), expected_contexts)
+    assert torch.equal(skip.cpu(), expected_skip)
+
+
 @pytest.mark.skipif(
     not current_platform.is_cuda_alike(), reason="requires a CUDA-like accelerator"
 )
@@ -376,6 +463,124 @@ def test_repeated_context_mask_unaligned_max_history_accelerator_parity(
 
     assert torch.equal(reference, torch.tensor([expected]))
     assert torch.equal(actual, reference)
+
+
+@pytest.mark.parametrize("max_history", [512, 8192])
+@pytest.mark.parametrize("include_prompt", [False, True])
+def test_watermark_prep_many_rows_is_deterministic(max_history, include_prompt):
+    """128 sampled rows with planted repeats, launched repeatedly.
+
+    The fused kernel stores each row's context from one lane and reloads it
+    from every lane of the program; without a barrier between the two the skip
+    mask differs from launch to launch. Small fixtures do not open that window,
+    so this case runs many concurrent programs several times.
+    """
+    generator = torch.Generator().manual_seed(901)
+    num_reqs, num_rows, context_width, max_len = 64, 128, 4, 3000
+    all_token_ids = torch.randint(
+        0, 7, (num_reqs, max_len), dtype=torch.int32, generator=generator
+    )
+    prompt_lens = torch.randint(
+        0, 40, (num_reqs,), dtype=torch.int32, generator=generator
+    )
+    total_lens = prompt_lens + torch.randint(
+        context_width + 8, 2100, (num_reqs,), dtype=torch.int32, generator=generator
+    )
+    for req in range(num_reqs):
+        total = int(total_lens[req])
+        start = 0 if include_prompt else int(prompt_lens[req])
+        all_token_ids[req, start + 3 : start + 3 + context_width] = all_token_ids[
+            req, total - context_width : total
+        ].clone()
+    req_indices = torch.randint(
+        -1, num_reqs, (num_rows,), dtype=torch.int32, generator=generator
+    )
+    watermarking = torch.rand(num_reqs, generator=generator) > 0.2
+    temperatures = (torch.rand(num_reqs, generator=generator) > 0.2).float()
+
+    expected_contexts, expected_skip = _watermark_prep_cpu(
+        all_token_ids,
+        req_indices,
+        prompt_lens,
+        total_lens,
+        context_width,
+        watermarking,
+        temperatures,
+        max_history,
+        include_prompt,
+        True,
+    )
+    cuda_inputs = [
+        t.cuda() for t in (all_token_ids, req_indices, prompt_lens, total_lens)
+    ]
+    for _ in range(10):
+        contexts, skip = watermark_prep(
+            *cuda_inputs,
+            context_width,
+            watermarking=watermarking.cuda(),
+            temperatures=temperatures.cuda(),
+            max_history=max_history,
+            include_prompt=include_prompt,
+            scan=True,
+        )
+        assert torch.equal(contexts.cpu(), expected_contexts)
+        assert torch.equal(skip.cpu(), expected_skip)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="requires a CUDA-like accelerator"
+)
+@pytest.mark.parametrize("scope", ["single_turn", "all"])
+@pytest.mark.parametrize("max_history", [None, 5, 8192])
+def test_watermark_prep_matches_separate_context_and_mask_kernels(
+    scope: str, max_history
+):
+    """The fused kernel reproduces `_get_contexts` + `repeated_context_mask`."""
+    fixture = _watermark_prep_fixture(3, scope)
+    device_inputs = {
+        key: value.cuda() if torch.is_tensor(value) else value
+        for key, value in fixture.items()
+    }
+
+    sampler = object.__new__(GPUWatermarkSampler)
+    sampler.watermarker = SimpleNamespace(context_width=fixture["context_width"])
+    sampler.deduplicate_contexts = scope
+    sampler.deduplicate_contexts_max_history = max_history
+    sampler.req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=device_inputs["all_token_ids"]),
+        prompt_len=SimpleNamespace(gpu=device_inputs["prompt_lens"]),
+        total_len=SimpleNamespace(gpu=device_inputs["total_lens"]),
+    )
+    sampler.watermarking = SimpleNamespace(gpu=device_inputs["watermarking"])
+    sampler.sampling_states = SimpleNamespace(
+        temperature=SimpleNamespace(gpu=device_inputs["temperatures"])
+    )
+    req_indices = device_inputs["req_indices"]
+
+    # The head formula: contexts from `_get_contexts`, repeats from the mask
+    # kernel, skip = not (enabled and temperature != 0 and not repeated).
+    reference_contexts = sampler._get_contexts(req_indices)
+    repeated = repeated_context_mask(
+        device_inputs["all_token_ids"],
+        req_indices,
+        device_inputs["prompt_lens"],
+        device_inputs["total_lens"],
+        reference_contexts,
+        max_history,
+        include_prompt=scope == "all",
+    )
+    safe = req_indices.to(torch.int64).clamp_min(0)
+    watermarking = (
+        device_inputs["watermarking"][safe]
+        & (device_inputs["temperatures"][safe] != 0)
+        & ~repeated
+    )
+    reference_skip = ~(watermarking & (req_indices.to(torch.int64) >= 0))
+
+    contexts, skip = sampler._prepare_watermark_inputs(req_indices)
+
+    assert torch.equal(contexts, reference_contexts)
+    assert torch.equal(skip, reference_skip)
 
 
 def _repeated_context_inputs(

@@ -13,7 +13,7 @@ from vllm.v1.watermarking.watermarker import RandomSamplingState, Watermarker
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.sampler import Sampler
-from vllm.v1.worker.gpu.sample.watermark import repeated_context_mask
+from vllm.v1.worker.gpu.sample.watermark import watermark_prep
 
 logger = init_logger(__name__)
 
@@ -78,12 +78,7 @@ class GPUWatermarkSampler(Sampler):
             )
 
         processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
-        contexts = self._get_contexts(expanded_idx_mapping)
-        repeated_contexts = None
-        if self.deduplicate_contexts != "none":
-            repeated_contexts = self._get_repeated_contexts(
-                expanded_idx_mapping, contexts
-            )
+        contexts, skip_mask = self._prepare_watermark_inputs(expanded_idx_mapping)
 
         def random_sample(sample_logits: torch.Tensor) -> torch.Tensor:
             return gumbel_sample(
@@ -97,24 +92,14 @@ class GPUWatermarkSampler(Sampler):
                 use_fp64=self.use_fp64_gumbel,
             )
 
-        temperatures = self.sampling_states.temperature.gpu[expanded_idx_mapping]
-        needs_mixed_sampling = repeated_contexts is not None or not np.all(enabled)
-        skip_mask = None
-        sampling_state = None
-        if needs_mixed_sampling:
-            watermarking = self.watermarking.gpu[expanded_idx_mapping] & (
-                temperatures != 0
-            )
-            if repeated_contexts is not None:
-                watermarking &= ~repeated_contexts
-            skip_mask = ~watermarking
-            sampling_state = RandomSamplingState(
-                expanded_idx_mapping=expanded_idx_mapping,
-                temperatures=self.sampling_states.temperature.gpu,
-                seeds=self.sampling_states.seeds.gpu,
-                positions=pos,
-                use_fp64=self.use_fp64_gumbel,
-            )
+        # Temperature-0 rows are in `skip_mask`; ordinary sampling is argmax there.
+        sampling_state = RandomSamplingState(
+            expanded_idx_mapping=expanded_idx_mapping,
+            temperatures=self.sampling_states.temperature.gpu,
+            seeds=self.sampling_states.seeds.gpu,
+            positions=pos,
+            use_fp64=self.use_fp64_gumbel,
+        )
         output = self.watermarker.sample(
             processed_logits,
             contexts,
@@ -122,51 +107,32 @@ class GPUWatermarkSampler(Sampler):
             skip_mask=skip_mask,
             sampling_state=sampling_state,
         )
-        sampled = output.token_ids
-        output_logits = output.logits
-        sampled = torch.where(
-            temperatures == 0,
-            processed_logits.argmax(dim=-1),
-            sampled,
-        )
-        return sampled, output_logits
+        return output.token_ids, output.logits
 
-    def _get_repeated_contexts(
-        self,
-        expanded_idx_mapping: torch.Tensor,
-        contexts: torch.Tensor,
-    ) -> torch.Tensor:
-        return repeated_context_mask(
+    def _prepare_watermark_inputs(
+        self, expanded_idx_mapping: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Contexts and skip mask for the batch, in one launch."""
+        return watermark_prep(
             self.req_states.all_token_ids.gpu,
             expanded_idx_mapping,
             self.req_states.prompt_len.gpu,
             self.req_states.total_len.gpu,
-            contexts,
-            self.deduplicate_contexts_max_history,
+            self.watermarker.context_width,
+            watermarking=self.watermarking.gpu,
+            temperatures=self.sampling_states.temperature.gpu,
+            max_history=self.deduplicate_contexts_max_history,
             include_prompt=self.deduplicate_contexts == "all",
+            scan=self.deduplicate_contexts != "none",
         )
 
     def _get_contexts(self, expanded_idx_mapping: torch.Tensor) -> torch.Tensor:
-        context_width = self.watermarker.context_width
-        req_indices = expanded_idx_mapping.to(torch.int64)
-        valid_reqs = req_indices >= 0
-        safe_req_indices = req_indices.clamp_min(0)
-        total_lens = self.req_states.total_len.gpu[safe_req_indices].to(torch.int64)
-        prompt_lens = self.req_states.prompt_len.gpu[safe_req_indices].to(torch.int64)
-        history_starts = (
-            torch.zeros_like(prompt_lens)
-            if self.deduplicate_contexts == "all"
-            else prompt_lens
+        contexts, _ = watermark_prep(
+            self.req_states.all_token_ids.gpu,
+            expanded_idx_mapping,
+            self.req_states.prompt_len.gpu,
+            self.req_states.total_len.gpu,
+            self.watermarker.context_width,
+            include_prompt=self.deduplicate_contexts == "all",
         )
-        offsets = torch.arange(
-            -context_width, 0, dtype=torch.int64, device=req_indices.device
-        )
-        positions = total_lens.unsqueeze(-1) + offsets
-        valid_positions = valid_reqs.unsqueeze(-1) & (
-            positions >= history_starts.unsqueeze(-1)
-        )
-        positions = positions.clamp_min(0)
-        contexts = self.req_states.all_token_ids.gpu[
-            safe_req_indices.unsqueeze(-1), positions
-        ]
-        return torch.where(valid_positions, contexts, -1)
+        return contexts

@@ -95,6 +95,203 @@ def _repeated_context_mask_kernel(
     tl.store(output_ptr + row, repeated)
 
 
+@triton.jit
+def _watermark_prep_kernel(
+    contexts_ptr,
+    context_stride,
+    skip_mask_ptr,
+    all_token_ids_ptr,
+    all_token_ids_stride,
+    req_indices_ptr,
+    prompt_lens_ptr,
+    total_lens_ptr,
+    watermarking_ptr,
+    temperatures_ptr,
+    CONTEXT_WIDTH: tl.constexpr,
+    MAX_HISTORY: tl.constexpr,
+    INCLUDE_PROMPT: tl.constexpr,
+    SCAN: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One program per sampled row: write its context and whether to skip it.
+
+    Fuses the context gather, the repeated-context scan and the skip-mask
+    reduction so the sampler issues one launch instead of ~25 per step.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    req_idx = tl.load(req_indices_ptr + row).to(tl.int64)
+    valid_req = req_idx >= 0
+    safe_req_idx = tl.maximum(req_idx, 0)
+    prompt_len = tl.load(prompt_lens_ptr + safe_req_idx, mask=valid_req, other=0)
+    total_len = tl.load(total_lens_ptr + safe_req_idx, mask=valid_req, other=0)
+    sequence_start = 0 if INCLUDE_PROMPT else prompt_len
+    history_len = total_len - sequence_start
+
+    watermarked = valid_req
+    if watermarking_ptr is not None:
+        enabled = tl.load(watermarking_ptr + safe_req_idx, mask=valid_req, other=0)
+        temperature = tl.load(
+            temperatures_ptr + safe_req_idx, mask=valid_req, other=0.0
+        )
+        watermarked = valid_req & (enabled != 0) & (temperature != 0.0)
+
+    # Positions before `sequence_start` and unused rows read as -1.
+    row_base = all_token_ids_ptr + safe_req_idx * all_token_ids_stride
+    # The scan reloads the context from `context_row`; the barrier below orders
+    # the single-lane stores before the all-lane loads.
+    context_row = contexts_ptr + row * context_stride
+    for offset in tl.static_range(CONTEXT_WIDTH):
+        position = total_len - CONTEXT_WIDTH + offset
+        context_token = tl.load(
+            row_base + tl.maximum(position, 0),
+            mask=valid_req & (position >= sequence_start),
+            other=-1,
+        )
+        tl.store(context_row + offset, context_token)
+    tl.debug_barrier()
+
+    repeated = tl.full((), 0, tl.int32)
+    if SCAN:
+        offsets = tl.arange(0, BLOCK)
+        # No scan for unwatermarked rows or histories shorter than the context.
+        do_scan = watermarked & (history_len >= CONTEXT_WIDTH)
+        scan_end = tl.where(do_scan, history_len, 0)
+        scan_start = 0
+        if MAX_HISTORY > 0:
+            scan_start = tl.maximum(scan_end - MAX_HISTORY, 0)
+        aligned_start = (scan_start // BLOCK) * BLOCK
+        for block_start in tl.range(aligned_start, scan_end, BLOCK):
+            previous_pos = block_start + offsets
+            in_window = (previous_pos >= scan_start) & (previous_pos < scan_end)
+            matches = in_window
+            for offset in tl.static_range(CONTEXT_WIDTH):
+                context_token = tl.load(context_row + offset)
+                historical_pos = previous_pos + offset - CONTEXT_WIDTH
+                historical_token = tl.load(
+                    row_base + sequence_start + tl.maximum(historical_pos, 0),
+                    mask=in_window & (historical_pos >= 0),
+                    other=-1,
+                )
+                matches &= historical_token == context_token
+            repeated |= tl.max(matches.to(tl.int32), axis=0)
+
+    if skip_mask_ptr is not None:
+        skip = tl.where(watermarked, repeated, 1)
+        tl.store(skip_mask_ptr + row, skip != 0)
+
+
+def _watermark_prep_cpu(
+    all_token_ids: torch.Tensor,
+    req_indices: torch.Tensor,
+    prompt_lens: torch.Tensor,
+    total_lens: torch.Tensor,
+    context_width: int,
+    watermarking: torch.Tensor | None,
+    temperatures: torch.Tensor | None,
+    max_history: int | None,
+    include_prompt: bool,
+    scan: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference for `watermark_prep`, and the path taken on CPU."""
+    device = all_token_ids.device
+    req_indices_64 = req_indices.to(torch.int64)
+    valid_reqs = req_indices_64 >= 0
+    safe_req_indices = req_indices_64.clamp_min(0)
+    total = total_lens[safe_req_indices].to(torch.int64)
+    prompt = prompt_lens[safe_req_indices].to(torch.int64)
+    sequence_starts = torch.zeros_like(prompt) if include_prompt else prompt
+    offsets = torch.arange(-context_width, 0, dtype=torch.int64, device=device)
+    positions = total.unsqueeze(-1) + offsets
+    valid_positions = valid_reqs.unsqueeze(-1) & (
+        positions >= sequence_starts.unsqueeze(-1)
+    )
+    contexts = all_token_ids[safe_req_indices.unsqueeze(-1), positions.clamp_min(0)]
+    contexts = torch.where(valid_positions, contexts, -1)
+
+    if watermarking is None:
+        watermarked = valid_reqs.clone()
+    else:
+        assert temperatures is not None
+        watermarked = (
+            valid_reqs
+            & watermarking[safe_req_indices]
+            & (temperatures[safe_req_indices] != 0)
+        )
+    if scan:
+        repeated = _repeated_context_mask_cpu(
+            all_token_ids,
+            req_indices,
+            prompt_lens,
+            total_lens,
+            contexts,
+            max_history,
+            include_prompt,
+        ).to(device)
+        watermarked = watermarked & ~repeated
+    return contexts, ~watermarked
+
+
+def watermark_prep(
+    all_token_ids: torch.Tensor,
+    req_indices: torch.Tensor,
+    prompt_lens: torch.Tensor,
+    total_lens: torch.Tensor,
+    context_width: int,
+    *,
+    watermarking: torch.Tensor | None = None,
+    temperatures: torch.Tensor | None = None,
+    max_history: int | None = None,
+    include_prompt: bool = False,
+    scan: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return `(contexts, skip_mask)` for the rows in `req_indices`.
+
+    `contexts` holds the last `context_width` tokens of each row, -1 padded
+    before the scope start. `skip_mask` marks rows sampled without the
+    watermark: unused, opted out, temperature 0, or (with `scan`) repeated
+    context. With `watermarking=None` only contexts are computed.
+    """
+    num_rows = len(req_indices)
+    if all_token_ids.device.type == "cpu":
+        return _watermark_prep_cpu(
+            all_token_ids,
+            req_indices,
+            prompt_lens,
+            total_lens,
+            context_width,
+            watermarking,
+            temperatures,
+            max_history,
+            include_prompt,
+            scan,
+        )
+
+    contexts = torch.empty(
+        (num_rows, context_width),
+        dtype=all_token_ids.dtype,
+        device=all_token_ids.device,
+    )
+    skip_mask = torch.empty(num_rows, dtype=torch.bool, device=all_token_ids.device)
+    _watermark_prep_kernel[(num_rows,)](
+        contexts,
+        contexts.stride(0),
+        skip_mask,
+        all_token_ids,
+        all_token_ids.stride(0),
+        req_indices,
+        prompt_lens,
+        total_lens,
+        watermarking,
+        temperatures,
+        CONTEXT_WIDTH=context_width,
+        MAX_HISTORY=0 if max_history is None else max_history,
+        INCLUDE_PROMPT=include_prompt,
+        SCAN=scan,
+        BLOCK=512,
+    )
+    return contexts, skip_mask
+
+
 def _repeated_context_mask_cpu(
     all_token_ids: torch.Tensor,
     req_indices: torch.Tensor,
