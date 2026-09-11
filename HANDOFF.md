@@ -30,8 +30,8 @@ git fetch git@github.com:simon-veitner-redhat/vllm.git 'refs/heads/patches/*:ref
 | `patches/dual-key-routing-cache` | `4b5c170666` | removes a per-step host stall, TPOT 4.32 ms to 2.63 ms |
 | `patches/config-reject-gumbel-specdec` | `1df37d0614` | rejects an unsupported config at validation instead of in the worker |
 | `patches/docs-dual-key` | `98f34ffcb0` | documents the dual-key detector, new fields and limits |
-| `patch/minor` | `3673087e0c` | three lint and warning fixes found by the validation pass, one commit on `1db8717152` |
-| `patch/warmup` | `4525c5c07d` | warms the watermark sampler kernel for every specialization the engine launches; fixes a base-feature gap; optional for the merge |
+| `patches/minor` | `3673087e0c` | three lint and warning fixes found by the validation pass, one commit on `1db8717152` |
+| `patches/warmup` | `4525c5c07d` | warms the watermark sampler kernel for every specialization the engine launches; fixes a base-feature gap; optional for the merge |
 | `patches/all` | `1db8717152` + this file | the four fixes cherry-picked onto the base, in that order, verified together; commits after `1db8717152` only add this document |
 
 ### How to pull them in
@@ -177,7 +177,7 @@ draft, recovery or bonus tokens. Files: the docs page and
 Verified. The Python snippets and the example compile, `--help` lists `--algorithm`, markdownlint
 reports no issues, ruff clean.
 
-### 5. `patch/minor`, commit `3673087e0c`
+### 5. `patches/minor`, commit `3673087e0c`
 
 Issue. Validation of `patches/all` found three small defects. `DraftWatermarker.sample` passed a
 lambda where the new template method types `RandomSampler | None`, so mypy and the pre-commit
@@ -201,7 +201,7 @@ Not in this branch: the first watermarked request at temperature 1.0 still JIT-c
 path. That is in the base feature (PR #54053), harmless under the default JIT monitor mode and
 fatal under `--jit-monitor-mode=error`; it is left for a separate follow-up.
 
-### 6. `patch/warmup`, commit `4525c5c07d`
+### 6. `patches/warmup`, commit `4525c5c07d`
 
 Issue. The first watermarked request at temperature 1.0 JIT-compiles `_philox_gumbel_kernel`
 during inference, once per engine, and kills the engine under `--jit-monitor-mode=error`. The
