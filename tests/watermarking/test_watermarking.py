@@ -62,6 +62,7 @@ def test_watermarker_contract(algorithm: str):
     assert torch.equal(first.token_ids, second.token_ids)
 
 
+@pytest.mark.parametrize("algorithm", ["gumbel", "dual_key_gumbel"])
 @pytest.mark.parametrize(
     "config_overrides",
     [
@@ -70,7 +71,7 @@ def test_watermarker_contract(algorithm: str):
     ],
 )
 def test_gumbel_config_warns_when_context_deduplication_is_weak(
-    monkeypatch, config_overrides
+    monkeypatch, algorithm, config_overrides
 ):
     messages: list[str] = []
     monkeypatch.setattr(
@@ -78,14 +79,14 @@ def test_gumbel_config_warns_when_context_deduplication_is_weak(
         lambda message, *, scope: messages.append(message),
     )
 
-    WatermarkConfig(key=42)
-    WatermarkConfig(key=42, deduplicate_contexts_max_history=1024)
-    WatermarkConfig(key=42, deduplicate_contexts_max_history=None)
-    WatermarkConfig(key=42, **config_overrides)
+    WatermarkConfig(key=42, algorithm=algorithm)
+    WatermarkConfig(key=42, algorithm=algorithm, deduplicate_contexts_max_history=1024)
+    WatermarkConfig(key=42, algorithm=algorithm, deduplicate_contexts_max_history=None)
+    WatermarkConfig(key=42, algorithm=algorithm, **config_overrides)
 
     assert messages == [
         (
-            "Single-key Gumbel-max watermarking with context deduplication disabled "
+            "Gumbel-max watermarking with context deduplication disabled "
             "or limited to fewer than 1024 positions may increase the frequency of "
             "degenerate generations, including repetition loops. Use "
             "deduplicate_contexts='single_turn' or 'all' with "
@@ -945,7 +946,8 @@ def test_draft_sampler_uses_draft_key_and_advances_context(monkeypatch):
 
     class StubWatermarker:
         @staticmethod
-        def sample(logits, contexts, random_sample):
+        def sample(logits, contexts, random_sampler=None):
+            assert random_sampler is None
             return WatermarkSample(torch.tensor([7, 7]), logits)
 
     speculator = object.__new__(StubSpeculator)
