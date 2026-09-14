@@ -267,16 +267,23 @@ def test_sampling_params_can_disable_watermarking():
     assert not SamplingParams.from_optional(watermarking=False).watermarking
 
 
-def test_gpu_sampler_rejects_watermarking_for_greedy(monkeypatch):
+def test_gpu_sampler_warns_but_accepts_watermarking_for_greedy(monkeypatch):
+    messages: list[str] = []
     sampler = object.__new__(GPUWatermarkSampler)
-    sampler.watermarking = SimpleNamespace(np=np.ones(1, dtype=bool))
+    sampler.watermarking = SimpleNamespace(np=np.ones(3, dtype=bool))
     monkeypatch.setattr(Sampler, "add_request", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "vllm.v1.watermarking.gpu_sampler.logger.warning_once",
+        lambda message: messages.append(message),
+    )
 
-    with pytest.raises(ValueError, match="Greedy decoding cannot be used"):
-        sampler.add_request(0, 1, SamplingParams(temperature=0))
+    sampler.add_request(0, 1, SamplingParams(temperature=0))
+    sampler.add_request(1, 1, SamplingParams(temperature=1))
+    sampler.add_request(2, 1, SamplingParams(temperature=0, watermarking=False))
 
-    sampler.add_request(0, 1, SamplingParams(temperature=1))
-    sampler.add_request(0, 1, SamplingParams(temperature=0, watermarking=False))
+    assert list(sampler.watermarking.np) == [True, True, False]
+    assert len(messages) == 1
+    assert "greedy decoding" in messages[0]
 
 
 def test_gpu_sampler_respects_mixed_request_watermarking(monkeypatch):
