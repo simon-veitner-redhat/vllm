@@ -2510,3 +2510,11 @@ class TestCreateErrorResponse:
         assert err.error.message == "oops"
         assert err.error.code == 400
         assert err.error.type == "bad_request"
+
+
+def test_watermarking_defaults_to_enabled():
+    assert _convert(_make_request()).watermarking
+
+
+def test_watermarking_opt_out_is_forwarded():
+    assert not _convert(_make_request(watermarking=False)).watermarking
