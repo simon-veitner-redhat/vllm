@@ -228,6 +228,7 @@ class SpeechToTextBaseServing(GenerateBaseServing):
         sampling_params = SamplingParams(
             max_tokens=1,
             temperature=0.0,
+            watermarking=False,
             allowed_token_ids=allowed_token_ids,
         )
 

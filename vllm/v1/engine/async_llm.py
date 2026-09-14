@@ -864,6 +864,7 @@ class AsyncLLM(EngineClient):
             mm_features=None,
             sampling_params=SamplingParams(
                 max_tokens=1,
+                watermarking=False,
                 extra_args={"kv_transfer_params": dict(kv_transfer_params)},
             ),
             pooling_params=None,
