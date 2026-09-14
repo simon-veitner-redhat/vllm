@@ -7,7 +7,11 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
+from vllm import SamplingParams
+from vllm.entrypoints.generate.beam_search.offline import BeamSearchOfflineMixin
+from vllm.entrypoints.generate.beam_search.utils import BeamSearchSequence
 from vllm.entrypoints.generate.generative_scoring.serving import (
     GenerativeScoringRequest,
     ServingGenerativeScoring,
@@ -161,3 +165,55 @@ def test_mixed_prefill_decode_warmup_disables_watermarking(monkeypatch):
 
     assert captured is not None
     assert not captured.watermarking
+
+
+def test_beam_search_structured_output_params_inherit_watermarking():
+    vocab_size = 8
+    allowed_ids = [2, 5]
+    bitmask = torch.zeros(1, (vocab_size + 31) // 32, dtype=torch.int32)
+    for token_id in allowed_ids:
+        bitmask[0, token_id >> 5] |= 1 << (token_id & 31)
+
+    class Grammar:
+        def accept_tokens(self, request_id, tokens):
+            return True
+
+        def is_terminated(self):
+            return False
+
+        def fill_bitmask(self, target, index):
+            target[index] = bitmask[0]
+
+    backend = SimpleNamespace(compile_grammar=lambda request_type, spec: Grammar())
+    base_params = SamplingParams(
+        logprobs=4,
+        max_tokens=1,
+        temperature=0.0,
+        watermarking=False,
+        detokenize=False,
+        skip_clone=True,
+    )
+    beam = BeamSearchSequence(
+        orig_prompt={"type": "token", "prompt_token_ids": [1, 2]},
+        tokens=[1, 2],
+        logprobs=[],
+    )
+
+    mixin = object.__new__(BeamSearchOfflineMixin)
+    mixin.model_config = SimpleNamespace(get_vocab_size=lambda: vocab_size)
+
+    entries = mixin._build_beam_sampling_params(
+        [beam],
+        base_params,
+        backend,
+        ("guidance", "spec"),
+        bitmask.clone(),
+    )
+
+    assert len(entries) == 1
+    beam_params, entry_allowed_ids = entries[0]
+    assert entry_allowed_ids == allowed_ids
+    assert beam_params.allowed_token_ids == allowed_ids
+    assert not beam_params.watermarking
+    assert beam_params.logprobs == base_params.logprobs
+    assert base_params.allowed_token_ids is None

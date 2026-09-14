@@ -446,17 +446,10 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
             # grammar still allows more tokens than the cap (e.g. inside
             # free-form strings), skip the engine-side constraint and rely
             # on the logprobs filtering in _beam_search_step instead.
-            beam_params = SamplingParams(
-                logprobs=base_params.logprobs,
-                max_tokens=1,
-                temperature=base_params.temperature,
-                detokenize=False,
-                allowed_token_ids=(
-                    allowed_ids
-                    if len(allowed_ids) <= _MAX_NUM_ALLOWED_TOKEN_IDS
-                    else None
-                ),
-                skip_clone=True,
+            # Rebind rather than mutate: clone() is shallow here.
+            beam_params = base_params.clone()
+            beam_params.allowed_token_ids = (
+                allowed_ids if len(allowed_ids) <= _MAX_NUM_ALLOWED_TOKEN_IDS else None
             )
             result.append((beam_params, allowed_ids))
 
