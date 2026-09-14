@@ -92,16 +92,30 @@ def test_beam_request_disables_watermarking(api_request):
 
 
 @pytest.mark.parametrize("request_cls", [TranscriptionRequest, TranslationRequest])
-def test_speech_request_disables_watermarking(request_cls):
+def test_speech_request_disables_watermarking_by_default(request_cls):
+    request = request_cls(file=UploadFile(file=BytesIO(), filename="audio.wav"))
+
+    sampling_params = request.to_sampling_params(default_max_tokens=1)
+    beam_params = request.to_beam_search_params(default_max_tokens=1)
+
+    assert not request.watermarking
+    assert not sampling_params.watermarking
+    assert not beam_params.watermarking
+
+
+@pytest.mark.parametrize("request_cls", [TranscriptionRequest, TranslationRequest])
+def test_speech_request_can_enable_watermarking(request_cls):
     request = request_cls(
-        file=UploadFile(file=BytesIO(), filename="audio.wav"), watermarking=False
+        file=UploadFile(file=BytesIO(), filename="audio.wav"),
+        temperature=0.8,
+        watermarking=True,
     )
 
     sampling_params = request.to_sampling_params(default_max_tokens=1)
     beam_params = request.to_beam_search_params(default_max_tokens=1)
 
-    assert not sampling_params.watermarking
-    assert not beam_params.watermarking
+    assert sampling_params.watermarking
+    assert beam_params.watermarking
 
 
 def test_chat_request_preserves_watermarking_with_structured_outputs():

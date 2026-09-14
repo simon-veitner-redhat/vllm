@@ -151,7 +151,7 @@ class TranscriptionRequest(OpenAIBaseModel):
     to automatically increase the temperature until certain thresholds are hit.
     """
 
-    watermarking: bool = True
+    watermarking: bool = False
     """Whether to apply the engine's configured watermark to this request."""
 
     top_p: float | None = None
