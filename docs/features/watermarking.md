@@ -19,7 +19,9 @@ vllm serve MODEL \
 
 Watermarking is disabled when `--watermark-config` is omitted. Gumbel-max (see
 `gumbel`) is the default algorithm within an enabled `WatermarkConfig`. When
-watermarking is configured, it is enabled for requests by default.
+watermarking is configured, it is enabled for requests by default, except on
+transcription and translation, which default it to false (see
+[Compatibility](#compatibility)).
 
 Requests can opt out without changing the engine-level algorithm or key:
 
@@ -33,6 +35,12 @@ The OpenAI-compatible APIs accept the same `watermarking: false` request field.
 Deployments that require watermarking must restrict this field to trusted
 callers, or strip and validate it at the ingress boundary, so untrusted clients
 cannot opt out.
+
+Stripping the field is not enough for `/v1/audio/transcriptions` and
+`/v1/audio/translations`, including their batch forms, because their default is
+false. An ingress that requires a watermark on those endpoints must set
+`watermarking: true` explicitly. The engine has no setting that forces the
+request-level default back on.
 
 `context_width` controls how many prior tokens seed each watermark decision
 and defaults to 4. Larger values make the watermark less robust to
@@ -79,11 +87,15 @@ watermark context, which is read from the request's generated token history.
 Accelerator smoke tests cover real prefix-cache hits with chunked prefill and
 watermarked generation under tensor, pipeline, and data parallelism.
 
-Chat Completions, Completions, Responses, batch Chat Completions, transcription,
-and translation expose the `watermarking` request switch. Realtime
+Chat Completions, Completions, Responses, Anthropic Messages, Cohere Chat, batch
+Chat Completions, transcription, and translation expose the `watermarking`
+request switch. Transcription and translation default it to false, because their
+output reproduces recorded speech rather than generating new text. Realtime
 transcription always uses ordinary greedy sampling and therefore disables
-watermarking internally. Pooling and embedding requests do not sample tokens
-and are unaffected.
+watermarking internally. The sampling calls vLLM issues for itself, such as
+language detection and beam search, are not watermarked; the sampler warmup at
+startup is the one exception, so the watermark kernels are compiled before
+serving. Pooling and embedding requests do not sample tokens and are unaffected.
 
 ## Speculative decoding
 
@@ -277,6 +289,8 @@ watermarked output or to modify watermarked text so it is no longer detected.
 - Not all watermarking algorithms have native speculative-decoding support.
 - Beam search expands candidates from model log probabilities and requires
   `watermarking=false` when the engine has watermarking configured.
+- A greedy request that still reaches the worker with watermarking enabled is
+  sampled greedily and logs a warning rather than failing the engine.
 - Models that replace the vLLM sampler with a custom sampler cannot use
   configured watermarking.
 - Global custom logits processors are unavailable because Model Runner V2 does
