@@ -221,6 +221,25 @@ Watermarked generation currently supports the `philox` PRF:
   resistance. vLLM versions its input mapping and provides compatibility
   vectors so generation and detection remain interoperable.
 
+## Reporting
+
+A request that asks for watermarking can still run without one, so an engine
+started with a watermark config reports what it decided for each request. An
+engine started without one reports nothing, and the fields below stay `None`.
+
+Every generation `CompletionOutput` carries `watermarked`: `True` if the engine
+applied its watermark, `False` if the request ran unwatermarked, and `None` for
+pooling outputs, beam search, and engines with no watermark config.
+
+The OpenAI-compatible chat and completions responses carry the same value as
+`metrics.watermarked` on the response, and on the final usage chunk when
+streaming with `stream_options.include_usage`. Unlike the timing fields in that
+block, it is present whether or not `--enable-per-request-metrics` is set.
+
+Prometheus exposes `vllm:request_watermarked_total`, a count of finished
+generation requests labelled `watermarked="true"` or `watermarked="false"`. Both
+series stay at zero on an engine with no watermark config.
+
 ## Detection
 
 The detector primitives operate on token IDs and do not require model weights:

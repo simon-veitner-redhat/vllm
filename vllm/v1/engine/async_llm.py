@@ -159,6 +159,7 @@ class AsyncLLM(EngineClient):
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
             admission_stats=self.admission_stats,
+            watermarking_enabled=self.vllm_config.watermark_config is not None,
         )
 
         # EngineCore (starts the engine in background process).

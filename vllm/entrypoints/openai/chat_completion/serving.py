@@ -27,6 +27,7 @@ from vllm.entrypoints.generate.base.serving import (
     GenerateBaseServing,
     build_per_request_timing_metrics,
     build_spec_decoding_metrics,
+    build_watermarked_metric,
     clamp_prompt_logprobs,
     format_token_id_placeholder,
 )
@@ -854,6 +855,13 @@ class OpenAIServingChat(GenerateBaseServing):
                             stream_per_request_metrics = PerRequestMetrics()
                         stream_per_request_metrics.speculative_decoding = spec_stats
 
+                # Per-request, so not suppressed for n>1; see build_watermarked_metric.
+                watermarked = build_watermarked_metric(last_res)
+                if watermarked is not None:
+                    if stream_per_request_metrics is None:
+                        stream_per_request_metrics = PerRequestMetrics()
+                    stream_per_request_metrics.watermarked = watermarked
+
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
                     object=chunk_object_type,
@@ -1156,6 +1164,13 @@ class OpenAIServingChat(GenerateBaseServing):
                 if per_request_metrics is None:
                     per_request_metrics = PerRequestMetrics()
                 per_request_metrics.speculative_decoding = spec_stats
+
+        # Per-request, so not suppressed for n>1; see build_watermarked_metric.
+        watermarked = build_watermarked_metric(final_res)
+        if watermarked is not None:
+            if per_request_metrics is None:
+                per_request_metrics = PerRequestMetrics()
+            per_request_metrics.watermarked = watermarked
 
         # ``final_res.prompt`` is the rendered chat-templated prompt text
         prompt_text = final_res.prompt if request.return_prompt_text else None

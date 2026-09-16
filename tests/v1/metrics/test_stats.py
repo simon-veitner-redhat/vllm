@@ -288,3 +288,23 @@ def test_prompt_token_stats_full_external_transfer_recompute():
     assert stats.external_kv_transfer == 999
     assert stats.cached_tokens == 999
     assert stats.total == 1000
+
+
+def test_finished_request_stats_record_watermarked():
+    req_stats = RequestStateStats(arrival_time=0.0)
+    req_stats.scheduled_ts = 0.1
+    req_stats.first_token_ts = 0.5
+    req_stats.last_token_ts = 2.0
+    req_stats.num_generation_tokens = 10
+
+    for watermarked in (True, False, None):
+        iteration_stats = IterationStats()
+        iteration_stats.update_from_finished_request(
+            finish_reason=FinishReason.STOP,
+            request_id="test-req",
+            num_prompt_tokens=100,
+            max_tokens_param=10,
+            req_stats=req_stats,
+            watermarked=watermarked,
+        )
+        assert iteration_stats.finished_requests[0].watermarked is watermarked

@@ -34,6 +34,19 @@ def watermarked_llm(vllm_runner) -> Generator[LLM, None, None]:
         yield runner.llm
 
 
+@pytest.fixture(scope="module")
+def plain_llm(vllm_runner) -> Generator[LLM, None, None]:
+    with vllm_runner(
+        MODEL,
+        dtype="half",
+        enforce_eager=True,
+        max_model_len=128,
+        max_num_seqs=4,
+        gpu_memory_utilization=0.05,  # shares the GPU with watermarked_llm
+    ) as runner:
+        yield runner.llm
+
+
 def test_watermark_with_combined_sampling_controls(watermarked_llm: LLM):
     params = SamplingParams(
         temperature=0.8,
@@ -148,3 +161,25 @@ def test_mixed_watermarked_batch(watermarked_llm: LLM):
 
     assert batched[0].outputs[0].token_ids == marked_alone.outputs[0].token_ids
     assert batched[1].outputs[0].token_ids == ordinary_alone.outputs[0].token_ids
+
+
+def test_completion_output_reports_watermarked(watermarked_llm: LLM):
+    prompt = "Reporting smoke test"
+    sampled = SamplingParams(temperature=0.8, max_tokens=4)
+    greedy = SamplingParams(temperature=0, max_tokens=4)
+    opted_out = SamplingParams(temperature=0.8, watermarking=False, max_tokens=4)
+
+    assert watermarked_llm.generate(prompt, sampled)[0].outputs[0].watermarked is True
+    # Greedy decoding cannot be watermarked, so admission resolves it to False.
+    assert watermarked_llm.generate(prompt, greedy)[0].outputs[0].watermarked is False
+    assert (
+        watermarked_llm.generate(prompt, opted_out)[0].outputs[0].watermarked is False
+    )
+
+
+def test_completion_output_reports_nothing_without_watermark_config(plain_llm: LLM):
+    params = SamplingParams(temperature=0.8, max_tokens=4)
+
+    output = plain_llm.generate("Reporting smoke test", params)[0]
+
+    assert output.outputs[0].watermarked is None

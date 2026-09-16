@@ -53,6 +53,9 @@ class CompletionOutput:
             ``--per-request-spec-decode-metrics`` is enabled; None otherwise.
             Surfaced in the response as ``metrics.speculative_decoding`` for
             single-sequence (``n == 1``) requests.
+        watermarked: Whether the engine's watermark was applied, resolved once
+            per request at admission. None for pooling outputs, beam search,
+            and engines with no watermark config.
     """
 
     index: int
@@ -66,6 +69,7 @@ class CompletionOutput:
     lora_request: LoRARequest | None = None
     sampling_mask: SamplingMask | None = None
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
+    watermarked: bool | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None

@@ -22,12 +22,15 @@ from vllm._aiter_ops import is_aiter_found_and_supported
 from vllm.config import MultiModalConfig
 from vllm.entrypoints.generate.base.protocol import (
     DeltaMessage,
+    PerRequestMetrics,
     RequestResponseMetadata,
 )
 from vllm.entrypoints.generate.base.serving import build_per_request_timing_metrics
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatMessage,
 )
 from vllm.entrypoints.openai.chat_completion.serving import (
     OpenAIServingChat,
@@ -41,7 +44,7 @@ from vllm.entrypoints.openai.models.serving import (
     OpenAIServingModels,
 )
 from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
-from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse, UsageInfo
 from vllm.exceptions import QueueOverflowError, VLLMValidationError
 from vllm.inputs import TokensPrompt
 from vllm.multimodal.inputs import PlaceholderRange
@@ -644,6 +647,7 @@ def _build_minimal_metrics_serving_chat(
 def _make_metrics_request_output(
     metrics: RequestStateStats | None = _PER_REQUEST_STATS,
     token_ids: tuple[int, ...] = (100, 101),
+    watermarked: bool | None = None,
 ) -> RequestOutput:
     return RequestOutput(
         request_id="test-id",
@@ -658,6 +662,7 @@ def _make_metrics_request_output(
                 cumulative_logprob=None,
                 logprobs=None,
                 finish_reason="stop",
+                watermarked=watermarked,
             )
         ],
         finished=True,
@@ -681,11 +686,12 @@ async def _stream_request_outputs(
 async def _collect_metrics_stream_chunks(
     serving: OpenAIServingChat,
     request: ChatCompletionRequest,
+    request_output: RequestOutput | None = None,
 ) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
     async for line in serving.chat_completion_stream_generator(
         request,
-        _single_request_output(_make_metrics_request_output()),
+        _single_request_output(request_output or _make_metrics_request_output()),
         "chatcmpl-test-id",
         "test-model",
         conversation=[{"role": "user", "content": "Test"}],
@@ -793,6 +799,91 @@ async def test_chat_streaming_metrics_ride_on_usage_chunk():
     usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
     assert usage_chunks
     assert usage_chunks[-1]["metrics"]["time_to_first_token_ms"] == pytest.approx(500.0)
+
+
+@pytest.mark.asyncio
+async def test_chat_watermarked_reported_without_timing_flag():
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    response = await serving.chat_completion_full_generator(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            stream=False,
+        ),
+        _single_request_output(_make_metrics_request_output(watermarked=True)),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    )
+
+    assert response.metrics is not None
+    assert response.metrics.watermarked is True
+    assert response.metrics.time_to_first_token_ms is None
+
+
+@pytest.mark.asyncio
+async def test_chat_watermarked_reported_for_n_greater_than_one():
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=True)
+    response = await serving.chat_completion_full_generator(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            stream=False,
+            n=2,
+        ),
+        _single_request_output(_make_metrics_request_output(watermarked=False)),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Test"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    )
+
+    assert response.metrics is not None
+    assert response.metrics.watermarked is False
+    assert response.metrics.time_to_first_token_ms is None
+
+
+@pytest.mark.asyncio
+async def test_chat_streaming_watermarked_rides_on_usage_chunk():
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    chunks = await _collect_metrics_stream_chunks(
+        serving,
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Test prompt"}],
+            max_tokens=10,
+            stream=True,
+            stream_options={"include_usage": True},
+        ),
+        _make_metrics_request_output(watermarked=True),
+    )
+
+    usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
+    assert usage_chunks
+    assert usage_chunks[-1]["metrics"]["watermarked"] is True
+
+
+def test_chat_response_round_trips_watermarked():
+    response = ChatCompletionResponse(
+        model="test-model",
+        choices=[
+            ChatCompletionResponseChoice(
+                index=0, message=ChatMessage(role="assistant", content="hi")
+            )
+        ],
+        usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        metrics=PerRequestMetrics(watermarked=False),
+    )
+
+    restored = ChatCompletionResponse.model_validate_json(response.model_dump_json())
+
+    assert restored.metrics is not None
+    assert restored.metrics.watermarked is False
 
 
 @pytest.mark.asyncio

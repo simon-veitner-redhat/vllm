@@ -119,6 +119,17 @@ def build_spec_decoding_metrics(
     return SpeculativeDecodingMetrics(**metrics.to_dict())
 
 
+def build_watermarked_metric(final_res: "RequestOutput | None") -> bool | None:
+    """Return the request's resolved watermarking decision, or ``None`` when
+    nothing is reported (no output yet, pooling, or no watermark config).
+
+    The decision is per-request, so it is not suppressed for n>1.
+    """
+    if final_res is None or not final_res.outputs:
+        return None
+    return final_res.outputs[0].watermarked
+
+
 @dataclass(kw_only=True)
 class ServeContext(Generic[RequestT]):
     request: RequestT

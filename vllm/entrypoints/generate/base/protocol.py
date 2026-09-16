@@ -82,6 +82,8 @@ class PerRequestMetrics(OpenAIBaseModel):
     tokens_per_second: float | None = None
     # Experimental, subject to change.
     speculative_decoding: SpeculativeDecodingMetrics | None = None
+    # Set on watermark-configured engines regardless of --enable-per-request-metrics.
+    watermarked: bool | None = None
 
 
 class RequestResponseMetadata(BaseModel):

@@ -155,6 +155,7 @@ class RequestState:
         n: int | None = None,
         temperature: float | None = None,
         stream_input: bool = False,
+        watermarking: bool | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -175,6 +176,7 @@ class RequestState:
         self.top_p = top_p
         self.n = n
         self.temperature = temperature
+        self.watermarking = watermarking
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
@@ -229,6 +231,7 @@ class RequestState:
         queue: RequestOutputCollector | None,
         log_stats: bool,
         stream_interval: int,
+        watermarking_enabled: bool = False,
     ) -> "RequestState":
         if sampling_params := request.sampling_params:
             if not sampling_params.detokenize:
@@ -249,6 +252,11 @@ class RequestState:
             top_p = sampling_params.top_p
             n = sampling_params.n
             temperature = sampling_params.temperature
+            # Without a watermark config admission always resolves False;
+            # report nothing instead.
+            watermarking = (
+                sampling_params.watermarking if watermarking_enabled else None
+            )
         else:
             logprobs_processor = None
             detokenizer = None
@@ -256,6 +264,7 @@ class RequestState:
             top_p = None
             n = None
             temperature = None
+            watermarking = None
             assert request.pooling_params is not None
             output_kind = request.pooling_params.output_kind
 
@@ -281,6 +290,7 @@ class RequestState:
             log_stats=log_stats,
             stream_interval=stream_interval,
             stream_input=request.resumable,
+            watermarking=watermarking,
         )
 
     def make_request_output(
@@ -442,6 +452,7 @@ class RequestState:
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,
             spec_decode_metrics=self.spec_decode_metrics if finished else None,
+            watermarked=self.watermarking,
         )
 
     def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
@@ -459,6 +470,7 @@ class OutputProcessor:
         stream_interval: int = 1,
         tracing_enabled: bool = False,
         admission_stats: "SharedAdmissionStats | None" = None,
+        watermarking_enabled: bool = False,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
@@ -469,6 +481,7 @@ class OutputProcessor:
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
         self.admission_stats = admission_stats
+        self.watermarking_enabled = watermarking_enabled
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -584,6 +597,7 @@ class OutputProcessor:
             queue=queue,
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
+            watermarking_enabled=self.watermarking_enabled,
         )
         self.request_states[request_id] = req_state
         if parent_req:
@@ -880,6 +894,7 @@ class OutputProcessor:
             max_tokens_param=req_state.max_tokens_param,
             req_stats=req_state.stats,
             num_cached_tokens=req_state.num_cached_tokens,
+            watermarked=req_state.watermarking,
         )
         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
 

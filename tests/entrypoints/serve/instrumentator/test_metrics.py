@@ -193,6 +193,7 @@ EXPECTED_METRICS_V1 = [
     "vllm:iteration_tokens_total",
     "vllm:cache_config_info",
     "vllm:request_success_total",
+    "vllm:request_watermarked_total",
     "vllm:request_prompt_tokens_sum",
     "vllm:request_prompt_tokens_bucket",
     "vllm:request_prompt_tokens_count",

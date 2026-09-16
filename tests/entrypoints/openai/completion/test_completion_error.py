@@ -8,12 +8,20 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from vllm.config.multimodal import MultiModalConfig
-from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
-from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+from vllm.entrypoints.generate.base.protocol import (
+    PerRequestMetrics,
+    RequestResponseMetadata,
+)
+from vllm.entrypoints.openai.completion.protocol import (
+    CompletionRequest,
+    CompletionResponse,
+    CompletionResponseChoice,
+)
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.scale_out.render.serving import ServingRender
+from vllm.entrypoints.serve.engine.protocol import UsageInfo
 from vllm.exceptions import GenerationError, VLLMValidationError
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.renderers.hf import HfRenderer
@@ -113,6 +121,7 @@ def _build_minimal_metrics_serving_completion(
 
 def _make_metrics_request_output(
     metrics: RequestStateStats | None = _PER_REQUEST_STATS,
+    watermarked: bool | None = None,
 ) -> RequestOutput:
     return RequestOutput(
         request_id="test-id",
@@ -127,6 +136,7 @@ def _make_metrics_request_output(
                 cumulative_logprob=None,
                 logprobs=None,
                 finish_reason="stop",
+                watermarked=watermarked,
             )
         ],
         finished=True,
@@ -191,6 +201,61 @@ def test_completion_per_request_metrics_suppressed_for_multiple_prompts():
         RequestResponseMetadata(request_id="cmpl-test-id"),
     )
     assert response.metrics is None
+
+
+def test_completion_watermarked_reported_without_timing_flag():
+    serving = _build_minimal_metrics_serving_completion(
+        enable_per_request_metrics=False
+    )
+    response = serving.request_output_to_completion_response(
+        [_make_metrics_request_output(watermarked=True)],
+        CompletionRequest(model=MODEL_NAME, prompt="Test prompt", max_tokens=10),
+        "cmpl-test-id",
+        0,
+        MODEL_NAME,
+        None,
+        RequestResponseMetadata(request_id="cmpl-test-id"),
+    )
+    assert response.metrics is not None
+    assert response.metrics.watermarked is True
+    assert response.metrics.time_to_first_token_ms is None
+
+
+def test_completion_watermarked_reported_for_multiple_prompts():
+    serving = _build_minimal_metrics_serving_completion(enable_per_request_metrics=True)
+    response = serving.request_output_to_completion_response(
+        [
+            _make_metrics_request_output(watermarked=False),
+            _make_metrics_request_output(watermarked=False),
+        ],
+        CompletionRequest(
+            model=MODEL_NAME,
+            prompt=["Test prompt", "Another prompt"],
+            max_tokens=10,
+        ),
+        "cmpl-test-id",
+        0,
+        MODEL_NAME,
+        None,
+        RequestResponseMetadata(request_id="cmpl-test-id"),
+    )
+    assert response.metrics is not None
+    assert response.metrics.watermarked is False
+    assert response.metrics.time_to_first_token_ms is None
+
+
+def test_completion_response_round_trips_watermarked():
+    response = CompletionResponse(
+        model=MODEL_NAME,
+        choices=[CompletionResponseChoice(index=0, text="hi")],
+        usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        metrics=PerRequestMetrics(watermarked=False),
+    )
+
+    restored = CompletionResponse.model_validate_json(response.model_dump_json())
+
+    assert restored.metrics is not None
+    assert restored.metrics.watermarked is False
 
 
 def _spec_decode_metrics() -> RequestSpecDecodeMetrics:

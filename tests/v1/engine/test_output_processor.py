@@ -53,11 +53,126 @@ def test_delta_output_without_new_tokens_returns_empty_logprobs(
     state.sampling_mask_chunks = []
     state.routed_experts_chunks = []
     state.spec_decode_metrics = None
+    state.watermarking = None
 
     output = state._new_completion_output([], None, None)
 
     assert isinstance(output.logprobs, FlatLogprobs if flat_logprobs else list)
     assert len(output.logprobs) == 0
+
+
+def _make_engine_core_request(
+    request_id: str,
+    prompt_token_ids: list[int],
+    sampling_params: SamplingParams | None,
+    pooling_params: PoolingParams | None = None,
+) -> EngineCoreRequest:
+    return EngineCoreRequest(
+        request_id=request_id,
+        external_req_id=f"{request_id}-ext",
+        prompt_token_ids=prompt_token_ids,
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=sampling_params,
+        pooling_params=pooling_params,
+    )
+
+
+def _run_watermarking_requests(
+    watermarking: bool,
+    *,
+    watermarking_enabled: bool,
+) -> tuple[list[bool | None], list[bool | None]]:
+    prompt_tokens = [[1, 2, 3], [4, 5]]
+    generation_tokens = [[10, 11, 12], [20, 21]]
+
+    # detokenize=False, so no tokenizer is needed.
+    output_processor = OutputProcessor(
+        None, log_stats=True, watermarking_enabled=watermarking_enabled
+    )
+    requests = [
+        _make_engine_core_request(
+            f"request-{idx}",
+            tokens,
+            SamplingParams(watermarking=watermarking, detokenize=False),
+        )
+        for idx, tokens in enumerate(prompt_tokens)
+    ]
+
+    engine_core = MockEngineCore(
+        tokens_list=generation_tokens,
+        prompts_list=prompt_tokens,
+        request_ids=[req.request_id for req in requests],
+    )
+    for request in requests:
+        output_processor.add_request(request, None)
+
+    reported: list[bool | None] = []
+    finished: list[bool | None] = []
+    while outputs := engine_core.get_outputs():
+        iteration_stats = IterationStats()
+        processed = output_processor.process_outputs(
+            outputs, time.monotonic(), iteration_stats
+        )
+        for request_output in processed.request_outputs:
+            reported.extend(
+                completion_output.watermarked
+                for completion_output in request_output.outputs
+            )
+        finished.extend(
+            finished_request.watermarked
+            for finished_request in iteration_stats.finished_requests
+        )
+
+    assert reported
+    assert len(finished) == len(requests)
+    return reported, finished
+
+
+@pytest.mark.parametrize("watermarking", [True, False])
+def test_completion_output_reports_resolved_watermarking(watermarking: bool) -> None:
+    reported, finished = _run_watermarking_requests(
+        watermarking, watermarking_enabled=True
+    )
+
+    assert all(value is watermarking for value in reported)
+    assert all(value is watermarking for value in finished)
+
+
+@pytest.mark.parametrize("watermarking", [True, False])
+def test_watermarking_not_reported_without_engine_config(watermarking: bool) -> None:
+    reported, finished = _run_watermarking_requests(
+        watermarking, watermarking_enabled=False
+    )
+
+    assert all(value is None for value in reported)
+    assert all(value is None for value in finished)
+
+
+def test_pooling_request_state_has_no_watermarking() -> None:
+    request = _make_engine_core_request(
+        "request-0",
+        [1, 2, 3],
+        sampling_params=None,
+        pooling_params=PoolingParams(task="embed"),
+    )
+
+    state = RequestState.from_new_request(
+        tokenizer=None,
+        request=request,
+        prompt=None,
+        parent_req=None,
+        request_index=0,
+        queue=None,
+        log_stats=False,
+        stream_interval=1,
+        watermarking_enabled=True,
+    )
+
+    assert state.watermarking is None
 
 
 def _ref_convert_id_to_token(

@@ -729,6 +729,23 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 for idx in engine_indexes
             }
 
+        self.counter_request_watermarked: dict[bool, dict[int, Counter]] = {}
+        counter_request_watermarked_base = self._counter_cls(
+            name="vllm:request_watermarked",
+            documentation=(
+                "Count of finished generation requests by whether the engine "
+                "watermark was applied."
+            ),
+            labelnames=labelnames + ["watermarked"],
+        )
+        for watermarked in (True, False):
+            self.counter_request_watermarked[watermarked] = {
+                idx: counter_request_watermarked_base.labels(
+                    model_name, str(idx), "true" if watermarked else "false"
+                )
+                for idx in engine_indexes
+            }
+
         request_tokens_buckets = histogram_buckets(
             "request_tokens", max_model_len=max_model_len
         )
@@ -1139,6 +1156,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.counter_request_success[finished_request.finish_reason][
                 engine_idx
             ].inc()
+            if finished_request.watermarked is not None:
+                self.counter_request_watermarked[finished_request.watermarked][
+                    engine_idx
+                ].inc()
             self.histogram_e2e_time_request[engine_idx].observe(
                 finished_request.e2e_latency
             )

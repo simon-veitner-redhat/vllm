@@ -18,6 +18,7 @@ from vllm.entrypoints.generate.base.serving import (
     GenerateBaseServing,
     build_per_request_timing_metrics,
     build_spec_decoding_metrics,
+    build_watermarked_metric,
     clamp_prompt_logprobs,
     format_token_id_placeholder,
 )
@@ -475,6 +476,13 @@ class OpenAIServingCompletion(GenerateBaseServing):
                             stream_per_request_metrics = PerRequestMetrics()
                         stream_per_request_metrics.speculative_decoding = spec_stats
 
+                # Per-request, so not suppressed for n>1; see build_watermarked_metric.
+                watermarked = build_watermarked_metric(last_res)
+                if watermarked is not None:
+                    if stream_per_request_metrics is None:
+                        stream_per_request_metrics = PerRequestMetrics()
+                    stream_per_request_metrics.watermarked = watermarked
+
                 final_usage_chunk = CompletionStreamResponse(
                     id=request_id,
                     created=created_time,
@@ -632,6 +640,13 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 if per_request_metrics is None:
                     per_request_metrics = PerRequestMetrics()
                 per_request_metrics.speculative_decoding = spec_stats
+
+        # Per-request, so not suppressed for n>1; see build_watermarked_metric.
+        watermarked = build_watermarked_metric(last_final_res)
+        if watermarked is not None:
+            if per_request_metrics is None:
+                per_request_metrics = PerRequestMetrics()
+            per_request_metrics.watermarked = watermarked
 
         if final_res_batch:
             kv_transfer_params = final_res_batch[0].kv_transfer_params
