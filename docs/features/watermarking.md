@@ -80,6 +80,9 @@ because their recovery tokens are watermarked.
 For `dual_key_gumbel`, `alpha` has no effect under speculative decoding. The
 speculative protocol selects the key for each token instead.
 
+Context deduplication applies to draft, rejection-recovery, and bonus tokens.
+See [Under speculative decoding](#under-speculative-decoding).
+
 ## Context deduplication
 
 When a token context is repeated, generation can use ordinary sampling for that
@@ -87,7 +90,6 @@ occurrence. Reusing the repeated context leads to a bias over the sequence, as
 certain token choices would be correlated. Ordinary sampling at these positions
 allows for single-sequence non-distortion (see section G.3 of the
 [SynthID-Text supplementary materials](https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fs41586-024-08025-4/MediaObjects/41586_2024_8025_MOESM1_ESM.pdf)).
-This also applies to drafter watermarking during speculative decoding.
 The detector independently deduplicates contexts so repeated keyed random
 vectors are not treated as independent evidence, meaning that context
 deduplication at generation time does not reduce the watermarking signal, unless
@@ -129,6 +131,34 @@ vllm serve MODEL \
   --watermark-config \
   '{"algorithm":"gumbel","key":42,"deduplicate_contexts":"all"}'
 ```
+
+### Under speculative decoding
+
+The configured policy covers every token a speculative step can emit. The
+drafter checks each draft token before it samples it, and the target checks the
+verification rows, which is where rejection-recovery and bonus tokens are drawn.
+A repeated context is sampled without the watermark on whichever side produced
+the token, as it is in ordinary decoding.
+
+The history searched for a token in a speculative block is the committed history
+the scope selects above, plus the earlier positions of the block still in
+flight. On the draft side those are the contexts of the previous draft steps; on
+the target side they are the earlier verification rows of the same block. A
+context that repeats within one block is therefore deduplicated too, before
+either occurrence is committed.
+
+Those uncommitted positions count toward `deduplicate_contexts_max_history`, so
+inside a block the committed part of the window is shorter by up to
+`num_speculative_tokens`.
+
+Deduplication does not change the acceptance criterion or the marginal output
+distribution. Acceptance compares the target and draft probabilities of the
+drafted token, and neither depends on which key, or whether any key, produced
+it. Deduplication only moves which positions carry detectable signal.
+
+It is not free. Every draft and verification row scans its history, and the cost
+grows with `deduplicate_contexts_max_history`, so a large window costs
+throughput.
 
 ## Algorithms
 

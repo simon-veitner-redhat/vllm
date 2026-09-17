@@ -41,12 +41,17 @@ class WatermarkConfig:
     sampled; a repeated context is sampled without the watermark. `none`
     disables the search. `single_turn` (default) searches this request's
     generated tokens. `all` also searches the prompt and samples the first
-    `context_width` generated tokens without watermarking."""
+    `context_width` generated tokens without watermarking. Under speculative
+    decoding the search covers draft, rejection-recovery and bonus tokens, and
+    the history of a token in a speculative block also includes the block's
+    earlier, not yet committed positions."""
     deduplicate_contexts_max_history: int | None = Field(default=8192, ge=1)
     """Number of most recent history positions searched (default 8192), or
     `None` for the whole scope. Each position is compared over the
-    `context_width` tokens before it. Ignored when `deduplicate_contexts` is
-    `none`."""
+    `context_width` tokens before it. Under speculative decoding the
+    uncommitted positions of the current block count toward this limit, so the
+    committed window searched is shorter by up to `num_speculative_tokens`
+    positions. Ignored when `deduplicate_contexts` is `none`."""
     prf: WatermarkPRFName = "philox"
     """Pseudorandom function used by the watermarking algorithm."""
     allow_target_only_watermarking: bool = False
