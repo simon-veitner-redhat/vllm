@@ -272,14 +272,15 @@ def repeated_context_mask(
             ``None`` for all of them. The window compared at each position
             reaches `context_width` tokens further back.
         include_prompt: Search the prompt as well as the generated tokens.
-        skip_partial_context: Mark contexts containing start padding so they use
-            ordinary sampling.
         history_offsets: Number of newer, non-committed positions preceding each
             context. These positions count toward `max_history`. Must be 1-D
             over rows; a stride-0 broadcast row is fine.
         local_positions: Position within each request's speculative block. When
             provided, compare each context with earlier contexts in that block.
         num_speculative_steps: Maximum number of draft tokens in the block.
+        skip_partial_context: Mark contexts containing start padding so they use
+            ordinary sampling.
+
     """
     if max_history is not None and max_history < 1:
         raise ValueError("max_history must be positive or None")
