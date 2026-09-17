@@ -141,6 +141,7 @@ def test_nope_flashinfer_sparse_mla_uses_model_scale(monkeypatch):
         req_id_per_token=torch.zeros(1, dtype=torch.int32),
         block_table=torch.zeros((1, 1), dtype=torch.int32),
         block_size=1,
+        num_decode_tokens=1,
     )
     recorded_scale = None
 
@@ -3137,10 +3138,7 @@ def test_flashinfer_hisparse_decode_runs_batched_attention():
     def convert_decode(self, *args, **kwargs):  # noqa: ARG001
         return physical_topk, valid_counts
 
-    def prepare_kernel(self, *args, **kwargs):  # noqa: ARG001
-        pass
-
-    def run_kernel(self, q, cache, indices, counts):  # noqa: ARG001
+    def run_kernel(self, q, cache, indices, counts, **kwargs):  # noqa: ARG001
         kernel_shapes.append(q.shape)
         return q[..., :1], None
 
@@ -3156,11 +3154,11 @@ def test_flashinfer_hisparse_decode_runs_batched_attention():
     )
     impl = object.__new__(FlashInferMLASparseImpl)
     impl.topk_indices_buffer = topk
+    impl.dcp_world_size = 1
     impl.index_group = index_group
     impl.index_group_index = 0
-    impl._prepare_mqa_kernel = MethodType(prepare_kernel, impl)
-    impl._run_mqa_kernel = MethodType(run_kernel, impl)
-    metadata = SimpleNamespace(num_decode_tokens=num_tokens)
+    impl._forward_mqa_kernel = MethodType(run_kernel, impl)
+    metadata = SimpleNamespace(num_decode_tokens=num_tokens, block_size=64)
 
     output, lse = FlashInferMLASparseImpl.forward_mqa(
         impl,
@@ -3191,9 +3189,10 @@ def test_flashattn_hisparse_decode_uses_index_group():
     )
     impl = object.__new__(FlashAttnMLASparseImpl)
     impl.topk_indices_buffer = topk
+    impl.dcp_world_size = 1
     impl.index_group = index_group
     impl.index_group_index = 0
-    impl._run_mqa_kernel = MagicMock(return_value=q_nope[..., :1])
+    impl._forward_mqa_kernel = MagicMock(return_value=(q_nope[..., :1], None))
     metadata = SimpleNamespace(num_decode_tokens=num_tokens, block_size=64)
 
     output, lse = FlashAttnMLASparseImpl.forward_mqa(
@@ -3207,7 +3206,7 @@ def test_flashattn_hisparse_decode_uses_index_group():
     assert output.shape == (num_tokens, 2, 1)
     assert lse is None
     index_group.convert_decode_logical_to_physical_topk.assert_called_once()
-    impl._run_mqa_kernel.assert_called_once()
+    impl._forward_mqa_kernel.assert_called_once()
 
 
 def test_flashinfer_sm120_hisparse_decode_uses_index_group():
@@ -3447,7 +3446,12 @@ def _record_fa4_kernels(monkeypatch, num_heads, *, device):
 
     monkeypatch.setattr(fa4_sparse, "flash_attn_varlen_func", fake_fa4)
     flashinfer_decode = ModuleType("flashinfer.decode")
-    flashinfer_decode.trtllm_batch_decode_with_kv_cache_mla = fake_trtllm
+    monkeypatch.setattr(
+        flashinfer_decode,
+        "trtllm_batch_decode_with_kv_cache_mla",
+        fake_trtllm,
+        raising=False,
+    )
     monkeypatch.setitem(sys.modules, "flashinfer.decode", flashinfer_decode)
     return SimpleNamespace(fa4=fa4_calls, trtllm=trtllm_calls, lse=lse)
 
@@ -3506,7 +3510,7 @@ def test_fa4_sparse_decode_kernel_correctness(num_heads, return_lse):
 @pytest.mark.parametrize("dcp", [1, 2], ids=["native", "dcp2"])
 @pytest.mark.parametrize("num_decode_tokens", [7, 3])
 def test_fa4_sparse_routes_whole_batches(monkeypatch, num_decode_tokens, dcp):
-    import vllm.v1.attention.backends.mla.flashattn_mla_sparse as fa4_sparse
+    import vllm.model_executor.layers.attention.sparse_mla_attention as sparse_mla
     from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
         FlashAttnMLASparseFA4Impl,
     )
@@ -3526,7 +3530,7 @@ def test_fa4_sparse_routes_whole_batches(monkeypatch, num_decode_tokens, dcp):
         valid_counts[0] = 0
         index_filter = MagicMock(return_value=(inputs.topk_indices, valid_counts))
         monkeypatch.setattr(
-            fa4_sparse, "triton_filter_and_convert_dcp_index", index_filter
+            sparse_mla, "triton_filter_and_convert_dcp_index", index_filter
         )
         # mla_attention fuses the query before the DCP all-gather.
         q = torch.cat(q, dim=-1)
@@ -3606,7 +3610,7 @@ def test_fa4_sparse_routes_whole_batches(monkeypatch, num_decode_tokens, dcp):
 def test_fa4_sparse_hisparse_routes_lanes(
     monkeypatch, num_decode_tokens, all_resident, lane
 ):
-    import vllm.v1.attention.backends.mla.flashattn_mla_sparse as fa4_sparse
+    import vllm.model_executor.layers.attention.sparse_mla_attention as sparse_mla
     from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
         FlashAttnMLASparseFA4Impl,
     )
@@ -3648,7 +3652,7 @@ def test_fa4_sparse_hisparse_routes_lanes(
     )
     triton_convert = MagicMock(return_value=physical(num_prefill_tokens))
     monkeypatch.setattr(
-        fa4_sparse, "triton_convert_req_index_to_global_index", triton_convert
+        sparse_mla, "triton_convert_req_index_to_global_index", triton_convert
     )
     impl = _fa4_impl(topk_indices_buffer=inputs.topk_indices, index_group=index_group)
 
@@ -3696,6 +3700,63 @@ def test_fa4_sparse_hisparse_routes_lanes(
     assert trtllm["seq_lens"] is prefill_counts
     assert (out[:num_decode_tokens] == 1.0).all()
     assert (out[num_decode_tokens:] == 2.0).all()
+
+
+@pytest.mark.parametrize("backend", ["fa3", "fa4", "flashinfer"])
+def test_sparse_mqa_consumes_decode_before_prefill_reuses_indices(monkeypatch, backend):
+    """Preparing a later portion must not overwrite unconsumed decode indices."""
+    import vllm.model_executor.layers.attention.sparse_mla_attention as sparse_mla
+
+    inputs = _fa4_inputs([128] * 4, device="cpu")
+    inputs.metadata.num_decode_tokens = 2
+    physical = torch.full((2, 128), 3, dtype=torch.int32)
+    counts = torch.full((2,), 128, dtype=torch.int32)
+    group = object.__new__(HiSparseMLAIndexGroup)
+    group.physical_kv_cache = MagicMock(return_value=inputs.kv_cache)
+    group.convert_decode_logical_to_physical_topk = MagicMock(
+        return_value=(physical, counts)
+    )
+    group.cache = MagicMock(
+        return_value=SimpleNamespace(all_context_pages_resident=False)
+    )
+    group.stage_prefill_rows = MagicMock(
+        return_value=(inputs.kv_cache, inputs.metadata.block_table, torch.zeros(2))
+    )
+
+    def convert_prefill(*args, **kwargs):
+        physical.fill_(7)
+        return physical, counts
+
+    monkeypatch.setattr(
+        sparse_mla, "triton_convert_req_index_to_global_index", convert_prefill
+    )
+
+    def run_kernel(q, cache, indices, counts, **kwargs):
+        out = indices[:, :1].clone().view(-1, 1, 1).expand(-1, 16, 512)
+        return out, None
+
+    if backend == "fa4":
+        impl = _fa4_impl(topk_indices_buffer=inputs.topk_indices, index_group=group)
+        impl._decode = lambda q_nope, q_rope, *args: run_kernel(q_nope, *args)
+        impl._prefill = run_kernel
+    else:
+        impl_cls = (
+            FlashAttnMLASparseImpl if backend == "fa3" else FlashInferMLASparseImpl
+        )
+        impl = object.__new__(impl_cls)
+        impl.topk_indices_buffer = inputs.topk_indices
+        impl.index_group = group
+        impl.index_group_index = 0
+        impl.dcp_world_size = 1
+        impl._forward_mqa_kernel = run_kernel
+
+    out, lse = impl.forward_mqa(
+        (inputs.ql_nope, inputs.q_pe), inputs.kv_cache, inputs.metadata, None
+    )
+    assert lse is None
+    assert out.shape == (4, 16, 512)
+    assert (out[:2] == 3).all()
+    assert (out[2:] == 7).all()
 
 
 @pytest.mark.parametrize("hisparse", [False, True])

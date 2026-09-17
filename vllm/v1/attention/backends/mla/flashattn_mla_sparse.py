@@ -30,11 +30,7 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     _get_workspace_buffer,
 )
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
-from vllm.v1.attention.backends.mla.sparse_utils import (
-    flat_kv_row_view,
-    triton_convert_req_index_to_global_index,
-    triton_filter_and_convert_dcp_index,
-)
+from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 
@@ -191,131 +187,23 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
         )
         self.supports_quant_query_input = False
 
-    def forward_mqa(
+    def _forward_mqa_kernel(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        kv_c_and_k_pe_cache: torch.Tensor,
-        attn_metadata: FlashAttnMLASparseMetadata,
+        kv_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        valid_counts: torch.Tensor,
+        *,
         layer: AttentionLayer,
+        block_size: int,
+        is_decode: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not isinstance(q, tuple):
             raise NotImplementedError(
                 "FlashAttnMLASparseImpl expects split (q_nope, q_rope) input."
             )
         q_nope, q_rope = q
-        num_actual_toks = q_rope.shape[0]
-
-        assert self.topk_indices_buffer is not None
-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
-        index_group = self.index_group
-        if isinstance(index_group, HiSparseMLAIndexGroup):
-            num_decode_tokens = attn_metadata.num_decode_tokens
-            outputs = []
-            if num_decode_tokens:
-                physical_topk, valid_counts = (
-                    index_group.convert_decode_logical_to_physical_topk(
-                        self.index_group_index,
-                        topk_indices[:num_decode_tokens],
-                        attn_metadata,
-                        return_valid_counts=True,
-                    )
-                )
-                outputs.append(
-                    self._run_mqa_kernel(
-                        q_nope[:num_decode_tokens],
-                        q_rope[:num_decode_tokens],
-                        index_group.physical_kv_cache(self.index_group_index).view(
-                            kv_c_and_k_pe_cache.dtype
-                        ),
-                        physical_topk,
-                        valid_counts,
-                        attn_metadata.block_size,
-                    )
-                )
-            if num_decode_tokens < num_actual_toks:
-                cache = index_group.cache(self.index_group_index)
-                if num_decode_tokens == 0 and cache.all_context_pages_resident:
-                    physical_topk, valid_counts = (
-                        index_group.convert_logical_to_physical_topk(
-                            self.index_group_index,
-                            topk_indices,
-                            attn_metadata,
-                            block_stride_rows=None,
-                            return_valid_counts=True,
-                        )
-                    )
-                    prefill_cache = index_group.physical_kv_cache(
-                        self.index_group_index
-                    ).view(kv_c_and_k_pe_cache.dtype)
-                else:
-                    prefill_cache, block_table, req_ids = (
-                        index_group.stage_prefill_rows(
-                            self.index_group_index,
-                            kv_c_and_k_pe_cache,
-                            attn_metadata,
-                        )
-                    )
-                    physical_topk, valid_counts = (
-                        triton_convert_req_index_to_global_index(
-                            req_ids,
-                            block_table,
-                            topk_indices[num_decode_tokens:],
-                            BLOCK_SIZE=attn_metadata.block_size,
-                            NUM_TOPK_TOKENS=topk_indices.shape[1],
-                            return_valid_counts=True,
-                        )
-                    )
-                outputs.append(
-                    self._run_mqa_kernel(
-                        q_nope[num_decode_tokens:],
-                        q_rope[num_decode_tokens:],
-                        prefill_cache,
-                        physical_topk,
-                        valid_counts,
-                        attn_metadata.block_size,
-                    )
-                )
-            return torch.cat(outputs) if len(outputs) > 1 else outputs[0], None
-
-        kv_rows, block_stride_rows = flat_kv_row_view(
-            kv_c_and_k_pe_cache, attn_metadata.block_size
-        )
-        topk_indices, valid_counts = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token[:num_actual_toks],
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            BLOCK_STRIDE_ROWS=block_stride_rows,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-            return_valid_counts=True,
-        )
-        return (
-            self._run_mqa_kernel(
-                q_nope,
-                q_rope,
-                kv_rows,
-                topk_indices,
-                valid_counts,
-                attn_metadata.block_size,
-                cache_is_flat=True,
-            ),
-            None,
-        )
-
-    def _run_mqa_kernel(
-        self,
-        q_nope: torch.Tensor,
-        q_rope: torch.Tensor,
-        kv_cache: torch.Tensor,
-        topk_indices: torch.Tensor,
-        valid_counts: torch.Tensor,
-        block_size: int,
-        *,
-        cache_is_flat: bool = False,
-    ) -> torch.Tensor:
-        kv_rows = (
-            kv_cache if cache_is_flat else flat_kv_row_view(kv_cache, block_size)[0]
-        )
+        kv_rows, _ = flat_kv_row_view(kv_cache, block_size)
 
         cu_seqlens_q = torch.arange(
             0, q_rope.shape[0] + 1, dtype=torch.int32, device=q_rope.device
@@ -337,7 +225,7 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
             causal=True,
             fa_version=3,
         )
-        return out
+        return out, None
 
 
 def _fa4_cute_mla_available() -> str | None:
@@ -593,147 +481,32 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata])
         self.max_varlen_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self._workspace_buffer: torch.Tensor | None = None
 
-    def forward_mqa(
+    def _forward_mqa_kernel(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        kv_c_and_k_pe_cache: torch.Tensor,
-        attn_metadata: FlashAttnMLASparseMetadata,
+        kv_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        valid_counts: torch.Tensor,
+        *,
         layer: AttentionLayer,
+        block_size: int,
+        is_decode: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        q_fused: torch.Tensor | None = None
-        if isinstance(q, tuple):
-            ql_nope, q_pe = q
-        else:
-            # The fused query's halves are 16B-aligned slices; FA4 does not copy them.
-            assert q.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim
-            q_fused = q
-            ql_nope = q[..., : self.kv_lora_rank]
-            q_pe = q[..., self.kv_lora_rank :]
-        num_actual_toks = q_pe.shape[0]
-        num_decode_toks = attn_metadata.num_decode_tokens
-
-        assert self.topk_indices_buffer is not None
-        if isinstance(index_group := self.index_group, HiSparseMLAIndexGroup):
-            return self._forward_mqa_hisparse(
-                index_group, ql_nope, q_pe, kv_c_and_k_pe_cache, attn_metadata
-            )
-
-        kv_rows, block_stride_rows = flat_kv_row_view(
-            kv_c_and_k_pe_cache, attn_metadata.block_size
-        )
-        if self.dcp_world_size > 1:
-            topk_indices, valid_counts = triton_filter_and_convert_dcp_index(
-                attn_metadata.req_id_per_token[:num_actual_toks],
-                attn_metadata.block_table,
-                self.topk_indices_buffer[:num_actual_toks],
-                dcp_size=self.dcp_world_size,
-                dcp_rank=self.dcp_rank,
-                cp_kv_cache_interleave_size=attn_metadata.cp_kv_cache_interleave_size,
-                BLOCK_SIZE=attn_metadata.block_size,
-                BLOCK_STRIDE_ROWS=block_stride_rows,
-                NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
-                return_valid_counts=True,
-            )
-        else:
-            topk_indices, valid_counts = self._convert_logical_to_physical_topk(
-                self.topk_indices_buffer[:num_actual_toks],
-                attn_metadata,
-                block_stride_rows=block_stride_rows,
-                return_valid_counts=True,
-            )
-
-        if num_decode_toks >= num_actual_toks:
+        if is_decode:
+            if isinstance(q, tuple):
+                ql_nope, q_pe = q
+            else:
+                assert q.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim
+                ql_nope = q[..., : self.kv_lora_rank]
+                q_pe = q[..., self.kv_lora_rank :]
+            kv_rows, _ = flat_kv_row_view(kv_cache, block_size)
             out, lse = self._decode(ql_nope, q_pe, kv_rows, topk_indices, valid_counts)
         else:
-            out, lse = self._prefill(
-                q_fused if q_fused is not None else torch.cat((ql_nope, q_pe), dim=-1),
-                kv_c_and_k_pe_cache,
-                topk_indices,
-                valid_counts,
-            )
+            if isinstance(q, tuple):
+                q = torch.cat(q, dim=-1)
+            out, lse = self._prefill(q, kv_cache, topk_indices, valid_counts)
         assert lse is None or lse.shape == (out.shape[0], out.shape[1])
         return out, lse
-
-    def _forward_mqa_hisparse(
-        self,
-        index_group: HiSparseMLAIndexGroup,
-        ql_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        kv_c_and_k_pe_cache: torch.Tensor,
-        attn_metadata: FlashAttnMLASparseMetadata,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Both lanes over HiSparse's hot cache, or a staged copy of the host rows."""
-        assert self.dcp_world_size == 1
-        assert not self.need_to_return_lse_for_decode
-        assert self.topk_indices_buffer is not None
-        layer_index = self.index_group_index
-        num_actual_toks = q_pe.shape[0]
-        num_decode_toks = attn_metadata.num_decode_tokens
-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
-        hot_cache = index_group.physical_kv_cache(layer_index).view(
-            kv_c_and_k_pe_cache.dtype
-        )
-
-        outputs: list[torch.Tensor] = []
-        if num_decode_toks > 0:
-            # Once per forward; pass to FA4 unsliced, CUDA graphs capture the pointers.
-            physical_topk, valid_counts = (
-                index_group.convert_decode_logical_to_physical_topk(
-                    layer_index,
-                    topk_indices[:num_decode_toks],
-                    attn_metadata,
-                    return_valid_counts=True,
-                )
-            )
-            hot_rows, block_stride_rows = flat_kv_row_view(
-                hot_cache, attn_metadata.block_size
-            )
-            # The flat row view matches the resolver only while blocks are contiguous.
-            assert block_stride_rows == attn_metadata.block_size
-            out, _ = self._decode(
-                ql_nope[:num_decode_toks],
-                q_pe[:num_decode_toks],
-                hot_rows,
-                physical_topk,
-                valid_counts,
-            )
-            outputs.append(out)
-
-        if num_decode_toks < num_actual_toks:
-            cache = index_group.cache(layer_index)
-            if num_decode_toks == 0 and cache.all_context_pages_resident:
-                physical_topk, valid_counts = (
-                    index_group.convert_logical_to_physical_topk(
-                        layer_index,
-                        topk_indices,
-                        attn_metadata,
-                        block_stride_rows=None,
-                        return_valid_counts=True,
-                    )
-                )
-                prefill_cache = hot_cache
-            else:
-                prefill_cache, block_table, req_ids = index_group.stage_prefill_rows(
-                    layer_index, kv_c_and_k_pe_cache, attn_metadata
-                )
-                # The staged tensor is dense, so its blocks need no row stride.
-                physical_topk, valid_counts = triton_convert_req_index_to_global_index(
-                    req_ids,
-                    block_table,
-                    topk_indices[num_decode_toks:],
-                    BLOCK_SIZE=attn_metadata.block_size,
-                    NUM_TOPK_TOKENS=topk_indices.shape[1],
-                    return_valid_counts=True,
-                )
-            out, _ = self._prefill(
-                torch.cat((ql_nope[num_decode_toks:], q_pe[num_decode_toks:]), dim=-1),
-                prefill_cache,
-                physical_topk,
-                valid_counts,
-            )
-            outputs.append(out)
-
-        return (torch.cat(outputs) if len(outputs) > 1 else outputs[0]), None
 
     def _decode(
         self,
