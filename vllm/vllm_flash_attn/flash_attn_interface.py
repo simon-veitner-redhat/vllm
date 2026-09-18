@@ -174,8 +174,8 @@ def get_scheduler_metadata(
 
 
 def flash_attn_varlen_func(
-    q,
-    k,
+    q: "torch.Tensor | None",
+    k: "torch.Tensor | None",
     v,
     max_seqlen_q,
     cu_seqlens_q,
@@ -264,7 +264,9 @@ def flash_attn_varlen_func(
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
         q_v: (total_q, nheads, headdim_v). MLA-absorbed queries; the kernel computes
-            softmax(scale * (q @ k.T + q_v @ v.T)) @ v. FA3 and FA4 only.
+            softmax(scale * (q @ k.T + q_v @ v.T)) @ v. FA3 and FA4 only. With
+            q=None and k=None (FA4 only) there is no rope stream: q_v is the whole
+            query, v the whole KV row, head_dim is q_v's, and softmax_scale is required.
         gather_kv_indices: (total_q, gather_kv_length) int32, one KV row list per query
             token, with `-1` as the "no token" sentinel. Requires q_v, excludes
             block_table, and gather_kv_length must be a multiple of 128. FA4 only.
@@ -299,8 +301,12 @@ def flash_attn_varlen_func(
     assert gather_kv_valid_length is None or fa_version == 4, (
         f"gather_kv_valid_length is only supported by FA4, got fa_version={fa_version}"
     )
+    assert q is not None or (fa_version == 4 and k is None and q_v is not None), (
+        "q=None is only the FA4 rope-less q_v path (k=None, q_v given)"
+    )
 
     if softmax_scale is None:
+        assert q is not None, "softmax_scale is required when q is None"
         softmax_scale = q.shape[-1] ** (-0.5)
     # custom op does not support non-tuple input
     real_window_size: tuple[int, int]

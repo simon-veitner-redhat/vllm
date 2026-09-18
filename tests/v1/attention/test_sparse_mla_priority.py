@@ -18,22 +18,29 @@ FLASHMLA = AttentionBackendEnum.FLASHMLA_SPARSE
 
 
 @pytest.mark.parametrize(
-    "num_heads,kv_cache_dtype,use_hisparse,expected",
+    "num_heads,kv_cache_dtype,use_hisparse,head_size,expected",
     [
-        (16, "auto", False, [FA4, FLASHINFER, FLASHMLA]),
-        (16, "auto", True, [FLASHINFER, FA4, FLASHMLA]),
-        (32, "auto", False, [FLASHMLA, FLASHINFER]),
-        (32, "auto", True, [FLASHMLA, FLASHINFER]),
-        (16, "fp8_ds_mla", False, [FLASHINFER, FLASHMLA]),
-        (16, "fp8_ds_mla", True, [FLASHINFER, FLASHMLA]),
+        (16, "auto", False, 576, [FA4, FLASHINFER, FLASHMLA]),
+        (16, "auto", True, 576, [FLASHINFER, FA4, FLASHMLA]),
+        (32, "auto", False, 576, [FLASHMLA, FLASHINFER]),
+        (32, "auto", True, 576, [FLASHMLA, FLASHINFER]),
+        (16, "fp8_ds_mla", False, 576, [FLASHINFER, FLASHMLA]),
+        (16, "fp8_ds_mla", True, 576, [FLASHINFER, FLASHMLA]),
+        # Rope-less MLA (GLM-5.3-Flash): FlashInfer first until FA4 wins there.
+        (16, "auto", False, 512, [FLASHINFER, FA4, FLASHMLA]),
+        (16, "auto", True, 512, [FLASHINFER, FA4, FLASHMLA]),
+        (32, "auto", False, 512, [FLASHMLA, FLASHINFER]),
     ],
 )
-def test_sparse_backend_priority(num_heads, kv_cache_dtype, use_hisparse, expected):
+def test_sparse_backend_priority(
+    num_heads, kv_cache_dtype, use_hisparse, head_size, expected
+):
     priorities = _get_backend_priorities(
         use_mla=True,
         device_capability=DeviceCapability(major=10, minor=0),
         num_heads=num_heads,
         kv_cache_dtype=kv_cache_dtype,
+        head_size=head_size,
         use_hisparse=use_hisparse,
     )
 

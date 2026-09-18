@@ -381,8 +381,9 @@ class FlashAttnMLASparseFA4Backend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        # 512 latent + 64 RoPE; split back apart for the qv kernel.
-        return [576]
+        # 512 latent + 64 RoPE, split back apart for the qv kernel; 512 is the
+        # rope-less latent alone (GLM-5.3-Flash), which the kernel takes as q=None.
+        return [512, 576]
 
     @classmethod
     def is_mla(cls) -> bool:
@@ -454,15 +455,32 @@ class FlashAttnMLASparseFA4Backend(AttentionBackend):
 
         kv_lora_rank = getattr(hf_config, "kv_lora_rank", None)
         qk_rope_head_dim = getattr(hf_config, "qk_rope_head_dim", None)
-        if (kv_lora_rank, qk_rope_head_dim) != (512, 64):
+        qk_nope_head_dim = getattr(hf_config, "qk_nope_head_dim", None)
+        dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        nope = qk_rope_head_dim == 0
+        if nope:
+            # Rope-less MLA: the decode kernel takes the 512 latent as q=None and
+            # the prefill lane's trtllm-gen kernel ships only the (256, 0, 256) shape.
+            if (kv_lora_rank, qk_nope_head_dim) != (512, 256):
+                return (
+                    "FA4 sparse MLA with qk_rope_head_dim=0 requires kv_lora_rank=512 "
+                    f"and qk_nope_head_dim=256, got {kv_lora_rank} and "
+                    f"{qk_nope_head_dim}"
+                )
+            if dcp_size > 1:
+                return "FA4 sparse MLA does not support DCP with qk_rope_head_dim=0 yet"
+            if vllm_config.attention_config.hisparse_config is not None:
+                return (
+                    "FA4 sparse MLA does not support HiSparse with "
+                    "qk_rope_head_dim=0 yet"
+                )
+        elif (kv_lora_rank, qk_rope_head_dim) != (512, 64):
             return (
                 "FA4 sparse MLA requires kv_lora_rank=512 and qk_rope_head_dim=64, "
                 f"got {kv_lora_rank} and {qk_rope_head_dim}"
             )
-
         # The prefill lane's trtllm-gen sparse kernel takes only these.
-        qk_nope_head_dim = getattr(hf_config, "qk_nope_head_dim", None)
-        if qk_nope_head_dim not in (128, 192):
+        elif qk_nope_head_dim not in (128, 192):
             return (
                 "FA4 sparse MLA requires qk_nope_head_dim in [128, 192], "
                 f"got {qk_nope_head_dim}"
@@ -472,9 +490,9 @@ class FlashAttnMLASparseFA4Backend(AttentionBackend):
         num_heads = vllm_config.model_config.get_num_attention_heads(
             vllm_config.parallel_config
         )
-        dcp_size = vllm_config.parallel_config.decode_context_parallel_size
-        # 128 gathered heads take FA's prefill kernel, which is unvalidated under DCP.
-        head_counts = (8, 16, 32, 64) if dcp_size > 1 else (8, 16, 32, 64, 128)
+        # 128 gathered heads take FA's prefill kernel, which is unvalidated under DCP
+        # and, with q=None, unvalidated with a top-k gather at all.
+        head_counts = (8, 16, 32, 64) if dcp_size > 1 or nope else (8, 16, 32, 64, 128)
         if num_heads * dcp_size not in head_counts:
             counts = ", ".join(str(h) for h in head_counts)
             if dcp_size == 1:
@@ -646,7 +664,7 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata])
             out, lse = self._decode(ql_nope, q_pe, kv_rows, topk_indices, valid_counts)
         else:
             out, lse = self._prefill(
-                q_fused if q_fused is not None else torch.cat((ql_nope, q_pe), dim=-1),
+                q_fused if q_fused is not None else self._fused_query(ql_nope, q_pe),
                 kv_c_and_k_pe_cache,
                 topk_indices,
                 valid_counts,
@@ -726,7 +744,7 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata])
                     return_valid_counts=True,
                 )
             out, _ = self._prefill(
-                torch.cat((ql_nope[num_decode_toks:], q_pe[num_decode_toks:]), dim=-1),
+                self._fused_query(ql_nope[num_decode_toks:], q_pe[num_decode_toks:]),
                 prefill_cache,
                 physical_topk,
                 valid_counts,
@@ -734,6 +752,12 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata])
             outputs.append(out)
 
         return (torch.cat(outputs) if len(outputs) > 1 else outputs[0]), None
+
+    def _fused_query(self, ql_nope: torch.Tensor, q_pe: torch.Tensor) -> torch.Tensor:
+        """The ``[T, H, kv_lora_rank + qk_rope_head_dim]`` query of the trtllm lane."""
+        if self.qk_rope_head_dim == 0 and ql_nope.is_contiguous():
+            return ql_nope
+        return torch.cat((ql_nope, q_pe), dim=-1)
 
     def _decode(
         self,
@@ -748,10 +772,13 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata])
         cu_seqlens_q, cu_seqlens_k, seqused_k = _fa4_varlen_scalars(
             self.max_varlen_tokens, num_kv_rows, kv_rows.device
         )
+        # Rope-less MLA (qk_rope_head_dim 0): the kernel takes the latent alone as
+        # q_v with q=None, k=None; head_dim comes from q_v and the scale is passed.
+        nope = self.qk_rope_head_dim == 0
         # An all-sentinel row yields (0, -inf), the DCP merge identity; no post-masking.
         kernel_out = flash_attn_varlen_func(
-            q=q_pe,
-            k=kv_rows[:, self.kv_lora_rank :].unsqueeze(1),
+            q=None if nope else q_pe,
+            k=None if nope else kv_rows[:, self.kv_lora_rank :].unsqueeze(1),
             v=kv_rows[:, : self.kv_lora_rank].unsqueeze(1),
             q_v=ql_nope,
             max_seqlen_q=1,
@@ -782,11 +809,27 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata])
         topk_indices: torch.Tensor,
         valid_counts: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """``kv_cache`` is any contiguous ``[blocks, block_size, 576]`` BF16 tensor."""
+        """``kv_cache``: contiguous ``[blocks, block_size, head_size]``, BF16."""
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
 
         if self._workspace_buffer is None:
             self._workspace_buffer = _get_workspace_buffer(query.device)
+        nope = self.qk_rope_head_dim == 0
+        # Only the consumers below need it; the DeepSeek path without DCP skips it.
+        empty_rows = (
+            valid_counts == 0 if nope or self.need_to_return_lse_for_decode else None
+        )
+        extra: dict[str, torch.Tensor] = {}
+        if nope:
+            # trtllm-gen's rope-less kernel takes the active length per token and
+            # rejects zero-length rows: give those one dummy slot (row 0, length 1)
+            # and remask them below. The write goes to the index group's shared
+            # buffer, converted once at layer 0 and read by every layer of the
+            # group; it is idempotent and valid_counts is never touched, so each
+            # layer sees the same empty rows and remasks its own output.
+            assert empty_rows is not None
+            topk_indices[:, 0] = topk_indices[:, 0].masked_fill(empty_rows, 0)
+            extra["sparse_mla_top_k_lens"] = valid_counts.clamp(min=1)
         # BF16 KV only, so bmm1 is the plain softmax scale and bmm2 is 1.0.
         kernel_out = trtllm_batch_decode_with_kv_cache_mla(
             query=query.unsqueeze(1),
@@ -802,6 +845,7 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata])
             bmm2_scale=1.0,
             sparse_mla_top_k=topk_indices.shape[1],
             return_lse=self.need_to_return_lse_for_decode,
+            **extra,
         )
         if self.need_to_return_lse_for_decode:
             assert isinstance(kernel_out, tuple)
@@ -817,10 +861,12 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata])
             )
             # trtllm-gen returns a base-2 LSE; this impl declares base e.
             lse = lse * math.log(2.0)
-            # Rows this rank owns no slot for: the DCP merge identity.
-            empty_rows = valid_counts == 0
+        # Rows this rank owns no slot for (DCP), or that took the dummy slot above:
+        # the merge identity (0, -inf).
+        if empty_rows is not None:
             out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
-            lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+            if lse is not None:
+                lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
         return out, lse
 
     def autotune_hisparse_decode(self, layer: AttentionLayer) -> None:

@@ -108,14 +108,16 @@ def _get_backend_priorities(
                 # BF16 KV Cache
                 # Prefer FA4, then FlashInfer, at low head counts (FlashMLA pads heads).
                 # Under HiSparse FA4 trails FlashInfer by 3-7% on decode ITL at
-                # 32K context (GLM-5.2 NVFP4, TP4 and TP8), so the order flips there.
+                # 32K context (GLM-5.2 NVFP4, TP4 and TP8), so the order flips there,
+                # and for the rope-less head size 512 (GLM-5.3-Flash) FlashInfer
+                # stays first until the FA4 kernel is measured faster there.
                 if num_heads is not None and num_heads <= 16:
                     sparse_backends = [
                         AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE_FA4,
                         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
                         AttentionBackendEnum.FLASHMLA_SPARSE,
                     ]
-                    if use_hisparse:
+                    if use_hisparse or head_size == 512:
                         sparse_backends[0], sparse_backends[1] = (
                             sparse_backends[1],
                             sparse_backends[0],

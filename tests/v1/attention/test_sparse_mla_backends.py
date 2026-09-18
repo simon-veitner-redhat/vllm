@@ -3378,10 +3378,15 @@ def _fa4_impl(**fields):
     return stub
 
 
-def _fa4_inputs(counts, *, num_heads=16, topk=128, num_blocks=4, device=DEVICE_TYPE):
-    """Decode inputs whose token ``i`` has ``counts[i]`` valid rows, -1 padded."""
+def _fa4_inputs(
+    counts, *, num_heads=16, topk=128, num_blocks=4, device=DEVICE_TYPE, rope_dim=64
+):
+    """Decode inputs whose token ``i`` has ``counts[i]`` valid rows, -1 padded.
+
+    ``rope_dim=0`` is the rope-less GLM-5.3-Flash shape: 512-wide rows and queries.
+    """
     device = torch.device(device)
-    block_size, kv_lora_rank, rope_dim = 64, 512, 64
+    block_size, kv_lora_rank = 64, 512
     num_tokens = len(counts)
     torch.manual_seed(0)
 
@@ -3433,7 +3438,7 @@ def _record_fa4_kernels(monkeypatch, num_heads, *, device):
 
     def fake_fa4(**kwargs):
         fa4_calls.append(kwargs)
-        rows = kwargs["q"].shape[0]
+        rows = kwargs["q_v"].shape[0]
         out = torch.ones(rows, num_heads, 512, dtype=torch.bfloat16, device=device)
         return (out, lse(rows)) if kwargs.get("return_softmax_lse") else out
 
@@ -3453,20 +3458,35 @@ def _record_fa4_kernels(monkeypatch, num_heads, *, device):
 
 
 @pytest.mark.parametrize(
-    "num_heads,return_lse", [(128, False), (16, True)], ids=["heads128", "heads16_lse"]
+    "num_heads,return_lse,rope_dim,topk,repeat",
+    [
+        (128, False, 64, 2048, 1),
+        (16, True, 64, 2048, 1),
+        # GLM-5.3-Flash at TP4: rope-less, the kpool-widened 2176 buffer, both
+        # per-CTA head bands of the kernel (h=8 below 75 tokens, h=16 from 75 on).
+        (16, False, 0, 2176, 1),
+        (16, False, 0, 2176, 12),
+    ],
+    ids=["heads128", "heads16_lse", "glm_nope_h8", "glm_nope_h16"],
 )
-def test_fa4_sparse_decode_kernel_correctness(num_heads, return_lse):
+def test_fa4_sparse_decode_kernel_correctness(
+    num_heads, return_lse, rope_dim, topk, repeat
+):
     from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
         FlashAttnMLASparseFA4Impl,
     )
 
     _require_fa4()
-    counts = [0, 1, 127, 128, 129, 2047, 2048]
-    inputs = _fa4_inputs(counts, num_heads=num_heads, topk=2048, num_blocks=64)
+    counts = [0, 1, 127, 128, 129, 2047, min(2051, topk)] * repeat
+    inputs = _fa4_inputs(
+        counts, num_heads=num_heads, topk=topk, num_blocks=64, rope_dim=rope_dim
+    )
     impl = _fa4_impl(
         topk_indices_buffer=inputs.topk_indices,
         scale=inputs.scale,
         need_to_return_lse_for_decode=return_lse,
+        qk_rope_head_dim=rope_dim,
+        qk_nope_head_dim=256 if rope_dim == 0 else 128,
     )
     q = (inputs.ql_nope, inputs.q_pe)
 
@@ -3503,19 +3523,63 @@ def test_fa4_sparse_decode_kernel_correctness(num_heads, return_lse):
         )
 
 
-@pytest.mark.parametrize("dcp", [1, 2], ids=["native", "dcp2"])
+def test_fa4_sparse_prefill_nope_real_kernel():
+    """The trtllm-gen rope-less fallback: dummy slot, per-token lengths, remask."""
+    from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
+        FlashAttnMLASparseFA4Impl,
+    )
+
+    _require_fa4()
+    counts = [0, 1, 127, 128, 129, 2047, 2051]
+    inputs = _fa4_inputs(counts, num_heads=16, topk=2176, num_blocks=64, rope_dim=0)
+    impl = _fa4_impl(
+        topk_indices_buffer=inputs.topk_indices,
+        scale=inputs.scale,
+        qk_rope_head_dim=0,
+        qk_nope_head_dim=256,
+        _workspace_buffer=None,
+    )
+    valid_counts = inputs.valid_counts.clone()
+    kv_flat = inputs.kv_cache.view(-1, inputs.kv_lora_rank)
+    keys = kv_flat[inputs.topk_indices.clamp(min=0).long()].float()
+    scores = torch.einsum("thd,tkd->thk", inputs.ql_nope.float(), keys)
+    scores = (scores * inputs.scale).masked_fill(
+        (inputs.topk_indices < 0)[:, None, :], float("-inf")
+    )
+    probs = torch.softmax(scores, dim=-1).nan_to_num()
+    expected = torch.einsum("thk,tkd->thd", probs, keys)
+
+    with torch.inference_mode():
+        for _ in range(2):  # a second layer of the index group sees the same buffer
+            out, lse = FlashAttnMLASparseFA4Impl._prefill(
+                impl, inputs.ql_nope, inputs.kv_cache, inputs.topk_indices, valid_counts
+            )
+            assert lse is None
+            torch.testing.assert_close(out.float(), expected, rtol=0.01, atol=0.01)
+            assert (out[0] == 0).all()
+            assert valid_counts.tolist() == counts
+            assert inputs.topk_indices[0, 0] == 0
+            assert (inputs.topk_indices[0, 1:] == -1).all()
+
+
+@pytest.mark.parametrize(
+    "dcp,rope_dim", [(1, 64), (2, 64), (1, 0)], ids=["native", "dcp2", "nope"]
+)
 @pytest.mark.parametrize("num_decode_tokens", [7, 3])
-def test_fa4_sparse_routes_whole_batches(monkeypatch, num_decode_tokens, dcp):
+def test_fa4_sparse_routes_whole_batches(monkeypatch, num_decode_tokens, dcp, rope_dim):
     import vllm.v1.attention.backends.mla.flashattn_mla_sparse as fa4_sparse
     from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
         FlashAttnMLASparseFA4Impl,
     )
 
-    counts = [1, 2, 3, 4, 5, 6, 7]
+    # Rope-less: token 0 has no valid slot, which the trtllm lane must dummy-fill.
+    counts = [0 if rope_dim == 0 else 1, 2, 3, 4, 5, 6, 7]
     num_tokens = len(counts)
     # The query is all-gathered before forward_mqa: more heads than the impl's.
     kernel_heads = 16 * dcp
-    inputs = _fa4_inputs(counts, num_heads=kernel_heads, device="cpu")
+    inputs = _fa4_inputs(
+        counts, num_heads=kernel_heads, device="cpu", rope_dim=rope_dim
+    )
     inputs.metadata.num_decode_tokens = num_decode_tokens
     calls = _record_fa4_kernels(monkeypatch, kernel_heads, device="cpu")
     valid_counts = inputs.valid_counts.clone()
@@ -3542,6 +3606,9 @@ def test_fa4_sparse_routes_whole_batches(monkeypatch, num_decode_tokens, dcp):
         dcp_world_size=dcp,
         dcp_rank=dcp - 1,
         need_to_return_lse_for_decode=dcp > 1,
+        scale=inputs.scale,
+        qk_rope_head_dim=rope_dim,
+        qk_nope_head_dim=256 if rope_dim == 0 else 128,
     )
 
     with torch.inference_mode():
@@ -3568,9 +3635,16 @@ def test_fa4_sparse_routes_whole_batches(monkeypatch, num_decode_tokens, dcp):
         # Every token is its own one-row FA4 sequence, spec-decode rows included.
         assert fa4["max_seqlen_q"] == 1
         assert fa4["cu_seqlens_q"].tolist() == list(range(num_tokens + 1))
-        # The qv kernel takes the two halves, fused query or not.
-        assert fa4["q"].shape[-1] == inputs.rope_dim
-        assert fa4["q_v"].shape[-1] == inputs.kv_lora_rank
+        # The qv kernel takes the two halves, fused query or not; with no rope
+        # stream it takes the latent alone as q_v and q=None, k=None.
+        if rope_dim == 0:
+            assert fa4["q"] is None and fa4["k"] is None
+            assert fa4["q_v"] is inputs.ql_nope
+            assert fa4["v"].shape[-1] == inputs.kv_lora_rank
+            assert fa4["softmax_scale"] == inputs.scale
+        else:
+            assert fa4["q"].shape[-1] == inputs.rope_dim
+            assert fa4["q_v"].shape[-1] == inputs.kv_lora_rank
         assert (out == 1.0).all()
         if dcp > 1:
             # FA4's LSE is natural log already, so it is passed through untouched.
@@ -3581,8 +3655,27 @@ def test_fa4_sparse_routes_whole_batches(monkeypatch, num_decode_tokens, dcp):
     assert calls.fa4 == []
     assert trtllm["return_lse"] is (dcp > 1)
     assert trtllm["query"].shape[0] == num_tokens
+    assert trtllm["query"].shape[-1] == inputs.kv_lora_rank + inputs.rope_dim
     assert trtllm["seq_lens"] is valid_counts
     assert trtllm["sparse_mla_top_k"] == inputs.topk
+    if rope_dim == 0:
+        # trtllm-gen's rope-less kernel: per-token lengths clamped to one dummy slot
+        # (row 0) for the empty token, valid_counts untouched, the row remasked to
+        # zero even without an LSE; a second layer of the same index group sees the
+        # same (already dummy-filled) buffer and remasks again.
+        # No cat for a contiguous rope-less query: the lane sees a view of it.
+        assert trtllm["query"].data_ptr() == inputs.ql_nope.data_ptr()
+        assert trtllm["sparse_mla_top_k_lens"].tolist() == [max(c, 1) for c in counts]
+        assert valid_counts.tolist() == counts
+        assert inputs.topk_indices[0, 0] == 0
+        assert (out[0] == 0).all() and (out[1:] == 2.0).all()
+        out2, _ = FlashAttnMLASparseFA4Impl._prefill(
+            impl, inputs.ql_nope, inputs.kv_cache, inputs.topk_indices, valid_counts
+        )
+        assert (out2[0] == 0).all() and (out2[1:] == 2.0).all()
+        assert valid_counts.tolist() == counts
+        return
+    assert "sparse_mla_top_k_lens" not in trtllm
     if dcp == 1:
         assert (out == 2.0).all()
         return
@@ -3814,8 +3907,14 @@ def test_hisparse_autotune_dispatch_reaches_fa4():
     unbound.impl.autotune_hisparse_decode.assert_not_called()
 
 
-def _fa4_gate(local_heads, *, dcp_size=1, pcp_size=1, hisparse=False):
-    """``validate_configuration`` on a fixed SM100, not the running GPU's."""
+def _fa4_gate(
+    local_heads, *, dcp_size=1, pcp_size=1, hisparse=False, dims=(512, 64, 128)
+):
+    """``validate_configuration`` on a fixed SM100, not the running GPU's.
+
+    ``dims`` is ``(kv_lora_rank, qk_rope_head_dim, qk_nope_head_dim)``; the layer's
+    head size is the first two summed.
+    """
     vllm_config = create_vllm_config(
         model_name="deepseek-ai/DeepSeek-V2-Lite-Chat",
         tensor_parallel_size=1,
@@ -3823,11 +3922,12 @@ def _fa4_gate(local_heads, *, dcp_size=1, pcp_size=1, hisparse=False):
         block_size=64,
     )
     model_config = vllm_config.model_config
+    kv_lora_rank, qk_rope_head_dim, qk_nope_head_dim = dims
     model_config.hf_text_config = SimpleNamespace(
         index_topk=2048,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        qk_nope_head_dim=128,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        qk_nope_head_dim=qk_nope_head_dim,
     )
     model_config.get_num_attention_heads = MethodType(
         lambda self, parallel_config: local_heads, model_config
@@ -3839,7 +3939,7 @@ def _fa4_gate(local_heads, *, dcp_size=1, pcp_size=1, hisparse=False):
 
     with set_current_vllm_config(vllm_config):
         return FlashAttnMLASparseFA4Backend.validate_configuration(
-            head_size=576,
+            head_size=kv_lora_rank + qk_rope_head_dim,
             dtype=torch.bfloat16,
             kv_cache_dtype="auto",
             block_size=64,
@@ -3872,6 +3972,46 @@ def test_fa4_sparse_supports_head_counts(monkeypatch, local_heads, dcp_size, sup
         (reason,) = reasons
         assert "heads" in reason
         assert ("DCP-gathered" in reason) == (dcp_size > 1)
+
+
+@pytest.mark.parametrize(
+    "dims,local_heads,dcp_size,hisparse,reject",
+    [
+        ((512, 0, 256), 16, 1, False, None),
+        ((512, 0, 256), 64, 1, False, None),
+        ((512, 0, 256), 128, 1, False, "heads"),
+        ((512, 0, 128), 16, 1, False, "qk_nope_head_dim=256"),
+        ((512, 0, 256), 16, 2, False, "DCP"),
+        ((512, 0, 256), 16, 1, True, "HiSparse"),
+        ((512, 64, 256), 16, 1, False, "qk_nope_head_dim in [128, 192]"),
+        ((256, 0, 256), 16, 1, False, "head_size"),
+    ],
+    ids=[
+        "glm_tp4",
+        "glm_tp1",
+        "nope_128_heads",
+        "nope_128",
+        "nope_dcp",
+        "nope_hisparse",
+        "rope_256",
+        "256",
+    ],
+)
+def test_fa4_sparse_gates_rope_less_dims(
+    monkeypatch, dims, local_heads, dcp_size, hisparse, reject
+):
+    """Rope-less MLA is admitted only at the (512, 0, 256) shape trtllm-gen ships."""
+    import vllm.v1.attention.backends.mla.flashattn_mla_sparse as fa4_sparse
+
+    monkeypatch.setattr("vllm.utils.flashinfer.has_flashinfer", lambda: True)
+    monkeypatch.setattr(fa4_sparse, "_fa4_cute_mla_available", lambda: None)
+
+    reasons = _fa4_gate(local_heads, dcp_size=dcp_size, dims=dims, hisparse=hisparse)
+
+    if reject is None:
+        assert reasons == []
+    else:
+        assert any(reject in reason for reason in reasons), reasons
 
 
 @pytest.mark.parametrize(
