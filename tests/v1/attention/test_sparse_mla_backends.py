@@ -3381,10 +3381,7 @@ def _fa4_impl(**fields):
 def _fa4_inputs(
     counts, *, num_heads=16, topk=128, num_blocks=4, device=DEVICE_TYPE, rope_dim=64
 ):
-    """Decode inputs whose token ``i`` has ``counts[i]`` valid rows, -1 padded.
-
-    ``rope_dim=0`` is the rope-less GLM-5.3-Flash shape: 512-wide rows and queries.
-    """
+    """Decode inputs whose token ``i`` has ``counts[i]`` valid rows, -1 padded."""
     device = torch.device(device)
     block_size, kv_lora_rank = 64, 512
     num_tokens = len(counts)
@@ -3659,11 +3656,9 @@ def test_fa4_sparse_routes_whole_batches(monkeypatch, num_decode_tokens, dcp, ro
     assert trtllm["seq_lens"] is valid_counts
     assert trtllm["sparse_mla_top_k"] == inputs.topk
     if rope_dim == 0:
-        # trtllm-gen's rope-less kernel: per-token lengths clamped to one dummy slot
-        # (row 0) for the empty token, valid_counts untouched, the row remasked to
-        # zero even without an LSE; a second layer of the same index group sees the
-        # same (already dummy-filled) buffer and remasks again.
-        # No cat for a contiguous rope-less query: the lane sees a view of it.
+        # Per-token lengths with one dummy slot (row 0) for the empty token, the row
+        # remasked to zero without an LSE, valid_counts untouched; a second layer of the
+        # index group sees the same buffer. No cat for a contiguous rope-less query.
         assert trtllm["query"].data_ptr() == inputs.ql_nope.data_ptr()
         assert trtllm["sparse_mla_top_k_lens"].tolist() == [max(c, 1) for c in counts]
         assert valid_counts.tolist() == counts
@@ -3910,11 +3905,7 @@ def test_hisparse_autotune_dispatch_reaches_fa4():
 def _fa4_gate(
     local_heads, *, dcp_size=1, pcp_size=1, hisparse=False, dims=(512, 64, 128)
 ):
-    """``validate_configuration`` on a fixed SM100, not the running GPU's.
-
-    ``dims`` is ``(kv_lora_rank, qk_rope_head_dim, qk_nope_head_dim)``; the layer's
-    head size is the first two summed.
-    """
+    """``validate_configuration`` on a fixed SM100, not the running GPU's."""
     vllm_config = create_vllm_config(
         model_name="deepseek-ai/DeepSeek-V2-Lite-Chat",
         tensor_parallel_size=1,
@@ -3986,16 +3977,7 @@ def test_fa4_sparse_supports_head_counts(monkeypatch, local_heads, dcp_size, sup
         ((512, 64, 256), 16, 1, False, "qk_nope_head_dim in [128, 192]"),
         ((256, 0, 256), 16, 1, False, "head_size"),
     ],
-    ids=[
-        "glm_tp4",
-        "glm_tp1",
-        "nope_128_heads",
-        "nope_128",
-        "nope_dcp",
-        "nope_hisparse",
-        "rope_256",
-        "256",
-    ],
+    ids=["tp4", "tp1", "heads128", "nope128", "dcp", "hisparse", "rope256", "lora256"],
 )
 def test_fa4_sparse_gates_rope_less_dims(
     monkeypatch, dims, local_heads, dcp_size, hisparse, reject

@@ -381,8 +381,8 @@ class FlashAttnMLASparseFA4Backend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        # 512 latent + 64 RoPE, split back apart for the qv kernel; 512 is the
-        # rope-less latent alone (GLM-5.3-Flash), which the kernel takes as q=None.
+        # 512 latent + 64 RoPE, split back apart for the qv kernel; 512 is the latent
+        # alone (rope-less MLA), which the kernel takes as q=None.
         return [512, 576]
 
     @classmethod
@@ -467,13 +467,8 @@ class FlashAttnMLASparseFA4Backend(AttentionBackend):
                     f"and qk_nope_head_dim=256, got {kv_lora_rank} and "
                     f"{qk_nope_head_dim}"
                 )
-            if dcp_size > 1:
-                return "FA4 sparse MLA does not support DCP with qk_rope_head_dim=0 yet"
-            if vllm_config.attention_config.hisparse_config is not None:
-                return (
-                    "FA4 sparse MLA does not support HiSparse with "
-                    "qk_rope_head_dim=0 yet"
-                )
+            if dcp_size > 1 or vllm_config.attention_config.hisparse_config is not None:
+                return "Rope-less FA4 sparse MLA supports neither DCP nor HiSparse"
         elif (kv_lora_rank, qk_rope_head_dim) != (512, 64):
             return (
                 "FA4 sparse MLA requires kv_lora_rank=512 and qk_rope_head_dim=64, "
@@ -772,8 +767,7 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata])
         cu_seqlens_q, cu_seqlens_k, seqused_k = _fa4_varlen_scalars(
             self.max_varlen_tokens, num_kv_rows, kv_rows.device
         )
-        # Rope-less MLA (qk_rope_head_dim 0): the kernel takes the latent alone as
-        # q_v with q=None, k=None; head_dim comes from q_v and the scale is passed.
+        # Rope-less MLA: the kernel takes the latent alone as q_v, with q=None, k=None.
         nope = self.qk_rope_head_dim == 0
         # An all-sentinel row yields (0, -inf), the DCP merge identity; no post-masking.
         kernel_out = flash_attn_varlen_func(
@@ -823,10 +817,9 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata])
         if nope:
             # trtllm-gen's rope-less kernel takes the active length per token and
             # rejects zero-length rows: give those one dummy slot (row 0, length 1)
-            # and remask them below. The write goes to the index group's shared
-            # buffer, converted once at layer 0 and read by every layer of the
-            # group; it is idempotent and valid_counts is never touched, so each
-            # layer sees the same empty rows and remasks its own output.
+            # and remask them below. The write into the index group's shared buffer
+            # is idempotent and leaves valid_counts alone, so every layer of the
+            # group sees the same empty rows and remasks its own output.
             assert empty_rows is not None
             topk_indices[:, 0] = topk_indices[:, 0].masked_fill(empty_rows, 0)
             extra["sparse_mla_top_k_lens"] = valid_counts.clamp(min=1)
@@ -861,8 +854,7 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[FlashAttnMLASparseMetadata])
             )
             # trtllm-gen returns a base-2 LSE; this impl declares base e.
             lse = lse * math.log(2.0)
-        # Rows this rank owns no slot for (DCP), or that took the dummy slot above:
-        # the merge identity (0, -inf).
+        # Rows with no slot (DCP) or the dummy slot above: the merge identity (0, -inf).
         if empty_rows is not None:
             out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
             if lse is not None:

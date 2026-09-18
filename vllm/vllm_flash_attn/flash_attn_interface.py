@@ -174,8 +174,8 @@ def get_scheduler_metadata(
 
 
 def flash_attn_varlen_func(
-    q: "torch.Tensor | None",
-    k: "torch.Tensor | None",
+    q,
+    k,
     v,
     max_seqlen_q,
     cu_seqlens_q,
