@@ -107,11 +107,20 @@ def _get_backend_priorities(
                 # BF16 KV Cache
                 # Prefer FA4, then FlashInfer at low head counts (FlashMLA uses padding)
                 if num_heads is not None and num_heads <= 16:
-                    sparse_backends = [
-                        AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE_FA4,
-                        AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
-                        AttentionBackendEnum.FLASHMLA_SPARSE,
-                    ]
+                    if head_size == 512:
+                        # Rope-less MLA (no RoPE dim): FlashInfer stays ahead of
+                        # FA4 until FA4 measures faster on that shape.
+                        sparse_backends = [
+                            AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+                            AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE_FA4,
+                            AttentionBackendEnum.FLASHMLA_SPARSE,
+                        ]
+                    else:
+                        sparse_backends = [
+                            AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE_FA4,
+                            AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+                            AttentionBackendEnum.FLASHMLA_SPARSE,
+                        ]
                 else:
                     sparse_backends = [
                         AttentionBackendEnum.FLASHMLA_SPARSE,

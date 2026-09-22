@@ -267,7 +267,9 @@ def flash_attn_varlen_func(
            sequence. Mutually exclusive with cu_seqlens_k, and required when
            block_table is given.
         q_v: (total_q, nheads, headdim_v). MLA-absorbed queries; the kernel computes
-            softmax(scale * (q @ k.T + q_v @ v.T)) @ v. FA3 and FA4 only.
+            softmax(scale * (q @ k.T + q_v @ v.T)) @ v. FA3 and FA4 only. With
+            q=None and k=None (FA4 only) there is no rope stream: q_v is the whole
+            query, v the whole KV row, and softmax_scale is required.
         block_table: (batch_size, max_blocks_per_seq), dtype torch.int32. Paged KV
            cache block table. Requires seqused_k.
         return_softmax_lse: bool. Whether to also return softmax_lse.
@@ -324,8 +326,12 @@ def flash_attn_varlen_func(
     assert fa_version == 4 or (
         gather_kv_indices is None and gather_kv_valid_length is None
     ), f"gather_kv_* is only supported by FA4, got fa_version={fa_version}"
+    assert q is not None or (fa_version == 4 and k is None and q_v is not None), (
+        "q=None is only the FA4 rope-less q_v path (k=None, q_v given)"
+    )
 
     if softmax_scale is None:
+        assert q is not None, "softmax_scale is required when q is None"
         softmax_scale = q.shape[-1] ** (-0.5)
     # custom op does not support non-tuple input
     real_window_size: tuple[int, int]

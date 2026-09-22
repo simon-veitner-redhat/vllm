@@ -14,19 +14,23 @@ FLASHMLA = AttentionBackendEnum.FLASHMLA_SPARSE
 
 
 @pytest.mark.parametrize(
-    "num_heads,kv_cache_dtype,expected",
+    "num_heads,kv_cache_dtype,head_size,expected",
     [
-        (16, "auto", [FA4, FLASHINFER, FLASHMLA]),
-        (32, "auto", [FLASHMLA, FLASHINFER]),
-        (16, "fp8_ds_mla", [FLASHINFER, FLASHMLA]),
+        (16, "auto", 576, [FA4, FLASHINFER, FLASHMLA]),
+        # Rope-less MLA (GLM-5.3-Flash): FlashInfer first until FA4 wins there.
+        (16, "auto", 512, [FLASHINFER, FA4, FLASHMLA]),
+        (32, "auto", 512, [FLASHMLA, FLASHINFER]),
+        (32, "auto", 576, [FLASHMLA, FLASHINFER]),
+        (16, "fp8_ds_mla", 576, [FLASHINFER, FLASHMLA]),
     ],
 )
-def test_sparse_backend_priority(num_heads, kv_cache_dtype, expected):
+def test_sparse_backend_priority(num_heads, kv_cache_dtype, head_size, expected):
     priorities = _get_backend_priorities(
         use_mla=True,
         device_capability=DeviceCapability(major=10, minor=0),
         num_heads=num_heads,
         kv_cache_dtype=kv_cache_dtype,
+        head_size=head_size,
     )
 
     assert [b for b in priorities if b in (FA4, FLASHINFER, FLASHMLA)] == expected
