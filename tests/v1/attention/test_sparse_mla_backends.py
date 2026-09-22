@@ -3768,11 +3768,21 @@ def _record_fa4_kernels(monkeypatch, num_heads, *, device):
         # per-CTA head bands of the kernel (h=8 below 75 tokens, h=16 from 75 on).
         (16, False, 0, 2176, 1),
         (16, False, 0, 2176, 12),
+        # Under DCP the rope-less lane also returns its natural-log LSE.
+        (16, True, 0, 2176, 1),
         # The other head counts the rope-less gate admits (TP2, TP1).
         (32, False, 0, 2176, 1),
         (64, False, 0, 2176, 1),
     ],
-    ids=["heads128", "heads16_lse", "glm_nope_h8", "glm_nope_h16", "nope32", "nope64"],
+    ids=[
+        "heads128",
+        "heads16_lse",
+        "glm_nope_h8",
+        "glm_nope_h16",
+        "glm_nope_lse",
+        "nope32",
+        "nope64",
+    ],
 )
 def test_fa4_sparse_decode_kernel_correctness(
     num_heads, return_lse, rope_dim, topk, repeat
@@ -3823,14 +3833,23 @@ def test_fa4_sparse_decode_kernel_correctness(
         torch.testing.assert_close(lse, lse_fused, rtol=0, atol=2e-3)
 
 
-def test_fa4_sparse_prefill_nope_real_kernel():
-    """The trtllm-gen rope-less fallback: dummy slot, per-token lengths, remask."""
+@pytest.mark.parametrize("return_lse", [False, True], ids=["nolse", "lse"])
+def test_fa4_sparse_prefill_nope_real_kernel(return_lse):
+    """The trtllm-gen rope-less fallback, with and without the DCP LSE:
+    dummy slot, per-token lengths, remask.
+
+    log(count) dominates the LSE reference, so every row pins the ln-vs-log2
+    conversion and the empty-row identity. Per-head detail rides on the short
+    rows (count=1 spreads ~0.27 across heads, count~128 ~0.02); by count~2048
+    the spread is down at the 5e-3 tolerance, so those rows pin only log(count).
+    """
     _require_fa4()
     counts = [0, 1, 127, 128, 129, 2047, 2051]
     inputs = _fa4_inputs(counts, num_heads=16, topk=2176, num_blocks=64, rope_dim=0)
     impl = _fa4_impl(
         topk_indices_buffer=inputs.topk_indices,
         scale=inputs.scale,
+        need_to_return_lse_for_decode=return_lse,
         qk_rope_head_dim=0,
         qk_nope_head_dim=256,
     )
@@ -3844,18 +3863,28 @@ def test_fa4_sparse_prefill_nope_real_kernel():
     expected = torch.einsum(
         "thk,tkd->thd", torch.softmax(scores, dim=-1).nan_to_num(), keys
     )
+    # The DCP merge consumes a natural-log LSE; row 0 is -inf by construction.
+    expected_lse = torch.logsumexp(scores, dim=-1)
 
     with torch.inference_mode():
         for _ in range(2):  # a second layer of the index group sees the same buffer
             out, lse = FlashAttnMLASparseFA4Impl._prefill(
                 impl, inputs.ql_nope, inputs.kv_cache, inputs.topk_indices, valid_counts
             )
-            assert lse is None
             torch.testing.assert_close(out.float(), expected, rtol=0.01, atol=0.01)
             assert (out[0] == 0).all()
             assert valid_counts.tolist() == counts
             assert inputs.topk_indices[0, 0] == 0
             assert (inputs.topk_indices[0, 1:] == -1).all()
+            if not return_lse:
+                assert lse is None
+                continue
+            assert lse.shape == (len(counts), 16)
+            assert lse.dtype == torch.float32
+            assert not lse.isnan().any()
+            # The dummy slot's row carries no weight into the merge.
+            assert torch.isneginf(lse[0]).all()
+            torch.testing.assert_close(lse[1:], expected_lse[1:], rtol=0, atol=5e-3)
 
 
 def test_fa4_varlen_guards_the_ropeless_call():
@@ -3882,7 +3911,9 @@ def test_fa4_varlen_guards_the_ropeless_call():
 
 
 @pytest.mark.parametrize(
-    "dcp,rope_dim", [(1, 64), (2, 64), (1, 0)], ids=["native", "dcp2", "nope"]
+    "dcp,rope_dim",
+    [(1, 64), (2, 64), (1, 0), (2, 0)],
+    ids=["native", "dcp2", "nope", "nope_dcp2"],
 )
 @pytest.mark.parametrize("is_decode", [True, False])
 def test_fa4_sparse_hook_routes_lanes(monkeypatch, is_decode, dcp, rope_dim):
@@ -3906,6 +3937,17 @@ def test_fa4_sparse_hook_routes_lanes(monkeypatch, is_decode, dcp, rope_dim):
         inputs.topk_indices[0] = -1
         # DCP without PCP (the gate rejects the pair) always fuses the query.
         q = torch.cat(q, dim=-1)
+    # Rope-less both lanes take the latent alone.
+    latent = q[..., : inputs.kv_lora_rank] if dcp > 1 else inputs.ql_nope
+
+    def assert_is_latent(t, *, exact=False):
+        # Under DCP the latent is a slice of the fused query, so only the storage
+        # can match. Off DCP the decode lane forwards the tensor itself, while
+        # the prefill lane hands trtllm-gen a view of it.
+        assert t.data_ptr() == latent.data_ptr()
+        if exact and dcp == 1:
+            assert t is latent
+
     impl = _fa4_impl(
         topk_indices_buffer=inputs.topk_indices,
         dcp_world_size=dcp,
@@ -3949,7 +3991,8 @@ def test_fa4_sparse_hook_routes_lanes(monkeypatch, is_decode, dcp, rope_dim):
         # stream it takes the latent alone as q_v, with q=None and k=None.
         if rope_dim == 0:
             assert fa4["q"] is None and fa4["k"] is None
-            assert fa4["q_v"] is inputs.ql_nope
+            assert_is_latent(fa4["q_v"], exact=True)
+            assert fa4["q_v"].shape[-1] == inputs.kv_lora_rank
             assert fa4["v"].shape[-1] == inputs.kv_lora_rank
             assert fa4["softmax_scale"] == inputs.scale
         else:
@@ -3971,17 +4014,27 @@ def test_fa4_sparse_hook_routes_lanes(monkeypatch, is_decode, dcp, rope_dim):
     assert trtllm["sparse_mla_top_k"] == inputs.topk
     # The lane runs on the shared buffer the builder pre-sizes under DCP.
     assert trtllm["workspace_buffer"] is _get_workspace_buffer(torch.device("cpu"))
+    if dcp > 1:
+        # trtllm-gen's log2 LSE, converted for the merge. Token 0 owns no slot on
+        # this rank, so out and lse come back as the merge identity.
+        expected = calls.lse(num_tokens) * math.log(2.0)
+        torch.testing.assert_close(lse[1:], expected[1:], rtol=0, atol=1e-5)
+        assert torch.isneginf(lse[0]).all()
+        assert (out[0] == 0).all() and (out[1:] == 2.0).all()
     if rope_dim == 0:
-        # Per-token lengths with one dummy slot (row 0) for the empty token, that row
-        # remasked to zero without an LSE and valid_counts left alone, so a second
-        # layer of the index group repeats it. No cat for a contiguous latent query.
-        assert trtllm["query"].data_ptr() == inputs.ql_nope.data_ptr()
+        # Per-token lengths with one dummy slot (row 0) for the empty token, that
+        # row remasked to zero and valid_counts left alone, so a second layer of
+        # the index group repeats it. No cat for a contiguous latent query.
+        assert_is_latent(trtllm["query"])
+        # Width too: under DCP the pointer alone admits any prefix of the fused q.
+        assert trtllm["query"].shape[-1] == inputs.kv_lora_rank
         assert trtllm["sparse_mla_top_k_lens"].tolist() == [max(c, 1) for c in counts]
         assert valid_counts.tolist() == counts
         assert inputs.topk_indices[0, 0] == 0
-        assert (out[0] == 0).all() and (out[1:] == 2.0).all()
+        if dcp == 1:  # the DCP arm asserted this with its LSE above
+            assert (out[0] == 0).all() and (out[1:] == 2.0).all()
         out2, _ = FlashAttnMLASparseFA4Impl._prefill(
-            impl, inputs.ql_nope, inputs.kv_cache, inputs.topk_indices, valid_counts
+            impl, latent, inputs.kv_cache, inputs.topk_indices, valid_counts
         )
         assert (out2[0] == 0).all() and (out2[1:] == 2.0).all()
         assert valid_counts.tolist() == counts
@@ -3990,13 +4043,6 @@ def test_fa4_sparse_hook_routes_lanes(monkeypatch, is_decode, dcp, rope_dim):
     assert trtllm["query"].shape[-1] == inputs.kv_lora_rank + inputs.rope_dim
     if dcp == 1:
         assert (out == 2.0).all()
-        return
-    expected = calls.lse(num_tokens) * math.log(2.0)
-    torch.testing.assert_close(lse[1:], expected[1:], rtol=0, atol=1e-5)
-    assert (out[1:] == 2.0).all()
-    # Token 0 owns no slot on this rank: the DCP merge identity.
-    assert (out[0] == 0).all()
-    assert torch.isneginf(lse[0]).all()
 
 
 def test_fa4_sparse_autotune_hisparse_decode_runs_decode_lane(monkeypatch):

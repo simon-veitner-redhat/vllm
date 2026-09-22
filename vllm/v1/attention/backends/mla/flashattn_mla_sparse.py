@@ -294,6 +294,12 @@ class FlashAttnMLASparseFA4Backend(FlashInferMLASparseTRTLLMBackend):
                 )
             # Rope-less MLA drives both lanes with q=None; that is validated
             # against neither a context-parallel merge nor a HiSparse hot buffer.
+            # The DCP lane is unit-covered but has never run a token: the only
+            # rope-less model, GLM-5.3-Flash, compresses KV (tokens_per_state=4)
+            # and the shared indexer refuses DCP under any compression, so
+            # refusing here keeps a readable reason instead of a
+            # NotImplementedError four ranks deep. An uncompressed rope-less
+            # model would clear the indexer and reach the merge untested.
             nope = dims[1] == 0
             pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
             if nope and (dcp_size > 1 or pcp_size > 1):
