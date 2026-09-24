@@ -2702,6 +2702,10 @@ def get_kv_cache_configs(
     # When speculating with more than 1 speculative module (e.g. multi-layered MTP)
     # tag every SlidingWindowSpec with how many extra tokens to retain in the window.
     extra_retained_tokens = max(0, vllm_config.num_prefill_lookahead_tokens - 1)
+    if vllm_config.kv_transfer_config is not None:
+        # A KV consumer recomputes the last loaded prompt token, whose window
+        # starts one token below the next token's; the producer must hold it.
+        extra_retained_tokens += 1
     for layer_name, layer_spec in merged_kv_cache_specs.items():
         if isinstance(layer_spec, SlidingWindowSpec):
             merged_kv_cache_specs[layer_name] = replace(
