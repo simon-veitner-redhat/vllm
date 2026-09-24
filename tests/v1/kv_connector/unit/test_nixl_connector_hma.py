@@ -2391,20 +2391,24 @@ def test_push_write_hybrid_mla_replicates_attention():
 # so for a prompt of N tokens it loads floor(N / 64) * 64 of them, while the
 # prefiller (P) exports the blocks of all N.
 _PD_WINDOW = 128
+_PD_SWA_BLOCK_SIZE = 32
 
 
-def _dsv4_pd_kv_cache_config(bounded_replay: bool, num_swa_groups: int = 1):
+def _dsv4_pd_kv_cache_config(
+    bounded_replay: bool, num_swa_groups: int = 1, extra_retained_tokens: int = 0
+):
     from vllm.v1.kv_cache_interface import CircularBufferSpec, SlidingWindowMLASpec
 
     swa_groups = [
         KVCacheGroupSpec(
             [f"swa{i}"],
             SlidingWindowMLASpec(
-                block_size=32,
+                block_size=_PD_SWA_BLOCK_SIZE,
                 num_kv_heads=1,
                 head_size=64,
                 dtype=torch.bfloat16,
                 sliding_window=_PD_WINDOW,
+                extra_retained_tokens=extra_retained_tokens,
                 bounded_replay=bounded_replay,
             ),
         )
@@ -2436,11 +2440,11 @@ def _prefill_block_ids(kv_cache_config, num_tokens: int):
 
     Block ``i`` of group ``g`` is ``1000 * (g + 1) + i``, so an ID names the
     token span it holds. Sliding-window blocks below the window of the next
-    token are freed (null, ID 0), and the list is clipped to its last
-    ``cdiv(window, block_size) + 1`` entries. This is the shape the prefiller
-    was observed to send (a proxy dump of ``remote_block_ids``). A
-    full-length window list with leading nulls does not occur and is not
-    tested.
+    token, extended by ``extra_retained_tokens``, are freed (null, ID 0), and
+    the list is clipped to its last ``cdiv(window, block_size) + 1`` entries.
+    This is the shape the prefiller was observed to send (a proxy dump of
+    ``remote_block_ids``). A full-length window list with leading nulls does
+    not occur and is not tested.
     """
     from vllm.utils.math_utils import cdiv
     from vllm.v1.kv_cache_interface import CircularBufferSpec, SlidingWindowSpec
@@ -2454,14 +2458,17 @@ def _prefill_block_ids(kv_cache_config, num_tokens: int):
             continue
         ids = [base + i for i in range(cdiv(num_tokens, spec.block_size))]
         if isinstance(spec, SlidingWindowSpec):
-            first = max(0, num_tokens - spec.sliding_window + 1) // spec.block_size
+            num_skipped = (
+                num_tokens - spec.sliding_window + 1 - spec.extra_retained_tokens
+            )
+            first = max(0, num_skipped) // spec.block_size
             ids = [0] * first + ids[first:]
             ids = ids[-(cdiv(spec.sliding_window, spec.block_size) + 1) :]
         block_ids.append(ids)
     return block_ids
 
 
-def _pd_pull_worker(kv_cache_config):
+def _pd_pull_worker(kv_cache_config, remote_physical_blocks_per_logical: int = 1):
     """Decode worker for a TP-matched pull with only the transport mocked.
 
     ``pairs[g]`` collects the (local block, remote block) pairs of group ``g``
@@ -2500,7 +2507,7 @@ def _pd_pull_worker(kv_cache_config):
         remote_tp_size=4,
         remote_dcp_size=1,
         remote_block_size=64,
-        remote_physical_blocks_per_logical=1,
+        remote_physical_blocks_per_logical=remote_physical_blocks_per_logical,
     )
     worker.tp_mappings = {"P": TPMapping(((0,),) * num_groups, (0,), {0: 0}, 0)}
     worker._mixed_mem_types = False
@@ -2529,6 +2536,8 @@ def _pd_pull(
     bounded_replay: bool,
     cached_tokens: int = 0,
     num_swa_groups: int = 1,
+    extra_retained_tokens: int = 0,
+    remote_physical_blocks_per_logical: int = 1,
 ):
     """Schedule a remote-prefill request on a real decode scheduler and run
     the resulting metadata through the pull worker.
@@ -2547,7 +2556,9 @@ def _pd_pull(
 
     from .utils import create_model_runner_output
 
-    kv_cache_config = _dsv4_pd_kv_cache_config(bounded_replay, num_swa_groups)
+    kv_cache_config = _dsv4_pd_kv_cache_config(
+        bounded_replay, num_swa_groups, extra_retained_tokens
+    )
     vllm_config = create_vllm_config(block_size=64, max_num_batched_tokens=8192)
     vllm_config.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
     block_size, hash_block_size = resolve_kv_cache_block_sizes(
@@ -2591,7 +2602,7 @@ def _pd_pull(
         [block.block_id for block in manager.req_to_blocks[request.request_id]]
         for manager in scheduler.kv_cache_manager.coordinator.single_type_managers
     ]
-    worker = _pd_pull_worker(kv_cache_config)
+    worker = _pd_pull_worker(kv_cache_config, remote_physical_blocks_per_logical)
     worker._read_blocks_for_req(request.request_id, meta)
     if not any(meta.local_block_ids):
         return [[] for _ in kv_cache_config.kv_cache_groups], None, meta, tables
@@ -2687,6 +2698,45 @@ def test_pull_trim_window_group_by_token_range(num_tokens, bounded_replay):
     assert meta.local_block_ids[swa]
     assert all(remote != 0 for _, remote in pairs[swa])
     assert pairs[swa] == expected[swa]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("bounded_replay", [True, False], ids=["replay", "no_replay"])
+@pytest.mark.parametrize("num_tokens", [1024, 1087, 4095])
+def test_pull_trim_window_group_retains_extra_token(num_tokens, bounded_replay):
+    """With one extra retained window token on both sides, window blocks are
+    still read from the P block holding the same tokens. Without replay, D
+    recomputes token N - 1, so every block covering [N - window, N) must be
+    read."""
+    from vllm.utils.math_utils import cdiv
+
+    pairs, expected, _, tables = _pd_pull(
+        num_tokens, bounded_replay, extra_retained_tokens=1
+    )
+
+    swa = 0
+    assert pairs == expected
+    if not bounded_replay:
+        read = {local for local, _ in pairs[swa]}
+        first = (num_tokens - _PD_WINDOW) // _PD_SWA_BLOCK_SIZE
+        end = cdiv(num_tokens, _PD_SWA_BLOCK_SIZE)
+        assert all(tables[swa][i] in read for i in range(first, end))
+
+
+@pytest.mark.cpu_test
+def test_pull_trim_hetero_physical_blocks_falls_back_to_end_trim():
+    """Differing physical blocks per logical block keep the end-trim.
+    ``meta.remote.block_ids`` is kernel-expanded at this point."""
+    pairs, _, meta, _ = _pd_pull(
+        1025, bounded_replay=False, remote_physical_blocks_per_logical=2
+    )
+
+    assert pairs == [
+        list(zip(local, remote[-len(local) :]))
+        for local, remote in zip(
+            meta.local_physical_block_ids, meta.remote.block_ids, strict=True
+        )
+    ]
 
 
 @pytest.mark.cpu_test

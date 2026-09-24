@@ -21,6 +21,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    FullAttentionSpec,
+    KpoolTailSpec,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -257,6 +262,31 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_logical_block_ids,
                 remote_info.remote_physical_blocks_per_logical,
             )
+            remote_block_ids = meta.remote.block_ids
+            if (
+                not dcp_active
+                and meta.remote.num_tokens is not None
+                and meta.local_num_computed_blocks
+                and self.block_size == remote_info.remote_block_size
+                and remote_info.remote_physical_blocks_per_logical
+                == self._physical_blocks_per_logical_kv_block
+            ):
+                # D's hit may end below P's prompt (SWA bounded replay rounds
+                # it down), so an end-trim would shift every block. The paired
+                # lists come back equal-length, so the end-trim in _read_blocks
+                # leaves them alone.
+                local_block_ids, remote_block_ids = self._pair_by_block_position(
+                    meta.local_block_ids,
+                    remote_logical_block_ids,
+                    meta.local_num_computed_blocks,
+                    meta.remote.num_tokens,
+                )
+                local_block_ids = self._logical_to_kernel_block_ids(
+                    local_block_ids, self._physical_blocks_per_logical_kv_block
+                )
+                remote_block_ids = self._logical_to_kernel_block_ids(
+                    remote_block_ids, remote_info.remote_physical_blocks_per_logical
+                )
             num_groups = len(meta.local_block_ids)
 
             def group_ids(block_ids: BlockIds, rank: int) -> list[list[int]]:
@@ -294,8 +324,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         remote_info.remote_physical_blocks_per_logical,
                     )
                 else:
-                    local_physical_ids = group_ids(meta.local_physical_block_ids, rank)
-                    remote_physical_ids = group_ids(meta.remote.block_ids, rank)
+                    local_physical_ids = group_ids(local_block_ids, rank)
+                    remote_physical_ids = group_ids(remote_block_ids, rank)
                 read_specs.append(
                     ReadSpec(
                         remote_rank=rank,
@@ -388,6 +418,62 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             remote_agent_name=agent,
                         )
                         self.xfer_stats.record_failed_notification()
+
+    def _pair_by_block_position(
+        self,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+        local_num_computed_blocks: tuple[int, ...],
+        num_remote_tokens: int,
+    ) -> tuple[BlockIds, BlockIds]:
+        """Pair each local block with the remote block at the same block-table
+        position, skipping positions the remote does not hold.
+
+        Assumes the remote list ends at ``cdiv(num_remote_tokens, block_size)``
+        (no speculative lookahead slots on the exporter). Assumes a
+        full-attention group locates D's last loaded token, which SWA bounded
+        replay may round down.
+        """
+        transfer_groups = self.kv_cache_config.transfer_groups
+        transfer_group_ids = self.kv_cache_config.transfer_group_ids
+        num_computed_blocks = [local_num_computed_blocks[i] for i in transfer_group_ids]
+        # Without a full-attention list, assume D loads every remote token,
+        # as the end-trim does.
+        num_loaded_tokens = num_remote_tokens
+        for g, local_ids in enumerate(local_block_ids):
+            if issubclass(self._group_spec_types[g], FullAttentionSpec) and local_ids:
+                num_loaded_tokens = min(
+                    num_loaded_tokens,
+                    (num_computed_blocks[g] + len(local_ids))
+                    * transfer_groups[g].kv_cache_spec.block_size,
+                )
+
+        matched_local: list[list[int]] = []
+        matched_remote: list[list[int]] = []
+        for g, (local_ids, remote_ids) in enumerate(
+            zip(local_block_ids, remote_block_ids, strict=True)
+        ):
+            spec_type = self._group_spec_types[g]
+            scratch = spec_type in (CircularBufferSpec, KpoolTailSpec)
+            if scratch or not _is_attention_spec(spec_type):
+                matched_local.append(list(local_ids))
+                matched_remote.append(list(remote_ids))
+                continue
+            block_size = transfer_groups[g].kv_cache_spec.block_size
+            if issubclass(spec_type, FullAttentionSpec):
+                local_start = num_computed_blocks[g]
+            else:
+                local_start = cdiv(num_loaded_tokens, block_size) - len(local_ids)
+            remote_start = cdiv(num_remote_tokens, block_size) - len(remote_ids)
+            offset = local_start - remote_start
+            pairs = [
+                (local_id, remote_ids[i])
+                for i, local_id in enumerate(local_ids, offset)
+                if 0 <= i < len(remote_ids) and remote_ids[i] != 0
+            ]
+            matched_local.append([local_id for local_id, _ in pairs])
+            matched_remote.append([remote_id for _, remote_id in pairs])
+        return matched_local, matched_remote
 
     def _read_blocks(
         self,
