@@ -2382,3 +2382,353 @@ def test_push_write_hybrid_mla_replicates_attention():
         assert spec.remote_block_ids == [[7, 8], [3]]
         assert call.kwargs["local_xfer_side_handle"] == local_handle
         assert call.kwargs["remote_xfer_side_handle"] == remote_handle
+
+
+# DeepSeek-V4 P/D pull. The transfer layout is sliding-window MLA groups of
+# 32-token blocks, one 64-token MLA group (compressed KV and indexer) and one
+# compressor ring (CircularBufferSpec, one block per request). With SWA bounded
+# replay the decoder (D) rounds its external hit down to a 64-token boundary,
+# so for a prompt of N tokens it loads floor(N / 64) * 64 of them, while the
+# prefiller (P) exports the blocks of all N.
+_PD_WINDOW = 128
+
+
+def _dsv4_pd_kv_cache_config(bounded_replay: bool, num_swa_groups: int = 1):
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, SlidingWindowMLASpec
+
+    swa_groups = [
+        KVCacheGroupSpec(
+            [f"swa{i}"],
+            SlidingWindowMLASpec(
+                block_size=32,
+                num_kv_heads=1,
+                head_size=64,
+                dtype=torch.bfloat16,
+                sliding_window=_PD_WINDOW,
+                bounded_replay=bounded_replay,
+            ),
+        )
+        for i in range(num_swa_groups)
+    ]
+    return KVCacheConfig(
+        num_blocks=2000,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            *swa_groups,
+            KVCacheGroupSpec(
+                ["mla"],
+                MLAAttentionSpec(
+                    block_size=64, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["ring"],
+                CircularBufferSpec(
+                    block_size=8, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+                ),
+            ),
+        ],
+    )
+
+
+def _prefill_block_ids(kv_cache_config, num_tokens: int):
+    """Block IDs as the prefiller exports them after computing ``num_tokens``.
+
+    Block ``i`` of group ``g`` is ``1000 * (g + 1) + i``, so an ID names the
+    token span it holds. Sliding-window blocks below the window of the next
+    token are freed (null, ID 0), and the list is clipped to its last
+    ``cdiv(window, block_size) + 1`` entries. This is the shape the prefiller
+    was observed to send (a proxy dump of ``remote_block_ids``). A
+    full-length window list with leading nulls does not occur and is not
+    tested.
+    """
+    from vllm.utils.math_utils import cdiv
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, SlidingWindowSpec
+
+    block_ids = []
+    for g, group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        base = 1000 * (g + 1)
+        if isinstance(spec, CircularBufferSpec):
+            block_ids.append([base])
+            continue
+        ids = [base + i for i in range(cdiv(num_tokens, spec.block_size))]
+        if isinstance(spec, SlidingWindowSpec):
+            first = max(0, num_tokens - spec.sliding_window + 1) // spec.block_size
+            ids = [0] * first + ids[first:]
+            ids = ids[-(cdiv(spec.sliding_window, spec.block_size) + 1) :]
+        block_ids.append(ids)
+    return block_ids
+
+
+def _pd_pull_worker(kv_cache_config):
+    """Decode worker for a TP-matched pull with only the transport mocked.
+
+    ``pairs[g]`` collects the (local block, remote block) pairs of group ``g``
+    exactly as they are handed to the descriptor computation.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import TPMapping
+
+    num_groups = len(kv_cache_config.transfer_groups)
+    worker = object.__new__(NixlConnectorWorker)
+    worker.engine_id = "D"
+    worker.tp_rank = 0
+    worker.block_size = 64
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker._engine_last_active = {}
+    worker._bidirectional_kv_xfer_enabled = False
+    worker._recving_transfers = {}
+    worker.use_mla, worker._has_mamba = True, False
+    worker.dcp_size = 1
+    worker.dcp_rank = 0
+    worker.kv_cache_config = kv_cache_config
+    worker._group_spec_types = tuple(
+        bw.get_representative_spec_type(g.kv_cache_spec)
+        for g in kv_cache_config.transfer_groups
+    )
+    worker.region_group_ids = []
+    worker.dst_region_group_ids = {"P": []}
+    worker.num_regions = 1
+    worker._uses_region_group_mapping = False
+    worker.dst_uses_region_group_mapping = {"P": False}
+    worker.dst_region_num_blocks = {}
+    worker.dst_num_blocks = {"P": 2000, "D": 2000}
+    worker.transfer_topo = MagicMock()
+    worker.transfer_topo.tp_ratio.return_value = 1
+    worker.transfer_topo.block_size_ratio.return_value = 1
+    worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
+        remote_tp_size=4,
+        remote_dcp_size=1,
+        remote_block_size=64,
+        remote_physical_blocks_per_logical=1,
+    )
+    worker.tp_mappings = {"P": TPMapping(((0,),) * num_groups, (0,), {0: 0}, 0)}
+    worker._mixed_mem_types = False
+    worker.src_xfer_handles_by_block_size = {64: 1}
+    worker.dst_xfer_side_handles = {"P": {0: 3}}
+    worker._remote_agents = {"P": {(0, 0): "P-rank0"}}
+    worker.nixl_wrapper = MagicMock()
+
+    captured: list = []
+
+    def compute_desc_ids(block_ids, **kwargs):
+        captured.append([list(group) for group in block_ids])
+        return list(range(sum(len(group) for group in block_ids)))
+
+    worker._compute_desc_ids = compute_desc_ids
+    worker.pairs = lambda: [
+        list(zip(local, remote, strict=True))
+        # _read_blocks computes the remote descriptors first.
+        for remote, local in zip(captured[0], captured[1], strict=True)
+    ]
+    return worker
+
+
+def _pd_pull(
+    num_tokens: int,
+    bounded_replay: bool,
+    cached_tokens: int = 0,
+    num_swa_groups: int = 1,
+):
+    """Schedule a remote-prefill request on a real decode scheduler and run
+    the resulting metadata through the pull worker.
+
+    ``cached_tokens`` first runs a local request sharing that many prompt
+    tokens, so D has a prefix-cache hit. Returns the (local, remote) pairs
+    per group, the expected pairs, the request's metadata and D's block
+    table per group (block IDs, 0 for the null block). The expected pairs
+    read every allocated block from the P block holding the same tokens. A
+    window block P has already freed is not read; with replay, D recomputes
+    it.
+    """
+    from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.structured_output import StructuredOutputManager
+
+    from .utils import create_model_runner_output
+
+    kv_cache_config = _dsv4_pd_kv_cache_config(bounded_replay, num_swa_groups)
+    vllm_config = create_vllm_config(block_size=64, max_num_batched_tokens=8192)
+    vllm_config.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
+    block_size, hash_block_size = resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    )
+    scheduler = Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=block_size,
+        hash_block_size=hash_block_size,
+    )
+    scheduler.use_v2_model_runner = True
+    assert scheduler.prefix_replay_tokens == (_PD_WINDOW if bounded_replay else 0)
+
+    if cached_tokens:
+        prime = create_request(
+            num_tokens=cached_tokens + 64,
+            common_prefix_len=cached_tokens,
+            block_size=hash_block_size,
+        )
+        scheduler.add_request(prime)
+        out = scheduler.schedule()
+        scheduler.update_from_output(out, create_model_runner_output([prime]))
+
+    request = create_request(
+        num_tokens=num_tokens,
+        common_prefix_len=cached_tokens,
+        do_remote_prefill=True,
+        block_size=hash_block_size,
+    )
+    request.kv_transfer_params["remote_engine_id"] = "P"
+    remote_block_ids = _prefill_block_ids(kv_cache_config, num_tokens)
+    request.kv_transfer_params["remote_block_ids"] = remote_block_ids
+    request.kv_transfer_params["remote_num_tokens"] = num_tokens
+    scheduler.add_request(request)
+    out = scheduler.schedule()
+    meta = out.kv_connector_metadata.reqs_to_recv[request.request_id]
+
+    tables = [
+        [block.block_id for block in manager.req_to_blocks[request.request_id]]
+        for manager in scheduler.kv_cache_manager.coordinator.single_type_managers
+    ]
+    worker = _pd_pull_worker(kv_cache_config)
+    worker._read_blocks_for_req(request.request_id, meta)
+    if not any(meta.local_block_ids):
+        return [[] for _ in kv_cache_config.kv_cache_groups], None, meta, tables
+
+    # Ground truth: the position of each loaded block in D's block table.
+    expected = []
+    for g, table in enumerate(tables):
+        expected.append(
+            [
+                (block, 1000 * (g + 1) + table.index(block))
+                for block in meta.local_block_ids[g]
+                if 1000 * (g + 1) + table.index(block) in remote_block_ids[g]
+            ]
+        )
+    return worker.pairs(), expected, meta, tables
+
+
+@pytest.mark.cpu_test
+def test_pull_replay_rounded_hit_reads_prompt_start():
+    """D rounds a 1025-token hit down to 1024 tokens. Its first 64-token
+    block must still receive P's first block, not P's second.
+
+    Assumes D keeps rounding its external hit down to a 64-token boundary
+    under replay (16 local MLA blocks). A fix that changes D's hit instead
+    must update the expected block count; the pairing rule stays."""
+    pairs, expected, meta, _ = _pd_pull(num_tokens=1025, bounded_replay=True)
+
+    mla = 1
+    assert len(meta.local_block_ids[mla]) == 16
+    assert pairs[mla][0][1] == 2000
+    assert pairs == expected
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "num_tokens,bounded_replay,cached_tokens,expected_prefill_blocks",
+    [
+        pytest.param(1024, True, 0, range(0, 16), id="replay_aligned"),
+        pytest.param(1025, True, 0, range(0, 16), id="replay_mod1"),
+        pytest.param(1082, True, 0, range(0, 16), id="replay_mod58"),
+        pytest.param(1087, True, 0, range(0, 16), id="replay_mod63"),
+        pytest.param(4090, True, 0, range(0, 63), id="replay_4090"),
+        pytest.param(570, True, 128, range(2, 8), id="replay_d_hit_unaligned"),
+        pytest.param(576, True, 128, range(2, 9), id="replay_d_hit_aligned"),
+        pytest.param(1025, False, 0, range(0, 17), id="no_replay"),
+        pytest.param(150, False, 0, range(0, 3), id="no_replay_short"),
+        pytest.param(1025, False, 128, range(2, 17), id="no_replay_d_hit"),
+    ],
+)
+def test_pull_trim_matches_loaded_token_range(
+    num_tokens, bounded_replay, cached_tokens, expected_prefill_blocks
+):
+    """The 64-token MLA group loads P's blocks for exactly the token range D
+    loads: from D's local prefix-cache hit to the end of its (possibly
+    rounded-down) external hit. Neither end-trimming nor front-trimming P's
+    list does that when D's hit is rounded down and D has a local hit.
+
+    The replay cases assume D keeps rounding its external hit down to a
+    64-token boundary (``expected_prefill_blocks`` ends at floor(N / 64))."""
+    pairs, expected, _, _ = _pd_pull(num_tokens, bounded_replay, cached_tokens)
+
+    mla = 1
+    assert [remote for _, remote in pairs[mla]] == [
+        2000 + i for i in expected_prefill_blocks
+    ]
+    assert pairs[mla] == expected[mla]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "num_tokens,bounded_replay",
+    [
+        pytest.param(1087, True, id="1087-replay"),
+        pytest.param(4090, True, id="4090-replay"),
+        pytest.param(4095, True, id="4095-replay"),
+        pytest.param(4096, True, id="4096-replay"),
+        pytest.param(100, False, id="100-no_replay"),
+        pytest.param(150, False, id="150-no_replay"),
+        pytest.param(193, False, id="193-no_replay"),
+        pytest.param(4090, False, id="4090-no_replay"),
+        pytest.param(4096, False, id="4096-no_replay"),
+    ],
+)
+def test_pull_trim_window_group_by_token_range(num_tokens, bounded_replay):
+    """Each 32-token sliding-window block D allocates is read from the P
+    block holding the same tokens, and never from a null block. With
+    replay, D's rounded-down window can start up to two blocks below the
+    first block P still holds (1087, 4095). Those D blocks are not read at
+    all; the replay recomputes them."""
+    pairs, expected, meta, _ = _pd_pull(num_tokens, bounded_replay)
+
+    swa = 0
+    assert meta.local_block_ids[swa]
+    assert all(remote != 0 for _, remote in pairs[swa])
+    assert pairs[swa] == expected[swa]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("bounded_replay", [True, False], ids=["replay", "no_replay"])
+@pytest.mark.parametrize("num_tokens", [193, 1025, 4096])
+def test_pull_trim_ring_group_pairs_single_block(num_tokens, bounded_replay):
+    """The compressor ring is one block per request on both sides."""
+    pairs, expected, _, _ = _pd_pull(num_tokens, bounded_replay)
+
+    ring = 2
+    assert len(pairs[ring]) == 1
+    assert pairs[ring] == expected[ring]
+
+
+@pytest.mark.cpu_test
+def test_pull_trim_dsv41_layout():
+    """Two window groups, the MLA group and the ring in one read, each
+    sliced by its own block size."""
+    pairs, expected, meta, _ = _pd_pull(
+        num_tokens=4090, bounded_replay=True, num_swa_groups=2
+    )
+
+    assert [len(group) for group in meta.local_block_ids] == [4, 4, 63, 1]
+    assert pairs == expected
+
+
+@pytest.mark.cpu_test
+def test_pull_trim_local_hit_counts_differ_per_group():
+    """Without replay, a D prefix-cache hit covers blocks of both the window
+    and the MLA group. The window group's hit count is not where its loaded
+    blocks start (its blocks below the window are null), so each group must
+    be sliced from its own token position."""
+    from vllm.utils.math_utils import cdiv
+
+    pairs, expected, meta, tables = _pd_pull(
+        num_tokens=1025, bounded_replay=False, cached_tokens=256
+    )
+
+    swa, mla = 0, 1
+    assert meta.local_num_computed_blocks[mla] == 4
+    # Where the loaded window blocks start in D's block table.
+    window_start = tables[swa].index(meta.local_block_ids[swa][0])
+    assert window_start == cdiv(1025, 32) - len(meta.local_block_ids[swa])
+    assert meta.local_num_computed_blocks[swa] != window_start
+    assert pairs == expected
