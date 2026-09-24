@@ -1625,8 +1625,15 @@ class NixlBaseConnectorWorker:
                 if base_addr in seen_base_addresses:
                     region_index = seen_base_addresses.index(base_addr)
                     assert region_mem_types[region_index] == mem_type
+                    was_mla_region = self._region_is_mla[region_index]
                     self._region_is_mla[region_index] |= is_mla_region
                     if is_mla_region:
+                        # Packed HMA blocks put pages of several layers at one
+                        # base address; the region must span the longest.
+                        if was_mla_region:
+                            block_len = max(
+                                block_len, self.block_len_per_layer[region_index]
+                            )
                         self.block_len_per_layer[region_index] = block_len
                         self.block_stride_per_layer[region_index] = block_stride
                         self.region_num_blocks[region_index] = num_blocks
