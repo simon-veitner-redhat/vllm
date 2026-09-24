@@ -35,6 +35,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -55,6 +56,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     tensor_data,
 )
+from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.hisparse.layout import (
     create_hisparse_layout,
     get_hisparse_gpu_memory_usage,
@@ -2388,6 +2390,38 @@ def test_get_kv_cache_configs_attention_free():
             kv_cache_groups=[],
         )
     ]
+
+
+def test_get_kv_cache_configs_kv_connector_retains_extra_window_token():
+    """A KV consumer recomputes the last loaded prompt token, whose window
+    starts one token below the next token's, so that block must be retained."""
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(max_model_len=2048),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector", kv_role="kv_both"
+        ),
+    )
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
+    vllm_config.cache_config.prefix_cache_retention_interval = None
+    spec = new_sliding_window_spec(block_size=32, sliding_window=128)
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config, [{"layer_1": spec}], [spec.page_size_bytes * 100]
+    )[0]
+    retained_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    assert retained_spec.extra_retained_tokens == 1
+
+    manager = SlidingWindowManager(
+        retained_spec,
+        block_pool=BlockPool(
+            num_gpu_blocks=100, enable_caching=False, hash_block_size=32
+        ),
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=32,
+    )
+    num_tokens = 1087
+    first_retained_block = manager.get_num_skipped_tokens(num_tokens) // 32
+    assert first_retained_block == (num_tokens - 128) // 32
 
 
 def test_generate_uniform_type_kv_cache_specs():
