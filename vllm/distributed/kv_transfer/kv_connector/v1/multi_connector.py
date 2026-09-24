@@ -220,6 +220,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def requires_kv_delivery(self) -> bool:
         return any(c.requires_kv_delivery for c in self._connectors)
 
+    @property
+    def loads_sliding_window_kv(self) -> bool:
+        return bool(self._connectors) and all(
+            c.loads_sliding_window_kv for c in self._connectors
+        )
+
     @classmethod
     def _get_connector_classes_and_configs(
         cls, vllm_config: "VllmConfig"

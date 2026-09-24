@@ -81,6 +81,10 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     def supports_divergent_local_hybrid_hits(self) -> bool:
         return True
 
+    @property
+    def loads_sliding_window_kv(self) -> bool:
+        return True
+
     def __init__(
         self,
         vllm_config: VllmConfig,

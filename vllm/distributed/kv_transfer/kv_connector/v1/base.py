@@ -199,6 +199,17 @@ class KVConnectorBase_V1(ABC):
         """
         return self._kv_transfer_config.is_kv_producer
 
+    @property
+    def loads_sliding_window_kv(self) -> bool:
+        """Whether async loads deliver the sliding-window KV of the loaded tokens.
+
+        P/D loads of a prompt the remote computed in full do. If True, SWA
+        bounded replay neither rounds such a hit down to a block boundary nor
+        replays its last window once the load completes; a load that completes
+        the prompt recomputes only its last token. Defaults to False.
+        """
+        return False
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
