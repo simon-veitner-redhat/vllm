@@ -58,6 +58,7 @@ class MockConnector(KVConnectorBase_V1):
     """Mock connector for testing."""
 
     _supports_divergent_local_hybrid_hits = False
+    _loads_sliding_window_kv = False
 
     def __new__(cls, *args, **kwargs):
         # mock all KVConnectorBase_V1 functions
@@ -65,6 +66,7 @@ class MockConnector(KVConnectorBase_V1):
         mock.supports_divergent_local_hybrid_hits = (
             cls._supports_divergent_local_hybrid_hits
         )
+        mock.loads_sliding_window_kv = cls._loads_sliding_window_kv
         # Override just build_kv_connector_stats
         mock.build_kv_connector_stats = cls.build_kv_connector_stats
         mock.get_kv_connector_stats.return_value = None
@@ -102,12 +104,14 @@ class MockHMAConnector(KVConnectorBase_V1, SupportsHMA):
     """Mock connector that supports HMA for testing."""
 
     _supports_divergent_local_hybrid_hits = False
+    _loads_sliding_window_kv = False
 
     def __new__(cls, *args, **kwargs):
         mock = MagicMock(spec_set=cls)
         mock.supports_divergent_local_hybrid_hits = (
             cls._supports_divergent_local_hybrid_hits
         )
+        mock.loads_sliding_window_kv = cls._loads_sliding_window_kv
         mock.get_kv_connector_stats.return_value = None
         return mock
 
@@ -140,6 +144,10 @@ class MockDivergentHMAConnector(MockHMAConnector):
     _supports_divergent_local_hybrid_hits = True
 
 
+class MockWindowKVHMAConnector(MockHMAConnector):
+    _loads_sliding_window_kv = True
+
+
 # Register mock connectors
 KVConnectorFactory.register_connector("MockConnector", __name__, MockConnector.__name__)
 KVConnectorFactory.register_connector(
@@ -149,6 +157,11 @@ KVConnectorFactory.register_connector(
     "MockDivergentHMAConnector",
     __name__,
     MockDivergentHMAConnector.__name__,
+)
+KVConnectorFactory.register_connector(
+    "MockWindowKVHMAConnector",
+    __name__,
+    MockWindowKVHMAConnector.__name__,
 )
 
 
@@ -1137,6 +1150,16 @@ def test_divergent_local_hybrid_hit_capability_is_conservative():
 
     mixed = _make_multi_connector(["MockDivergentHMAConnector", "MockHMAConnector"])
     assert mixed.supports_divergent_local_hybrid_hits is False
+
+
+def test_loads_sliding_window_kv_requires_every_connector():
+    all_loading = _make_multi_connector(
+        ["MockWindowKVHMAConnector", "MockWindowKVHMAConnector"]
+    )
+    assert all_loading.loads_sliding_window_kv is True
+
+    mixed = _make_multi_connector(["MockWindowKVHMAConnector", "MockHMAConnector"])
+    assert mixed.loads_sliding_window_kv is False
 
 
 @pytest.mark.skipif(

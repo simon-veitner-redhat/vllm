@@ -2386,11 +2386,13 @@ def test_push_write_hybrid_mla_replicates_attention():
 
 # DeepSeek-V4 P/D pull. The transfer layout is sliding-window MLA groups of
 # 32-token blocks, one 64-token MLA group (compressed KV and indexer) and one
-# compressor ring (CircularBufferSpec, one block per request). With SWA bounded
-# replay the decoder (D) rounds its external hit down to a 64-token boundary,
-# so for a prompt of N tokens it loads floor(N / 64) * 64 of them, while the
-# prefiller (P) exports the blocks of all N.
+# compressor ring (CircularBufferSpec, one block per request). The NIXL
+# connector delivers the window KV, so with or without SWA bounded replay the
+# decoder (D) loads all N tokens of a prompt and the prefiller (P) exports the
+# blocks of all N. With a KV connector both sides retain one extra window token
+# (``extra_retained_tokens``), as ``get_kv_cache_configs`` sets it.
 _PD_WINDOW = 128
+_PD_SWA_BLOCK = 32
 
 
 def _dsv4_pd_kv_cache_config(bounded_replay: bool, num_swa_groups: int = 1):
@@ -2400,12 +2402,13 @@ def _dsv4_pd_kv_cache_config(bounded_replay: bool, num_swa_groups: int = 1):
         KVCacheGroupSpec(
             [f"swa{i}"],
             SlidingWindowMLASpec(
-                block_size=32,
+                block_size=_PD_SWA_BLOCK,
                 num_kv_heads=1,
                 head_size=64,
                 dtype=torch.bfloat16,
                 sliding_window=_PD_WINDOW,
                 bounded_replay=bounded_replay,
+                extra_retained_tokens=1,
             ),
         )
         for i in range(num_swa_groups)
@@ -2436,11 +2439,11 @@ def _prefill_block_ids(kv_cache_config, num_tokens: int):
 
     Block ``i`` of group ``g`` is ``1000 * (g + 1) + i``, so an ID names the
     token span it holds. Sliding-window blocks below the window of the next
-    token are freed (null, ID 0), and the list is clipped to its last
-    ``cdiv(window, block_size) + 1`` entries. This is the shape the prefiller
-    was observed to send (a proxy dump of ``remote_block_ids``). A
-    full-length window list with leading nulls does not occur and is not
-    tested.
+    token, extended by ``extra_retained_tokens``, are freed (null, ID 0), and
+    the list is clipped to its last ``cdiv(window, block_size) + 1`` entries.
+    This is the shape the prefiller was observed to send (a proxy dump of
+    ``remote_block_ids``). A full-length window list with leading nulls does
+    not occur and is not tested.
     """
     from vllm.utils.math_utils import cdiv
     from vllm.v1.kv_cache_interface import CircularBufferSpec, SlidingWindowSpec
@@ -2454,7 +2457,8 @@ def _prefill_block_ids(kv_cache_config, num_tokens: int):
             continue
         ids = [base + i for i in range(cdiv(num_tokens, spec.block_size))]
         if isinstance(spec, SlidingWindowSpec):
-            first = max(0, num_tokens - spec.sliding_window + 1) // spec.block_size
+            window = spec.sliding_window + spec.extra_retained_tokens
+            first = max(0, num_tokens - window + 1) // spec.block_size
             ids = [0] * first + ids[first:]
             ids = ids[-(cdiv(spec.sliding_window, spec.block_size) + 1) :]
         block_ids.append(ids)
@@ -2524,22 +2528,17 @@ def _pd_pull_worker(kv_cache_config):
     return worker
 
 
-def _pd_pull(
+def _pd_schedule(
     num_tokens: int,
     bounded_replay: bool,
     cached_tokens: int = 0,
     num_swa_groups: int = 1,
 ):
-    """Schedule a remote-prefill request on a real decode scheduler and run
-    the resulting metadata through the pull worker.
+    """Schedule a remote-prefill request on a real decode scheduler.
 
     ``cached_tokens`` first runs a local request sharing that many prompt
-    tokens, so D has a prefix-cache hit. Returns the (local, remote) pairs
-    per group, the expected pairs, the request's metadata and D's block
-    table per group (block IDs, 0 for the null block). The expected pairs
-    read every allocated block from the P block holding the same tokens. A
-    window block P has already freed is not read; with replay, D recomputes
-    it.
+    tokens to completion, so D has a prefix-cache hit. Returns the scheduler,
+    the request and the scheduler output of the step that starts its load.
     """
     from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -2571,7 +2570,9 @@ def _pd_pull(
         )
         scheduler.add_request(prime)
         out = scheduler.schedule()
-        scheduler.update_from_output(out, create_model_runner_output([prime]))
+        scheduler.update_from_output(
+            out, create_model_runner_output([prime], use_eos=True)
+        )
 
     request = create_request(
         num_tokens=num_tokens,
@@ -2584,7 +2585,29 @@ def _pd_pull(
     request.kv_transfer_params["remote_block_ids"] = remote_block_ids
     request.kv_transfer_params["remote_num_tokens"] = num_tokens
     scheduler.add_request(request)
-    out = scheduler.schedule()
+    return scheduler, request, scheduler.schedule()
+
+
+def _pd_pull(
+    num_tokens: int,
+    bounded_replay: bool,
+    cached_tokens: int = 0,
+    num_swa_groups: int = 1,
+):
+    """Schedule a remote-prefill request with ``_pd_schedule`` and run the
+    resulting metadata through the pull worker.
+
+    Returns the (local, remote) pairs per group, the expected pairs, the
+    request's metadata and D's block table per group (block IDs, 0 for the
+    null block). The expected pairs read every allocated block from the P
+    block holding the same tokens. A window block P has already freed is
+    not read.
+    """
+    scheduler, request, out = _pd_schedule(
+        num_tokens, bounded_replay, cached_tokens, num_swa_groups
+    )
+    kv_cache_config = scheduler.kv_cache_config
+    remote_block_ids = request.kv_transfer_params["remote_block_ids"]
     meta = out.kv_connector_metadata.reqs_to_recv[request.request_id]
 
     tables = [
@@ -2610,19 +2633,69 @@ def _pd_pull(
 
 
 @pytest.mark.cpu_test
-def test_pull_replay_rounded_hit_reads_prompt_start():
-    """D rounds a 1025-token hit down to 1024 tokens. Its first 64-token
-    block must still receive P's first block, not P's second.
+@pytest.mark.parametrize(
+    "num_tokens,cached_tokens,num_loaded_mla_blocks",
+    [
+        pytest.param(1025, 0, 17, id="mod1"),
+        pytest.param(1087, 0, 17, id="mod63"),
+        pytest.param(1025, 1024, 1, id="d_hit_1024"),
+        pytest.param(150, 0, 3, id="short"),
+    ],
+)
+def test_pull_replay_loaded_window_is_not_replayed(
+    num_tokens, cached_tokens, num_loaded_mla_blocks
+):
+    """The NIXL connector delivers the window KV, so after a load under
+    replay D keeps P's KV and recomputes only the last prompt token. Without
+    a D hit, the block holding the first token of that token's window
+    (N - _PD_WINDOW) is loaded from P."""
+    from .utils import create_model_runner_output
 
-    Assumes D keeps rounding its external hit down to a 64-token boundary
-    under replay (16 local MLA blocks). A fix that changes D's hit instead
-    must update the expected block count; the pairing rule stays."""
-    pairs, expected, meta, _ = _pd_pull(num_tokens=1025, bounded_replay=True)
+    scheduler, request, out = _pd_schedule(
+        num_tokens, bounded_replay=True, cached_tokens=cached_tokens
+    )
 
-    mla = 1
-    assert len(meta.local_block_ids[mla]) == 16
-    assert pairs[mla][0][1] == 2000
-    assert pairs == expected
+    meta = out.kv_connector_metadata.reqs_to_recv[request.request_id]
+    swa, mla = 0, 1
+    assert len(meta.local_block_ids[mla]) == num_loaded_mla_blocks
+    if not cached_tokens:
+        table = scheduler.kv_cache_manager.get_block_ids(request.request_id)[swa]
+        block_id = table[(num_tokens - _PD_WINDOW) // _PD_SWA_BLOCK]
+        assert block_id != 0
+        assert block_id in meta.local_block_ids[swa]
+    scheduler.update_from_output(
+        out, create_model_runner_output([], finished_recving={request.request_id})
+    )
+
+    out = scheduler.schedule()
+    new_req = next(r for r in out.scheduled_new_reqs if r.req_id == request.request_id)
+    assert new_req.num_computed_tokens == num_tokens - 1
+    assert new_req.replay_start == 0
+    assert out.num_scheduled_tokens[request.request_id] == 1
+
+
+@pytest.mark.cpu_test
+def test_pull_replay_failed_load_restarts_with_local_replay():
+    """A failed load restarts the request from token 0. The retry takes the
+    normal replay path for D's local prefix-cache hit."""
+    from .utils import create_model_runner_output
+
+    scheduler, request, out = _pd_schedule(
+        num_tokens=1025, bounded_replay=True, cached_tokens=256
+    )
+
+    # kv_load_failure_policy="recompute"
+    scheduler.recompute_kv_load_failures = True
+    output = create_model_runner_output([], finished_recving={request.request_id})
+    output.kv_connector_output.failed_recving = {request.request_id}
+    scheduler.update_from_output(out, output)
+    assert request.num_computed_tokens == 0
+
+    out = scheduler.schedule()
+    new_req = next(r for r in out.scheduled_new_reqs if r.req_id == request.request_id)
+    assert new_req.num_computed_tokens == 256 - _PD_WINDOW
+    assert new_req.replay_start == 256 - _PD_WINDOW
+    assert out.num_scheduled_tokens[request.request_id] == 1025 - _PD_WINDOW
 
 
 @pytest.mark.cpu_test
@@ -2630,11 +2703,11 @@ def test_pull_replay_rounded_hit_reads_prompt_start():
     "num_tokens,bounded_replay,cached_tokens,expected_prefill_blocks",
     [
         pytest.param(1024, True, 0, range(0, 16), id="replay_aligned"),
-        pytest.param(1025, True, 0, range(0, 16), id="replay_mod1"),
-        pytest.param(1082, True, 0, range(0, 16), id="replay_mod58"),
-        pytest.param(1087, True, 0, range(0, 16), id="replay_mod63"),
-        pytest.param(4090, True, 0, range(0, 63), id="replay_4090"),
-        pytest.param(570, True, 128, range(2, 8), id="replay_d_hit_unaligned"),
+        pytest.param(1025, True, 0, range(0, 17), id="replay_mod1"),
+        pytest.param(1082, True, 0, range(0, 17), id="replay_mod58"),
+        pytest.param(1087, True, 0, range(0, 17), id="replay_mod63"),
+        pytest.param(4090, True, 0, range(0, 64), id="replay_4090"),
+        pytest.param(570, True, 128, range(2, 9), id="replay_d_hit_unaligned"),
         pytest.param(576, True, 128, range(2, 9), id="replay_d_hit_aligned"),
         pytest.param(1025, False, 0, range(0, 17), id="no_replay"),
         pytest.param(150, False, 0, range(0, 3), id="no_replay_short"),
@@ -2645,12 +2718,9 @@ def test_pull_trim_matches_loaded_token_range(
     num_tokens, bounded_replay, cached_tokens, expected_prefill_blocks
 ):
     """The 64-token MLA group loads P's blocks for exactly the token range D
-    loads: from D's local prefix-cache hit to the end of its (possibly
-    rounded-down) external hit. Neither end-trimming nor front-trimming P's
-    list does that when D's hit is rounded down and D has a local hit.
-
-    The replay cases assume D keeps rounding its external hit down to a
-    64-token boundary (``expected_prefill_blocks`` ends at floor(N / 64))."""
+    loads: from D's local prefix-cache hit to the end of its external hit,
+    which is not rounded down under replay (``expected_prefill_blocks`` ends
+    at cdiv(N, 64))."""
     pairs, expected, _, _ = _pd_pull(num_tokens, bounded_replay, cached_tokens)
 
     mla = 1
@@ -2677,10 +2747,7 @@ def test_pull_trim_matches_loaded_token_range(
 )
 def test_pull_trim_window_group_by_token_range(num_tokens, bounded_replay):
     """Each 32-token sliding-window block D allocates is read from the P
-    block holding the same tokens, and never from a null block. With
-    replay, D's rounded-down window can start up to two blocks below the
-    first block P still holds (1087, 4095). Those D blocks are not read at
-    all; the replay recomputes them."""
+    block holding the same tokens, and never from a null block."""
     pairs, expected, meta, _ = _pd_pull(num_tokens, bounded_replay)
 
     swa = 0
@@ -2709,7 +2776,7 @@ def test_pull_trim_dsv41_layout():
         num_tokens=4090, bounded_replay=True, num_swa_groups=2
     )
 
-    assert [len(group) for group in meta.local_block_ids] == [4, 4, 63, 1]
+    assert [len(group) for group in meta.local_block_ids] == [5, 5, 64, 1]
     assert pairs == expected
 
 

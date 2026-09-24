@@ -963,14 +963,19 @@ class Scheduler(SchedulerInterface):
                             step_skipped_waiting.prepend_request(request)
                             continue
 
-                        if self.prefix_replay_tokens:
-                            # SWA bounded replay recomputes the hit's last
-                            # window, from the block holding its first
-                            # token; the sliding-window groups retire
-                            # whole blocks below the window of the hit's
-                            # next token. Hits end on a block boundary, or
-                            # a hit ending one token short of one would
-                            # retire the block the replay starts in.
+                        delivers_window = (
+                            load_kv_async and self.connector.loads_sliding_window_kv
+                        )
+                        if self.prefix_replay_tokens and not delivers_window:
+                            # A load that delivers the window KV takes the
+                            # whole hit. Otherwise SWA bounded replay
+                            # recomputes the hit's last window, from the
+                            # block holding its first token; the
+                            # sliding-window groups retire whole blocks
+                            # below the window of the hit's next token.
+                            # Hits end on a block boundary, or a hit ending
+                            # one token short of one would retire the block
+                            # the replay starts in.
                             ext_tokens -= ext_tokens % self.block_size
                             load_kv_async = load_kv_async and ext_tokens > 0
 
@@ -3066,10 +3071,14 @@ class Scheduler(SchedulerInterface):
 
         # SWA bounded replay recomputes the tail of the hit, which covers the
         # last token; otherwise a full prompt hit re-computes that token so the
-        # next one can be sampled.
-        num_replay_tokens = self._mark_prefix_replay(
-            request, request.num_computed_tokens
-        )
+        # next one can be sampled. A load that delivered the sliding-window KV
+        # needs no replay. A failed load of a multi-group layout restarts from
+        # token 0 (see _handle_failed_recving), so it has no hit to replay.
+        num_replay_tokens = 0
+        if not self.connector.loads_sliding_window_kv:
+            num_replay_tokens = self._mark_prefix_replay(
+                request, request.num_computed_tokens
+            )
         if num_replay_tokens > 0:
             request.num_computed_tokens -= num_replay_tokens
         elif request.num_computed_tokens == request.num_tokens:
