@@ -69,6 +69,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheLayout,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     compute_layer_kv_cache_shape_bytes,
 )
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
@@ -2419,6 +2420,70 @@ def test_register_packed_dsv4_mla_cache_as_single_region(
             [raw.data_ptr() + block_idx * packed_block_len, packed_block_len, 0]
             for block_idx in range(num_blocks)
         ]
+
+
+@pytest.mark.cpu_test
+def test_register_kv_caches_shared_region_keeps_longest_page():
+    """Views sharing a base address register one region spanning the longest
+    page, even when a shorter page registers last."""
+    nixl_worker = "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker"
+    swa_spec = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=128,
+    )
+    indexer_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=16,
+        dtype=torch.float16,
+    )
+    num_blocks = 4
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layers.0.attn"], swa_spec),
+            KVCacheGroupSpec(["layers.1.attn.indexer.k_cache"], indexer_spec),
+        ],
+    )
+    vllm_config = create_vllm_config(block_size=16)
+    vllm_config.kv_transfer_config.kv_buffer_device = "cuda"
+    fake_backend = MagicMock()
+    fake_backend.get_supported_kernel_block_sizes.return_value = [16]
+    fake_backend.get_name.return_value = "FLASHMLA"
+    fake_backend.full_cls_name.return_value = "fake.FLASHMLA"
+    fake_platform = MagicMock()
+    fake_platform.device_type = "cuda"
+    fake_platform.get_nixl_memory_type.return_value = "VRAM"
+
+    # Both pages start at the same offset of every block.
+    swa_page = swa_spec.page_size_bytes
+    backing = torch.zeros(num_blocks, swa_page, dtype=torch.uint8)
+    with (
+        patch(f"{nixl_worker}.NixlWrapper"),
+        patch(f"{nixl_worker}.get_tensor_model_parallel_rank", return_value=0),
+        patch(f"{nixl_worker}.get_tensor_model_parallel_world_size", return_value=1),
+        patch(f"{nixl_worker}.get_current_attn_backends", return_value=[fake_backend]),
+        patch(f"{nixl_worker}.current_platform", fake_platform),
+        set_current_vllm_config(vllm_config),
+    ):
+        worker = NixlConnectorWorker(vllm_config, "test-engine", kv_cache_config)
+        worker.use_mla = True
+        worker.nixl_wrapper.get_agent_metadata.return_value = b"fake-agent-metadata"
+        worker.register_kv_caches(
+            {
+                "layers.0.attn": backing,
+                "layers.1.attn.indexer.k_cache": backing[
+                    :, : indexer_spec.page_size_bytes
+                ],
+            }
+        )
+
+    assert worker.block_len_per_layer == [swa_page]
+    assert worker.src_blocks_data[:, 1].tolist() == [swa_page] * num_blocks
 
 
 class FakePlatform(Platform):
