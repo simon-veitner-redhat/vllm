@@ -216,6 +216,7 @@ def flash_attn_varlen_func(
     dynamic_causal: "torch.Tensor | None" = None,
     gather_kv_indices=None,
     gather_kv_valid_length=None,
+    mla_decode_h64: bool = False,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -298,6 +299,8 @@ def flash_attn_varlen_func(
         gather_kv_valid_length: (total_q,) int32, leading real entries per
             gather_kv_indices row. The kernel attends `round_up(length, 128)`
             entries, so the rest must be `-1`. Needs gather_kv_indices. FA4 only.
+        mla_decode_h64: run a sparse MQA decode with 64 query heads per KV head on the
+            heads-on-M kernel. FA4 only; other calls ignore it.
 
     Return:
         out: (total, nheads, headdim).
@@ -478,6 +481,7 @@ def flash_attn_varlen_func(
             k_descale=k_descale,
             v_descale=v_descale,
             output_scale=output_scale,
+            mla_decode_h64=mla_decode_h64,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")

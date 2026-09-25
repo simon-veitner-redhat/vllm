@@ -1196,7 +1196,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and self.impl.masked_mha_available  # type: ignore[attr-defined]
             and self.impl.dcp_world_size <= 1
             and _use_masked_mha(
-                backend_name=self.attn_backend.get_name(),
+                backend_name=(
+                    self.impl.prefill_backend_name  # type: ignore[attr-defined]
+                    or self.attn_backend.get_name()
+                ),
                 tensor_parallel_size=(
                     self._vllm_config.parallel_config.tensor_parallel_size
                 ),
@@ -1851,9 +1854,6 @@ def _use_masked_mha(
     seq_len: int,
     has_context: bool,
 ) -> bool:
-    if backend_name == "FLASH_ATTN_MLA_SPARSE_FA4":
-        # Its prefill batches run on FlashInfer's kernel, so it shares those rows.
-        backend_name = "FLASHINFER_MLA_SPARSE"
     thresholds = (
         _MASKED_MHA_THRESHOLDS.get((qk_head_dim, v_head_dim), {})
         .get(backend_name, {})

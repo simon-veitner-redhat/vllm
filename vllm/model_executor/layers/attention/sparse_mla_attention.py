@@ -649,6 +649,8 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     """Sparse MLA base with dense and masked-MHA prefill paths."""
 
     is_sparse = True
+    # The backend whose masked-MHA thresholds apply, if not this layer's own.
+    prefill_backend_name: str | None = None
 
     def __init__(
         self,

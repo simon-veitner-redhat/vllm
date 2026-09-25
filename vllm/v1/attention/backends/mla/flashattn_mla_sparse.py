@@ -9,6 +9,7 @@ from typing import Any, ClassVar
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
@@ -17,6 +18,7 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonMetadataBuilder,
 )
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -33,6 +35,7 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
 )
 from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.worker.workspace import current_workspace_manager
 from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 
 
@@ -239,8 +242,22 @@ def _fa4_cute_mla_available() -> str | None:
     return None
 
 
+def fa4_prefill_backend_name(num_heads: int, dcp_world_size: int) -> str:
+    """The backend whose kernel runs FA4's non-decode batches and whose masked-MHA
+    thresholds FA4 uses.
+
+    FLASHMLA_SPARSE with more than 16 query heads per rank and no DCP, where the
+    selector picks it by default; FlashMLA refuses DCP on a BF16 cache. Otherwise
+    FLASHINFER_MLA_SPARSE (the trtllm-gen kernel), whatever the head count.
+    """
+    if num_heads > 16 and dcp_world_size == 1:
+        return "FLASHMLA_SPARSE"
+    return "FLASHINFER_MLA_SPARSE"
+
+
 class FlashAttnMLASparseFA4Backend(FlashInferMLASparseTRTLLMBackend):
-    """Uniform decode batches on FA4; every other batch on the trtllm-gen kernel."""
+    """Uniform decode batches on FA4; every other batch on the prefill backend's
+    kernel: FLASHMLA_SPARSE's above 16 heads without DCP, else trtllm-gen."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     # The qv kernel asserts every descale is None: BF16 KV cache only.
@@ -273,7 +290,7 @@ class FlashAttnMLASparseFA4Backend(FlashInferMLASparseTRTLLMBackend):
         from vllm.utils.flashinfer import has_flashinfer
 
         if not has_flashinfer():
-            return "FA4 sparse MLA runs its prefill batches on FlashInfer's kernel"
+            return "FA4 sparse MLA builds on FlashInfer's sparse MLA backend"
         if (reason := _fa4_cute_mla_available()) is not None:
             return reason
         vllm_config = get_current_vllm_config_or_none()
@@ -307,12 +324,26 @@ class FlashAttnMLASparseFA4Backend(FlashInferMLASparseTRTLLMBackend):
                     f"FA4 sparse MLA requires {head_counts} gathered query heads, "
                     f"got num_heads={num_heads} * dcp_size={dcp_size}"
                 )
+            if fa4_prefill_backend_name(num_heads, dcp_size) == "FLASHMLA_SPARSE":
+                from vllm.v1.attention.ops.flashmla import (
+                    is_flashmla_sparse_supported,
+                )
+
+                supported, reason = is_flashmla_sparse_supported()
+                if not supported:
+                    return (
+                        "FA4 sparse MLA prefills on FLASHMLA_SPARSE above 16 heads "
+                        f"without DCP, which is unavailable: {reason}"
+                    )
         # super()'s remaining gates; their reasons name ``cls``, hence this backend.
         return super().supports_combination(*args, **kwargs)
 
 
 class FlashAttnMLASparseFA4MetadataBuilder(FlashInferMLASparseTRTLLMMetadataBuilder):
-    """The trtllm-gen builder: ``_prefill`` needs its DCP workspace pre-size."""
+    """The trtllm-gen builder, which pre-sizes the DCP workspace ``_prefill`` needs.
+
+    In the FlashMLA-prefill lane it splits batches as FLASHMLA_SPARSE's builder does.
+    """
 
     # FA4 bakes the decode batch's row count into its varlen scalars.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
@@ -325,9 +356,18 @@ class FlashAttnMLASparseFA4MetadataBuilder(FlashInferMLASparseTRTLLMMetadataBuil
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        # Ragged HiSparse decode windows would take the resolver's per-step loop.
+        num_q_heads = vllm_config.model_config.get_num_attention_heads(
+            vllm_config.parallel_config
+        )
+        # Where prefill follows FLASHMLA_SPARSE, classify batches as it does: only
+        # uniform decodes. Its reorder threshold matches FlashInfer's on SM100 (and
+        # is 1 under HiSparse for both, via the common builder), so it is inherited.
+        # Elsewhere, ragged HiSparse decode windows would take the resolver's
+        # per-step loop.
         self.require_uniform_decodes = (
-            vllm_config.attention_config.hisparse_config is not None
+            fa4_prefill_backend_name(num_q_heads, self.dcp_world_size)
+            == "FLASHMLA_SPARSE"
+            or vllm_config.attention_config.hisparse_config is not None
         )
 
 
@@ -343,7 +383,7 @@ def _fa4_varlen_scalars(
 
 
 class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[SparseMLACommonMetadata]):
-    """FA4 for decode rows; the trtllm-gen kernel for prefill rows."""
+    """FA4 for decode rows; FlashMLA's or the trtllm-gen kernel for prefill rows."""
 
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
@@ -360,6 +400,42 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[SparseMLACommonMetadata]):
         self.max_varlen_tokens = (
             get_current_vllm_config().scheduler_config.max_num_batched_tokens
         )
+        self._init_lanes()
+        if self.q_concat_spec is not None:
+            # Reserved up front, like FLASHMLA_SPARSE, so the memory profile counts it.
+            current_workspace_manager().get_simultaneous(self.q_concat_spec)
+
+    def _init_lanes(self) -> None:
+        """Set the prefill backend, the decode kernel and the prefill query buffer.
+
+        All follow from num_heads and dcp_world_size; see fa4_prefill_backend_name.
+        """
+        # Masked-MHA routing reads the thresholds of the backend prefill follows.
+        self.prefill_backend_name = fa4_prefill_backend_name(
+            self.num_heads, self.dcp_world_size
+        )
+        self.flashmla_prefill = self.prefill_backend_name == "FLASHMLA_SPARSE"
+        # The FlashMLA-prefill lane (no DCP, > 16 heads) asks FA4 for its heads-on-M
+        # kernel, which it runs at 64 heads per KV head; DCP keeps the transposed one.
+        self.fa4_decode_h64 = self.flashmla_prefill
+        # FLASHMLA_SPARSE's prefill query buffer, already padded to the kernel's
+        # 128-head multiple: ``concat_mla_q`` fills it in one pass. The op needs a
+        # 64-wide RoPE part and a latent width that is a multiple of 512; other
+        # shapes (e.g. a rope-less query) serve through torch.cat and a pad copy.
+        self.q_concat_spec: tuple[tuple[int, int, int], torch.dtype] | None = None
+        if (
+            self.flashmla_prefill
+            and self.qk_rope_head_dim == 64
+            and self.kv_lora_rank % 512 == 0
+        ):
+            self.q_concat_spec = (
+                (
+                    self.max_varlen_tokens,
+                    round_up(self.num_heads, 128),
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
+                torch.bfloat16,
+            )
 
     def _forward_mqa_kernel(
         self,
@@ -373,7 +449,21 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[SparseMLACommonMetadata]):
         is_decode: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not is_decode:
+            if self.q_concat_spec is not None and isinstance(q, tuple):
+                ql_nope, q_pe = q
+                (q_concat,) = current_workspace_manager().get_simultaneous(
+                    self.q_concat_spec
+                )
+                query = q_concat[: ql_nope.shape[0]]
+                ops.concat_mla_q(ql_nope, q_pe, query)
+                return self._prefill_flashmla(
+                    query, kv_cache, block_size, topk_indices, valid_counts
+                )
             query = torch.cat(q, dim=-1) if isinstance(q, tuple) else q
+            if self.flashmla_prefill:
+                return self._prefill_flashmla(
+                    query, kv_cache, block_size, topk_indices, valid_counts
+                )
             return self._prefill(query, kv_cache, topk_indices, valid_counts)
         if isinstance(q, tuple):
             ql_nope, q_pe = q
@@ -416,6 +506,7 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[SparseMLACommonMetadata]):
             causal=False,
             fa_version=4,
             return_softmax_lse=self.need_to_return_lse_for_decode,
+            mla_decode_h64=self.fa4_decode_h64,
         )
         return kernel_out if self.need_to_return_lse_for_decode else (kernel_out, None)
 
@@ -458,6 +549,38 @@ class FlashAttnMLASparseFA4Impl(SparseMLACommonImpl[SparseMLACommonMetadata]):
         out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
         lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
         return out, lse
+
+    def _prefill_flashmla(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_size: int,
+        topk_indices: torch.Tensor,
+        valid_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, None]:
+        """FLASHMLA_SPARSE's BF16 kernel on the same flat rows and top-k slots.
+
+        ``query`` holds the ``num_heads`` real heads, possibly already followed by
+        the padding heads.
+        """
+        from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
+
+        num_tokens, num_heads = query.shape[0], self.num_heads
+        # The Blackwell kernel takes query heads in multiples of 128.
+        padded_heads = round_up(num_heads, 128)
+        if padded_heads != query.shape[1]:
+            q_padded = query.new_empty((num_tokens, padded_heads, query.shape[-1]))
+            q_padded[:, :num_heads] = query
+            query = q_padded
+        kv_rows, _ = flat_kv_row_view(kv_cache, block_size)
+        out, _, _ = flash_mla_sparse_fwd(
+            query,
+            kv_rows.view(-1, 1, kv_rows.shape[-1]),
+            topk_indices.view(num_tokens, 1, -1),
+            self.scale,
+            topk_length=valid_counts,
+        )
+        return out[:, :num_heads], None
 
     # Compiles the FA4 decode kernel through this impl's hook before graph capture.
     # FlashInfer's body builds the fused BF16 query FA4's hook width-asserts on.

@@ -66,7 +66,7 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SharedTopkIndicesBuffer,
     SparseMLACommonMetadataBuilder,
 )
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backends.mla import index_group as index_group_module
 from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
@@ -75,6 +75,7 @@ from vllm.v1.attention.backends.mla.flashattn_mla_sparse import (
     FlashAttnMLASparseFA4MetadataBuilder,
     FlashAttnMLASparseImpl,
     _fa4_cute_mla_available,
+    fa4_prefill_backend_name,
 )
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseImpl,
@@ -800,7 +801,11 @@ def test_sparse_backend_decode_correctness(
     )
 
     with torch.inference_mode():
-        if backend_cls == FlashMLASparseBackend and kv_cache_dtype == "fp8_ds_mla":
+        # FA4 reserves its FlashMLA prefill query buffer in __init__, so a locked
+        # workspace must not need to grow.
+        if (
+            backend_cls == FlashMLASparseBackend and kv_cache_dtype == "fp8_ds_mla"
+        ) or backend_cls == FlashAttnMLASparseFA4Backend:
             from vllm.v1.worker.workspace import current_workspace_manager
 
             current_workspace_manager().lock()
@@ -1250,7 +1255,6 @@ def test_masked_mha_workspace_fits_single_request_boundary(max_query_len, expect
         ("FLASHMLA_SPARSE", 8, 112 * 1024),
         ("FLASHINFER_MLA_SPARSE", 4, 36 * 1024),
         ("FLASHINFER_MLA_SPARSE", 8, 64 * 1024),
-        ("FLASH_ATTN_MLA_SPARSE_FA4", 4, 36 * 1024),
     ],
 )
 def test_masked_mha_workspace_guards_long_routing_policy(
@@ -1271,6 +1275,70 @@ def test_masked_mha_workspace_guards_long_routing_policy(
         max_context_chunk_seq_len=0,
         workspace_numel=GLOBAL_TOPK_MASK_MAX_BYTES // torch.int32.itemsize,
     )
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "dcp_world_size", "expected"),
+    [
+        (64, 1, "FLASHMLA_SPARSE"),  # -dp 4 on GLM-5.2: every rank holds 64 heads
+        (32, 1, "FLASHMLA_SPARSE"),
+        (16, 1, "FLASHINFER_MLA_SPARSE"),  # TP4: FA4 is the default, FI prefill
+        (64, 2, "FLASHINFER_MLA_SPARSE"),  # FlashMLA refuses DCP on BF16
+    ],
+)
+def test_fa4_sparse_prefill_backend_name(num_heads, dcp_world_size, expected):
+    assert fa4_prefill_backend_name(num_heads, dcp_world_size) == expected
+    # FA4's masked-MHA routing then matches that backend's, e.g. 8K at TP1.
+    routed = _use_masked_mha(
+        backend_name=expected,
+        tensor_parallel_size=1,
+        qk_head_dim=256,
+        v_head_dim=256,
+        query_len=4096,
+        seq_len=4096,
+        has_context=False,
+    )
+    assert routed == (expected == "FLASHMLA_SPARSE")
+
+
+@pytest.mark.parametrize("flashmla_ok", [True, False])
+@pytest.mark.parametrize(("num_heads", "dcp"), [(16, 1), (64, 1), (128, 1), (16, 4)])
+def test_fa4_sparse_refuses_without_flashmla_in_its_lane(
+    monkeypatch, num_heads, dcp, flashmla_ok
+):
+    import vllm.config
+    import vllm.utils.flashinfer
+    import vllm.v1.attention.backends.mla.flashattn_mla_sparse as fa4_sparse
+    import vllm.v1.attention.ops.flashmla as flashmla_ops
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                index_topk=2048, kv_lora_rank=512, qk_rope_head_dim=64
+            ),
+            get_num_attention_heads=lambda parallel_config: num_heads,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
+    monkeypatch.setattr(vllm.utils.flashinfer, "has_flashinfer", lambda: True)
+    monkeypatch.setattr(fa4_sparse, "_fa4_cute_mla_available", lambda: None)
+    monkeypatch.setattr(
+        flashmla_ops,
+        "is_flashmla_sparse_supported",
+        lambda: (flashmla_ok, None if flashmla_ok else "no FlashMLA"),
+    )
+    monkeypatch.setattr(
+        fa4_sparse.FlashInferMLASparseTRTLLMBackend,
+        "supports_combination",
+        classmethod(lambda cls, *args, **kwargs: None),
+    )
+    reason = fa4_sparse.FlashAttnMLASparseFA4Backend.supports_combination()
+    # Only the lane that prefills on FlashMLA (> 16 heads, no DCP) needs it.
+    if num_heads > 16 and dcp == 1 and not flashmla_ok:
+        assert reason is not None and "no FlashMLA" in reason
+    else:
+        assert reason is None
 
 
 @pytest.mark.parametrize(
@@ -3656,8 +3724,16 @@ def _require_fa4():
         pytest.skip(reason)
 
 
+# Derived by FlashAttnMLASparseFA4Impl._init_lanes from num_heads and dcp_world_size.
+_FA4_LANE_ATTRS = frozenset(
+    {"prefill_backend_name", "flashmla_prefill", "fa4_decode_h64", "q_concat_spec"}
+)
+
+
 def _fa4_impl(**fields):
     """Skip constructor dependencies while retaining the implementation methods."""
+    # Lanes come from num_heads and dcp_world_size, never from the caller.
+    assert not _FA4_LANE_ATTRS & fields.keys(), _FA4_LANE_ATTRS & fields.keys()
     buffer = fields.pop("topk_indices_buffer")
     # DeepSeek-V3.2 shapes, and the DCP fields AttentionImpl.__new__ would fill.
     fields.setdefault("num_heads", 16)
@@ -3680,6 +3756,8 @@ def _fa4_impl(**fields):
     stub.__dict__.update(fields)
     # topk_indices_buffer is a data descriptor, so it needs its own setter.
     stub.topk_indices_buffer = buffer
+    # The lanes, as __init__ derives them.
+    stub._init_lanes()
     return stub
 
 
@@ -3758,7 +3836,10 @@ def _record_fa4_kernels(monkeypatch, num_heads, *, device):
 
 
 @pytest.mark.parametrize(
-    "num_heads,return_lse", [(128, False), (16, True)], ids=["heads128", "heads16_lse"]
+    "num_heads,return_lse",
+    [(128, False), (16, True), (64, False)],
+    # heads64: no DCP, so the heads-on-M kernel (mla_decode_h64)
+    ids=["heads128", "heads16_lse", "heads64"],
 )
 def test_fa4_sparse_decode_kernel_correctness(num_heads, return_lse):
     _require_fa4()
@@ -3766,9 +3847,13 @@ def test_fa4_sparse_decode_kernel_correctness(num_heads, return_lse):
     inputs = _fa4_inputs(counts, num_heads=num_heads, topk=2048, num_blocks=64)
     impl = _fa4_impl(
         topk_indices_buffer=inputs.topk_indices,
+        num_heads=num_heads,
         scale=inputs.scale,
         need_to_return_lse_for_decode=return_lse,
     )
+    # No DCP: above 16 heads the impl asks for the heads-on-M kernel, which FA4
+    # applies only at 64 heads per KV head. heads64 is the case that runs it.
+    assert impl.fa4_decode_h64 is (num_heads > 16)
     q = (inputs.ql_nope, inputs.q_pe)
 
     with torch.inference_mode():
@@ -3888,6 +3973,188 @@ def test_fa4_sparse_hook_routes_lanes(monkeypatch, is_decode, dcp):
     assert torch.isneginf(lse[0]).all()
 
 
+@pytest.mark.parametrize(
+    ("num_heads", "dcp", "rope_dim", "expected"),
+    [
+        (64, 1, 64, ((8192, 128, 576), torch.bfloat16)),  # GLM-5.2 at -dp 4 -ep
+        (32, 1, 64, ((8192, 128, 576), torch.bfloat16)),
+        (128, 1, 64, ((8192, 128, 576), torch.bfloat16)),
+        (16, 1, 64, None),  # trtllm-gen prefill lane
+        (32, 2, 64, None),  # DCP: trtllm-gen prefill lane
+        (64, 1, 0, None),  # rope-less query: concat_mla_q needs a 64-wide RoPE part
+    ],
+)
+def test_fa4_sparse_prefill_query_workspace(
+    monkeypatch, num_heads, dcp, rope_dim, expected
+):
+    """__init__ reserves FLASHMLA_SPARSE's padded query buffer in the FlashMLA
+    prefill lane only, and only for the shapes concat_mla_q takes."""
+    import vllm.v1.attention.backends.mla.flashattn_mla_sparse as fa4_sparse
+
+    fields = dict(
+        num_heads=num_heads,
+        kv_lora_rank=512,
+        qk_rope_head_dim=rope_dim,
+        dcp_world_size=dcp,
+    )
+
+    def stub_base_init(self, *args, **kwargs):
+        self.__dict__.update(fields)
+        self.topk_indices_buffer = torch.zeros(4, 128, dtype=torch.int32)
+
+    monkeypatch.setattr(SparseMLACommonImpl, "__init__", stub_base_init)
+    monkeypatch.setattr(
+        fa4_sparse,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=8192)
+        ),
+    )
+    manager = MagicMock()
+    monkeypatch.setattr(fa4_sparse, "current_workspace_manager", lambda: manager)
+
+    impl = FlashAttnMLASparseFA4Impl()
+
+    assert impl.q_concat_spec == expected
+    reserved = [call.args for call in manager.get_simultaneous.call_args_list]
+    assert reserved == ([] if expected is None else [(expected,)])
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "dcp", "rope_dim", "fused", "lane"),
+    [
+        (64, 1, 64, False, "concat"),
+        (128, 1, 64, False, "concat"),
+        (64, 1, 64, True, "cat"),  # an already fused query is only padded
+        (64, 1, 0, False, "cat"),  # rope-less: the torch.cat path, then the pad
+        (16, 1, 64, False, "trtllm"),
+        (64, 2, 64, False, "trtllm"),
+    ],
+)
+def test_fa4_sparse_prefill_query_build(
+    monkeypatch, num_heads, dcp, rope_dim, fused, lane
+):
+    """In the FlashMLA prefill lane a split query is written by concat_mla_q into
+    the reserved, already padded buffer that flash_mla_sparse_fwd then reads."""
+    import vllm.v1.attention.backends.mla.flashattn_mla_sparse as fa4_sparse
+
+    counts = [1, 2, 3, 4, 5]
+    num_tokens, kernel_heads = len(counts), num_heads * dcp
+    inputs = _fa4_inputs(counts, num_heads=kernel_heads, device="cpu")
+    inputs.q_pe = inputs.q_pe[..., :rope_dim]
+    calls = _record_fa4_kernels(monkeypatch, kernel_heads, device="cpu")
+    impl = _fa4_impl(
+        topk_indices_buffer=inputs.topk_indices,
+        num_heads=num_heads,
+        qk_rope_head_dim=rope_dim,
+        dcp_world_size=dcp,
+        max_varlen_tokens=16,
+    )
+
+    buffers: list[torch.Tensor] = []
+
+    def get_simultaneous(spec):
+        shape, dtype = spec
+        buffers.append(torch.full(shape, float("nan"), dtype=dtype))
+        return (buffers[-1],)
+
+    monkeypatch.setattr(
+        fa4_sparse,
+        "current_workspace_manager",
+        lambda: SimpleNamespace(get_simultaneous=get_simultaneous),
+    )
+    concat_calls: list[tuple] = []
+
+    def concat_mla_q(ql_nope, q_pe, out):
+        concat_calls.append((ql_nope, q_pe, out))
+        out[:, : ql_nope.shape[1]] = torch.cat((ql_nope, q_pe), dim=-1)
+
+    monkeypatch.setattr(fa4_sparse, "ops", SimpleNamespace(concat_mla_q=concat_mla_q))
+    flashmla_queries: list[torch.Tensor] = []
+
+    def flash_mla_sparse_fwd(q, kv, indices, scale, topk_length):
+        flashmla_queries.append(q)
+        out = torch.full((q.shape[0], q.shape[1], 512), 3.0, dtype=q.dtype)
+        return out, None, None
+
+    monkeypatch.setattr(flashmla, "flash_mla_sparse_fwd", flash_mla_sparse_fwd)
+
+    q = (inputs.ql_nope, inputs.q_pe)
+    expected_query = torch.cat(q, dim=-1)
+    with torch.inference_mode():
+        out, lse = impl._forward_mqa_kernel(
+            expected_query if fused else q,
+            inputs.kv_cache,
+            inputs.topk_indices,
+            inputs.valid_counts,
+            layer=None,
+            block_size=inputs.block_size,
+            is_decode=False,
+        )
+
+    assert lse is None
+    assert out.shape == (num_tokens, kernel_heads, 512)
+    assert calls.fa4 == []
+    if lane == "trtllm":
+        (trtllm,) = calls.trtllm
+        assert trtllm["query"].shape == (num_tokens, 1, kernel_heads, 576)
+        assert buffers == concat_calls == flashmla_queries == []
+        return
+
+    assert calls.trtllm == []
+    assert (out == 3.0).all()
+    (query,) = flashmla_queries
+    # The kernel always sees whole 128-head groups; the real heads are the query.
+    assert query.shape == (num_tokens, round_up(num_heads, 128), 512 + rope_dim)
+    torch.testing.assert_close(query[:, :num_heads], expected_query, rtol=0, atol=0)
+    if lane == "cat":
+        assert buffers == concat_calls == []
+        return
+    # One concat into the workspace rows of this batch, no further pad copy.
+    (buffer,) = buffers
+    ((ql_nope, q_pe, written),) = concat_calls
+    assert ql_nope is inputs.ql_nope and q_pe is inputs.q_pe
+    assert written.data_ptr() == query.data_ptr() == buffer.data_ptr()
+    assert buffer.shape == (16, round_up(num_heads, 128), 576)
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "dcp", "expected"),
+    [
+        (64, 1, True),  # -dp 4 -ep on GLM-5.2: the heads-on-M kernel
+        (32, 1, True),  # FA4 ignores the flag below 64 heads per KV head
+        (16, 1, False),  # TP4: FA4 is the default, nothing changes
+        (16, 4, False),  # 64 gathered heads under DCP keep the transposed kernel
+        (32, 2, False),
+    ],
+)
+def test_fa4_sparse_decode_h64_flag(monkeypatch, num_heads, dcp, expected):
+    """FA4 decode asks for the 64-head heads-on-M kernel only in the lane that
+    prefills on FlashMLA: more than 16 heads per rank and no DCP."""
+    counts = [1, 2, 3]
+    kernel_heads = num_heads * dcp
+    inputs = _fa4_inputs(counts, num_heads=kernel_heads, device="cpu")
+    calls = _record_fa4_kernels(monkeypatch, kernel_heads, device="cpu")
+    impl = _fa4_impl(
+        topk_indices_buffer=inputs.topk_indices,
+        num_heads=num_heads,
+        dcp_world_size=dcp,
+        need_to_return_lse_for_decode=dcp > 1,
+    )
+    assert impl.fa4_decode_h64 is expected
+    kv_rows = inputs.kv_cache.view(-1, inputs.kv_lora_rank + inputs.rope_dim)
+    with torch.inference_mode():
+        impl._decode(
+            inputs.ql_nope,
+            inputs.q_pe,
+            kv_rows,
+            inputs.topk_indices,
+            inputs.valid_counts,
+        )
+    (fa4,) = calls.fa4
+    assert fa4["mla_decode_h64"] is expected
+
+
 def test_fa4_sparse_autotune_hisparse_decode_runs_decode_lane(monkeypatch):
     """The HiSparse warmup reaches FA4's hook once per key, on the decode lane."""
     from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
@@ -3941,26 +4208,16 @@ def test_fa4_sparse_autotune_hisparse_decode_runs_decode_lane(monkeypatch):
     sibling.impl.autotune_hisparse_decode.assert_called_once_with(sibling)
 
 
-@pytest.mark.parametrize("dcp", [1, 2])
-@pytest.mark.parametrize("hisparse", [False, True])
-def test_fa4_builder_uniform_decodes_and_dcp_workspace(monkeypatch, hisparse, dcp):
-    """Only HiSparse requires uniform decodes; only DCP pre-sizes the workspace."""
-    from vllm.v1.attention.backend import AttentionCGSupport
-    from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as fi_sparse
-
-    def stub_base_init(self, kv_cache_spec, layer_names, vllm_config, device):
-        # Only the reorder-threshold and workspace inputs matter here.
-        self.vllm_config = vllm_config
-        self.model_config = vllm_config.model_config
-        self.dcp_world_size = dcp
-
-    monkeypatch.setattr(SparseMLACommonMetadataBuilder, "__init__", stub_base_init)
-    workspace = MagicMock()
-    monkeypatch.setattr(fi_sparse, "_get_workspace_buffer", workspace)
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(get_num_attention_heads=lambda _: 16),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+def _fa4_builder_vllm_config(num_heads, dcp, hisparse):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_num_attention_heads=lambda _: num_heads, max_model_len=4096
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp, cp_kv_cache_interleave_size=1
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192, max_num_seqs=8),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
         speculative_config=SimpleNamespace(
             num_speculative_tokens=3, parallel_drafting=False
         ),
@@ -3969,18 +4226,104 @@ def test_fa4_builder_uniform_decodes_and_dcp_workspace(monkeypatch, hisparse, dc
         ),
     )
 
+
+def _stub_sparse_builder_base(monkeypatch, dcp):
+    def stub_base_init(self, kv_cache_spec, layer_names, vllm_config, device):
+        # Only the reorder-threshold and workspace inputs matter here.
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.dcp_world_size = dcp
+        self.use_pcp = False
+        self.device = device
+        self.topk_tokens = 128
+
+    monkeypatch.setattr(SparseMLACommonMetadataBuilder, "__init__", stub_base_init)
+
+
+@pytest.mark.parametrize("num_heads", [16, 64])
+@pytest.mark.parametrize("dcp", [1, 2])
+@pytest.mark.parametrize("hisparse", [False, True])
+def test_fa4_builder_uniform_decodes_and_dcp_workspace(
+    monkeypatch, hisparse, dcp, num_heads
+):
+    """The FlashMLA-prefill lane (> 16 heads, no DCP) and HiSparse require uniform
+    decodes; only DCP pre-sizes the workspace."""
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as fi_sparse
+
+    _stub_sparse_builder_base(monkeypatch, dcp)
+    workspace = MagicMock()
+    monkeypatch.setattr(fi_sparse, "_get_workspace_buffer", workspace)
+    vllm_config = _fa4_builder_vllm_config(num_heads, dcp, hisparse)
+
     builder = FlashAttnMLASparseFA4MetadataBuilder(
         None, ["layer"], vllm_config, torch.device("cpu")
     )
 
-    assert builder.reorder_batch_threshold == (4 if hisparse else 128)
-    assert builder.require_uniform_decodes is hisparse
+    flashmla_lane = num_heads > 16 and dcp == 1
+    # FlashInfer's per-head-count threshold (inherited in both lanes); HiSparse
+    # sets 1, widened to the 1 + 3 spec tokens.
+    assert builder.reorder_batch_threshold == (
+        4 if hisparse else {16: 128, 64: 256}[num_heads]
+    )
+    assert builder.require_uniform_decodes is (flashmla_lane or hisparse)
     # FA4 bakes the decode row count into its cached varlen scalars.
     assert builder._cudagraph_support is AttentionCGSupport.UNIFORM_BATCH
     # Under DCP, sized before the first capture: graphs bake the address in.
     assert [call.args[1] for call in workspace.call_args_list] == (
-        [] if dcp == 1 else [fi_sparse._required_workspace_bytes(dcp, 16, 8192)]
+        [] if dcp == 1 else [fi_sparse._required_workspace_bytes(dcp, num_heads, 8192)]
     )
+
+
+@pytest.mark.parametrize("num_heads", [32, 64, 128])
+@pytest.mark.parametrize("hisparse", [False, True])
+@pytest.mark.parametrize("num_spec_tokens", [None, 3])
+def test_fa4_builder_splits_batches_like_flashmla(
+    monkeypatch, num_heads, hisparse, num_spec_tokens
+):
+    """Where FA4 prefills on FlashMLA, its builder splits decodes from prefills
+    exactly as FLASHMLA_SPARSE's builder does on SM100."""
+    from vllm.v1.attention.backends.mla import flashmla_sparse
+
+    _stub_sparse_builder_base(monkeypatch, dcp=1)
+    monkeypatch.setattr(flashmla_sparse, "num_compute_units", lambda _: 4)
+    monkeypatch.setattr(
+        flashmla_sparse,
+        "current_platform",
+        SimpleNamespace(is_device_capability_family=lambda family: family == 100),
+    )
+    vllm_config = _fa4_builder_vllm_config(num_heads, 1, hisparse)
+    vllm_config.speculative_config.num_speculative_tokens = num_spec_tokens
+    cpu = torch.device("cpu")
+
+    fa4 = FlashAttnMLASparseFA4MetadataBuilder(None, ["layer"], vllm_config, cpu)
+    flashmla_builder = FlashMLASparseMetadataBuilder(None, ["layer"], vllm_config, cpu)
+
+    assert fa4_prefill_backend_name(num_heads, 1) == "FLASHMLA_SPARSE"
+    assert (fa4.reorder_batch_threshold, fa4.require_uniform_decodes) == (
+        flashmla_builder.reorder_batch_threshold,
+        flashmla_builder.require_uniform_decodes,
+    )
+    # Spec-decode rows of unequal length next to a short chunk: both builders keep
+    # only the leading equal-length run as decodes.
+    metadata = SimpleNamespace(
+        max_query_len=5,
+        num_reqs=4,
+        num_actual_tokens=16,
+        query_start_loc_cpu=torch.tensor([0, 4, 8, 11, 16]),
+        is_prefilling=None,
+    )
+    splits = [
+        split_decodes_and_prefills(
+            metadata,
+            decode_threshold=builder.reorder_batch_threshold,
+            require_uniform=builder.require_uniform_decodes,
+        )
+        for builder in (fa4, flashmla_builder)
+    ]
+    assert splits[0] == splits[1]
+    if not hisparse:
+        assert splits[0] == (2, 2, 8, 8)
 
 
 @pytest.mark.parametrize(
