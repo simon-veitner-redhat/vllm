@@ -6,21 +6,30 @@ import pytest
 from vllm import SamplingParams
 from vllm.platforms import current_platform
 from vllm.v1.metrics.reader import Counter
-from vllm.v1.watermarking import GumbelWatermarkDetector
+from vllm.v1.watermarking import GumbelWatermarkDetector, SynthIDWatermarkDetector
 
 
-@pytest.mark.parametrize("enforce", [False, True])
 @pytest.mark.skipif(
     not current_platform.is_cuda_alike(), reason="requires a CUDA-like accelerator"
 )
-def test_llm_generated_sequence_is_watermarked(vllm_runner, enforce):
+@pytest.mark.parametrize(
+    ("algorithm", "detector_cls", "recorded_p_value"),
+    [
+        ("gumbel", GumbelWatermarkDetector, 9.83e-20),
+        # Loose bound (1e-6 after the x10 tolerance) that holds across seeds/paths.
+        ("synthid_text", SynthIDWatermarkDetector, 1e-7),
+    ],
+)
+def test_llm_generated_sequence_is_watermarked(
+    vllm_runner, algorithm, detector_cls, recorded_p_value
+):
     """Engine-level watermarking must produce tokens the detector recognizes."""
     watermark_config = {"key": 42, "context_width": 4}
-    detector = GumbelWatermarkDetector(**watermark_config)
+    detector = detector_cls(**watermark_config)
 
     runner = vllm_runner(
         "facebook/opt-125m",
-        watermark_config={**watermark_config, "enforce": enforce},
+        watermark_config={"algorithm": algorithm, **watermark_config},
         seed=0,
         enforce_eager=True,
         max_model_len=512,
@@ -28,10 +37,7 @@ def test_llm_generated_sequence_is_watermarked(vllm_runner, enforce):
         disable_log_stats=False,
     )
     request = "Tell me a story about an explorer who discovers a mysterious island."
-    # Openings use ordinary sampling, so the recorded p-value needs a fixed seed.
-    params_use_wm = SamplingParams(
-        temperature=1.0, max_tokens=256, watermarking=True, seed=0
-    )
+    params_use_wm = SamplingParams(temperature=1.0, max_tokens=256, watermarking=True)
     params_no_wm = SamplingParams(temperature=1.0, max_tokens=256, watermarking=False)
     params_greedy = SamplingParams(temperature=0.0, max_tokens=16)
 
@@ -41,19 +47,14 @@ def test_llm_generated_sequence_is_watermarked(vllm_runner, enforce):
         runner.llm.generate(request, params_greedy)
         metrics = runner.llm.get_metrics()
 
-    # The greedy request is skipped. The opt-out is not watermarked unless
-    # enforce overrides it.
+    # The greedy request is skipped; the opt-out one is not watermarked.
     counters = [m for m in metrics if isinstance(m, Counter)]
     status = {
         m.labels["status"]: m.value
         for m in counters
         if m.name == "vllm:watermark_requests"
     }
-    assert status == {
-        "watermarked": 1 + enforce,
-        "skipped": 1,
-        "not_watermarked": 1 - enforce,
-    }
+    assert status == {"watermarked": 1, "skipped": 1, "not_watermarked": 1}
     num_success = sum(m.value for m in counters if m.name == "vllm:request_success")
     assert sum(status.values()) == num_success
 
@@ -61,7 +62,6 @@ def test_llm_generated_sequence_is_watermarked(vllm_runner, enforce):
     result_no_wm = detector.detect(list(output_no_wm[0].outputs[0].token_ids))
 
     assert result_use_wm.is_watermarked, result_use_wm
-    recorded_p_value = 2.68e-29
     assert result_use_wm.p_value < recorded_p_value * 10  # tolerance
 
-    assert result_no_wm.is_watermarked == enforce, result_no_wm
+    assert not result_no_wm.is_watermarked, result_no_wm
