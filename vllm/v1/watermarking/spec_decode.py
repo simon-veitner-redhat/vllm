@@ -166,20 +166,17 @@ class DraftWatermarker:
         drafts of its request, so steps must be sampled in order even when
         their logits were computed in parallel.
         """
+        assert apply_temperature
+        assert is_drafting
+        assert logits_cache is not None
         assert logits_cache_col is not None
         num_steps = self.num_speculative_steps
-        if (
-            isinstance(self.watermarker, GumbelWatermarker)
-            and type(self.watermarker.prf) is PhiloxPRF
-            and logits.is_cuda
-        ):
-            assert apply_temperature
-            assert is_drafting
-            assert logits_cache is not None
+        philox_key = _philox_gumbel_key(self.watermarker)
+        if philox_key is not None and logits.is_cuda:
             return draft_philox_gumbel_sample(
                 logits,
                 self.contexts,
-                self.watermarker.prf.key,
+                philox_key,
                 num_steps=num_steps,
                 expanded_idx_mapping=idx_mapping,
                 temperatures=temperature,
@@ -258,16 +255,23 @@ def create_speculative_draft_watermarker(
     )
 
 
-def _philox_key(watermarker: Watermarker) -> int:
-    if not (
-        isinstance(watermarker, GumbelWatermarker)
-        and type(watermarker.prf) is PhiloxPRF
+def _philox_gumbel_key(watermarker: Watermarker) -> int | None:
+    """The Philox key of a Philox PRF GumbelWatermarker, else None."""
+    if isinstance(watermarker, GumbelWatermarker) and (
+        type(watermarker.prf) is PhiloxPRF
     ):
+        return watermarker.prf.key
+    return None
+
+
+def _philox_key(watermarker: Watermarker) -> int:
+    key = _philox_gumbel_key(watermarker)
+    if key is None:
         raise NotImplementedError(
             "In-kernel watermarked recovery supports only the Philox PRF "
             "GumbelWatermarker"
         )
-    return watermarker.prf.key
+    return key
 
 
 def _resolve_watermark_key(watermarker: Watermarker) -> int:

@@ -451,7 +451,7 @@ class DraftModelSpeculator(BaseSpeculator):
     def _draft_sampler(self) -> Callable[..., torch.Tensor]:
         """Return the sampler for one sample_draft batch.
 
-        Parallel drafters, which pass all steps at once flattened as
+        Drafters that pass all steps in one sample_draft batch, flattened as
         (request, step), override this.
         """
         if self.draft_watermarker is None:

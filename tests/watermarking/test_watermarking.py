@@ -1726,8 +1726,12 @@ def test_dflash_draft_sampler_watermarks_drafts_in_step_order(monkeypatch):
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("deduplicate_contexts", ["none", "single_turn", "all"])
-def test_dflash_draft_sampler_matches_step_loop_on_cuda(deduplicate_contexts, dtype):
-    """The fused CUDA `sample_parallel` is bit-exact with sampling step by step."""
+@pytest.mark.parametrize("cuda_graph", [False, True])
+def test_dflash_draft_sampler_matches_step_loop_on_cuda(
+    deduplicate_contexts, dtype, cuda_graph
+):
+    """The fused CUDA `sample_parallel`, run eagerly or replayed from a CUDA
+    graph, is bit-exact with sampling step by step."""
     num_reqs, num_steps, vocab_size, max_num_reqs = 4, 5, 1500, 6
     generator = torch.Generator().manual_seed(0)
     # Tokens 0-2 dominate, so contexts repeat and deduplication fires.
@@ -1755,27 +1759,41 @@ def test_dflash_draft_sampler_matches_step_loop_on_cuda(deduplicate_contexts, dt
             deduplicate_contexts=deduplicate_contexts,
             deduplicate_contexts_max_history=None,
         )
-        draft_watermarker.prepare(
+        state = dict(
             contexts=contexts.cuda(),
             enabled=torch.tensor([True, False, True, True]).cuda(),
             all_token_ids=all_token_ids.cuda(),
             prompt_lens=torch.full((max_num_reqs,), 4).cuda(),
             total_lens=torch.full((max_num_reqs,), 24).cuda(),
         )
+        draft_watermarker.prepare(**state)
         draft_logits = torch.zeros(max_num_reqs, num_steps, vocab_size, dtype=dtype)
         draft_logits = draft_logits.cuda()
         args = (temperature, seeds)
         kwargs = dict(apply_temperature=True, is_drafting=True)
         if fused:
-            sampled = draft_watermarker.sample_parallel(
-                logits.view(-1, vocab_size),
-                idx_mapping,
-                *args,
-                pos,
-                logits_cache=draft_logits,
-                logits_cache_col=draft_step,
-                **kwargs,
-            )
+
+            def sample():
+                return draft_watermarker.sample_parallel(
+                    logits.view(-1, vocab_size),
+                    idx_mapping,
+                    *args,
+                    pos,
+                    logits_cache=draft_logits,
+                    logits_cache_col=draft_step,
+                    **kwargs,
+                )
+
+            if cuda_graph:
+                sample()  # Compile the kernels before capture.
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    sampled = sample()
+                draft_watermarker.prepare(**state)
+                draft_logits.zero_()
+                graph.replay()
+            else:
+                sampled = sample()
         else:
             by_step = [t.view(num_reqs, num_steps) for t in (idx_mapping, pos)]
             steps = draft_step.view(num_reqs, num_steps)
