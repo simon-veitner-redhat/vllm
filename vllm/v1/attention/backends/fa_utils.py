@@ -203,7 +203,7 @@ def get_flash_attn_version(
         ):
             logger.warning_once(
                 "FA4's Blackwell head_size=512 kernel does not support %s, "
-                "defaulting to FA version 2.",
+                "so FlashAttention cannot serve head_size=512.",
                 reason,
             )
             fa_version = 2

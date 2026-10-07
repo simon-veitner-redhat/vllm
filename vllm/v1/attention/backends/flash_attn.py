@@ -500,20 +500,16 @@ class FlashAttentionBackend(AttentionBackend):
                 "FP8 KV cache requires FA3 on SM90, FA4 with head_size=512 "
                 "on SM90, or FA4 on SM100"
             )
-        if (
-            use_mm_prefix
-            and get_flash_attn_version(
-                head_size=head_size,
-                has_sinks=has_sink,
-                kv_cache_block_size=block_size,
-                supports_fa4_hd256=True,
-            )
-            != 4
-        ):
+        if (use_mm_prefix or head_size > 256) and get_flash_attn_version(
+            head_size=head_size,
+            has_sinks=has_sink,
+            kv_cache_block_size=block_size,
+            supports_fa4_hd256=True,
+        ) != 4:
             return (
-                "mm_prefix (PrefixLM bidirectional attention) requires "
-                "FlashAttention v4, which does not resolve for this "
-                "head_size"
+                "mm_prefix (PrefixLM bidirectional attention) and head_size > 256 "
+                "require FlashAttention v4, which does not resolve for this "
+                "configuration"
             )
         return None
 

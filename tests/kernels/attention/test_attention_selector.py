@@ -761,24 +761,39 @@ def test_fa4_hd256_block_size_advertisement(
 
 
 @blackwell_only
-def test_fa4_hd256_mm_prefix_deselects_flash_attn():
+@pytest.mark.parametrize(
+    "head_size,has_sink,config_kwargs,capability,deselected",
+    [
+        (256, False, {"is_mm_prefix_lm": True}, DeviceCapability(10, 0), True),
+        # FA2 has no head_size > 256 kernel, so FA4 ineligibility must deselect.
+        (512, False, {}, DeviceCapability(10, 0), False),
+        (512, True, {}, DeviceCapability(10, 0), True),
+        (512, False, {"softcap": 50.0}, DeviceCapability(10, 0), True),
+        (512, False, {"cache_dtype": "fp8"}, DeviceCapability(10, 0), True),
+        (512, False, {"dcp_size": 2}, DeviceCapability(10, 0), True),
+        (512, False, {"rswa_window": 512}, DeviceCapability(10, 0), True),
+        (512, False, {}, DeviceCapability(12, 0), True),
+    ],
+)
+def test_fa4_deselects_flash_attn(
+    head_size, has_sink, config_kwargs, capability, deselected
+):
     from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 
-    with _blackwell(_hd256_config(is_mm_prefix_lm=True)):
-        assert (
-            FlashAttentionBackend.supports_combination(
-                head_size=256,
-                dtype=torch.bfloat16,
-                kv_cache_dtype=None,
-                block_size=128,
-                use_mla=False,
-                has_sink=False,
-                use_sparse=False,
-                use_mm_prefix=True,
-                device_capability=DeviceCapability(10, 0),
-            )
-            is not None
+    vllm_config = _hd256_config(head_size=head_size, **config_kwargs)
+    with _blackwell(vllm_config, capability):
+        reason = FlashAttentionBackend.supports_combination(
+            head_size=head_size,
+            dtype=torch.bfloat16,
+            kv_cache_dtype=None,
+            block_size=128,
+            use_mla=False,
+            has_sink=has_sink,
+            use_sparse=False,
+            use_mm_prefix=config_kwargs.get("is_mm_prefix_lm", False),
+            device_capability=capability,
         )
+    assert (reason is not None) == deselected
 
 
 @pytest.mark.skipif(

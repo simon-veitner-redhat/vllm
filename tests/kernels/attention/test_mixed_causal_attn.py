@@ -326,8 +326,15 @@ def test_flash_attn4_mixed_causal(
     "per_seq_causal",
     [[True, False, True], [False, False, False], [True, True, True]],
 )
+# Uneven, non-64-aligned q_lens with a short sequence that is not last.
+@pytest.mark.parametrize(
+    "query_lens,kv_lens",
+    [([32, 32, 1], [32, 160, 96]), ([100, 37, 200], [160, 37, 224])],
+)
 @torch.inference_mode()
-def test_flash_attn4_hd512_mixed_causal(per_seq_causal: list[bool]):
+def test_flash_attn4_hd512_mixed_causal(
+    per_seq_causal: list[bool], query_lens: list[int], kv_lens: list[int]
+):
     """SM100 FA4 has no ``dynamic_causal``; the backend splits a mixed batch
     into a causal and a non-causal launch gated by ``seqused_q``."""
     from vllm.v1.attention.backends.flash_attn import split_dynamic_causal
@@ -339,7 +346,6 @@ def test_flash_attn4_hd512_mixed_causal(per_seq_causal: list[bool]):
     set_random_seed(42)
     device, dtype, head_size, block_size = "cuda", torch.bfloat16, 512, 16
     num_query_heads, num_kv_heads = 16, 2
-    query_lens, kv_lens = [32, 32, 1], [32, 160, 96]
     num_seqs = len(query_lens)
     max_num_blocks = max(kv_lens) // block_size
     num_blocks = max_num_blocks * num_seqs
@@ -365,7 +371,7 @@ def test_flash_attn4_hd512_mixed_causal(per_seq_causal: list[bool]):
     seqused_k = torch.tensor(kv_lens, dtype=torch.int32, device=device)
     dynamic_causal = torch.tensor(per_seq_causal, dtype=torch.int32, device=device)
 
-    output = torch.empty_like(query)
+    output = torch.full_like(query, float("nan"))
     for causal, seqused_q in split_dynamic_causal(cu_seqlens_q, dynamic_causal):
         flash_attn_varlen_func(
             q=query,
