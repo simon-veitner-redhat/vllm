@@ -49,7 +49,7 @@ class WatermarkConfig:
     `none`."""
     prf: WatermarkPRFName = "philox"
     """Pseudorandom function used by the watermarking algorithm."""
-    depth: int = 32
+    depth: int = Field(default=32, ge=1)
     """Number of layers of tournament sampling for SynthID-Text."""
     allow_target_only_watermarking: bool = False
     """Allow speculative decoding without watermarking draft tokens."""
@@ -62,15 +62,12 @@ class WatermarkConfig:
     def validate_watermark_settings(self) -> Self:
         if self.key > 2**64 - 1:
             raise ValueError("philox keys must fit in 64 bits")
-        if self.algorithm == "synthid_text":
-            if self.depth < 1:
-                raise ValueError("SynthID-Text depth must be positive")
-            if self.depth > 32:
-                logger.warning_once(
-                    "SynthID-Text depths above 32 require additional Philox "
-                    "evaluations and may reduce sampling performance.",
-                    scope="global",
-                )
+        if self.algorithm == "synthid_text" and self.depth > 32:
+            logger.warning_once(
+                "SynthID-Text depths above 32 require additional Philox "
+                "evaluations and may reduce sampling performance.",
+                scope="global",
+            )
         history_is_too_short = (
             self.deduplicate_contexts_max_history is not None
             and self.deduplicate_contexts_max_history < _MIN_RECOMMENDED_DEDUP_HISTORY
