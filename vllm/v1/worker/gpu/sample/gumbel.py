@@ -29,7 +29,9 @@ def _temperature_kernel(
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
-    temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
+    temperature = tl.load(
+        temperature_ptr + req_state_idx, mask=req_state_idx >= 0, other=0.0
+    ).to(tl.float32)
     if temperature == 0.0 or temperature == 1.0:
         # Early return to avoid loading logits.
         return

@@ -533,7 +533,7 @@ def _philox_gumbel_from_logits(logits, word):
 def _gumbel_value(logits_ptr, output, mask, temperature):
     logits = tl.load(logits_ptr, mask=mask, other=float("-inf")).to(tl.float32)
     if temperature is not None:
-        logits = tl_math.div_rn(logits, temperature)
+        logits = logits / temperature
     return _philox_gumbel_from_logits(logits, output)
 
 
@@ -603,7 +603,6 @@ def _philox_gumbel_kernel(
     key_0_value,
     key_1_value,
     vocab_size,
-    num_temperatures,
     CONTEXT_WIDTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     USE_FP64: tl.constexpr,
@@ -625,11 +624,8 @@ def _philox_gumbel_kernel(
 
     row_temperature = None
     if APPLY_TEMPERATURE:
-        # Matches `logits / where(t == 0, 1, t)` for t = temperature[idx], where
-        # the -1 index of a padding row wraps like a torch index.
         row_temperature = tl.load(
-            temp_ptr
-            + tl.where(valid_req, req_state_idx, req_state_idx + num_temperatures)
+            temp_ptr + req_state_idx, mask=valid_req, other=0.0
         ).to(tl.float32)
         row_temperature = tl.where(row_temperature == 0, 1.0, row_temperature)
 
@@ -662,8 +658,6 @@ def _philox_gumbel_kernel(
             logits = tl.load(logits_row + candidate, mask=mask, other=float("-inf")).to(
                 tl.float32
             )
-            if row_temperature is not None:
-                logits = tl_math.div_rn(logits, row_temperature)
             value, index = gumbel_noised_argmax(
                 logits,
                 candidate,
@@ -673,7 +667,7 @@ def _philox_gumbel_kernel(
                 temp,
                 IS_DRAFTING=IS_DRAFTING,
                 USE_FP64=USE_FP64,
-                APPLY_TEMPERATURE=False,
+                APPLY_TEMPERATURE=APPLY_TEMPERATURE,
             )
             token_id = block_index * BLOCK_SIZE + index
             tl.store(
@@ -808,7 +802,6 @@ def philox_gumbel_sample(
         key & _UINT32_MASK_VALUE,
         key >> 32,
         vocab_size,
-        0,
         CONTEXT_WIDTH=contexts.shape[-1],
         BLOCK_SIZE=block_size,
         USE_FP64=use_fp64,
@@ -1046,7 +1039,6 @@ def draft_philox_gumbel_sample(
             key & _UINT32_MASK_VALUE,
             key >> 32,
             vocab_size,
-            temperatures.shape[0],
             CONTEXT_WIDTH=contexts.shape[-1],
             BLOCK_SIZE=block_size,
             USE_FP64=use_fp64,

@@ -12,6 +12,9 @@ from vllm.v1.watermarking.watermarker import (
     SupportsSpeculativeDecoding,
     Watermarker,
 )
+from vllm.v1.worker.gpu.sample.gumbel import (
+    apply_temperature as apply_temperature_inplace,
+)
 from vllm.v1.worker.gpu.sample.watermark import draft_watermarking_mask
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
 
@@ -119,9 +122,16 @@ class DraftWatermarker:
             logits, idx_mapping, request_temperatures, logits_cache_col, contexts
         )
 
-        processed_logits = logits / torch.where(
-            request_temperatures == 0, 1, request_temperatures
-        ).unsqueeze(-1)
+        # Divide like gumbel_sample so opted-out rows sample the same tokens.
+        processed_logits = logits.to(torch.float32, copy=True)
+        if processed_logits.is_cuda:
+            apply_temperature_inplace(
+                processed_logits, idx_mapping.contiguous(), temperature
+            )
+        else:
+            processed_logits /= torch.where(
+                request_temperatures == 0, 1, request_temperatures
+            ).unsqueeze(-1)
         random_sampler = RandomSampler(
             expanded_idx_mapping=idx_mapping,
             temperatures=temperature,
