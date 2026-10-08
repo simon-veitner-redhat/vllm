@@ -30,12 +30,13 @@ def test_synthid_config_and_factory():
     assert not config.supports_speculative_decoding
 
 
-def test_synthid_config_rejects_invalid_depth():
+@pytest.mark.parametrize("depth", [0, 65])
+def test_synthid_config_rejects_invalid_depth(depth):
     with pytest.raises(ValidationError):
         WatermarkConfig(
             key=42,
             algorithm="synthid_text",
-            depth=0,
+            depth=depth,
         )
 
 

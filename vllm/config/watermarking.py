@@ -49,8 +49,10 @@ class WatermarkConfig:
     `none`."""
     prf: WatermarkPRFName = "philox"
     """Pseudorandom function used by the watermarking algorithm."""
-    depth: int = Field(default=32, ge=1)
-    """Number of layers of tournament sampling for SynthID-Text."""
+    depth: int = Field(default=32, ge=1, le=64)
+    """Number of layers of tournament sampling for SynthID-Text. Capped at 64
+    because the Triton kernel unrolls every layer, so its compile time grows
+    quadratically with depth."""
     allow_target_only_watermarking: bool = False
     """Allow speculative decoding without watermarking draft tokens."""
 
