@@ -964,8 +964,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # during actual execution.
         assert self.sampler is not None
         if isinstance(self.sampler, GPUWatermarkSampler):
-            # Profile watermark [num_reqs, vocab] temporaries before KV allocation.
-            sampling_params = SamplingParams(temperature=1.0, watermarking=True)
+            # Profile watermark temporaries, incl. the T != 1 FP32 logits copy.
+            sampling_params = SamplingParams(temperature=0.9, watermarking=True)
             for req_idx in range(num_reqs):
                 self.sampler.add_request(req_idx, sampling_params)
             self.sampler.apply_staged_writes()
