@@ -105,14 +105,19 @@ def test_synthid_accelerator_matches_cpu(depth):
     contexts = torch.tensor([[-1, -1, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]])
     watermarker = SynthIDWatermarker(42, context_width=3, depth=depth)
 
-    expected = watermarker.watermark_logits(logits.double(), contexts)
+    # FP64 tournament reference; watermark_logits itself computes in FP32.
+    expected = torch.softmax(logits.double(), dim=1)
+    for layer in range(depth):
+        words = watermarker.prf.uint32(
+            contexts, torch.arange(logits.shape[1]), stream=_STREAM_DOMAIN | layer // 32
+        )
+        g = ((words >> layer % 32) & 1).double()
+        expected *= 1 + g - (expected * g).sum(dim=1, keepdim=True)
     actual = watermarker.watermark_logits(logits.cuda(), contexts.cuda()).cpu()
 
     assert actual.dtype == torch.float32
-    assert torch.equal(torch.isneginf(actual), torch.isneginf(expected))
-    torch.testing.assert_close(
-        actual.exp().double(), expected.exp().double(), rtol=1e-5, atol=1e-7
-    )
+    assert torch.equal(torch.isneginf(actual), torch.isneginf(logits))
+    torch.testing.assert_close(actual.exp().double(), expected, rtol=1e-5, atol=1e-7)
 
 
 @pytest.mark.parametrize(
