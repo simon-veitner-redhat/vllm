@@ -906,7 +906,7 @@ def _synthid_tournament_kernel(
                     state_3,
                     key_0,
                     key_1,
-                    (stream_0_value + layer // 32).to(tl.uint32),
+                    (stream_0_value | (layer // 32)).to(tl.uint32),
                     stream_1,
                     BLOCK_SIZE,
                 )
@@ -937,7 +937,7 @@ def _synthid_tournament_kernel(
                 state_3,
                 key_0,
                 key_1,
-                (stream_0_value + FIRST // 32).to(tl.uint32),
+                (stream_0_value | (FIRST // 32)).to(tl.uint32),
                 stream_1,
                 BLOCK_SIZE,
             )
@@ -1010,14 +1010,14 @@ def synthid_watermark_logits(
     contexts: torch.Tensor,
     key: int,
     depth: int,
-    stream: int = 0,
+    *,
+    stream: int,
 ) -> torch.Tensor:
     """Return FP32 SynthID-Text log-probs of `logits` [B, V].
 
-    Layers [32 b, 32 b + 32) use the bits of Philox stream `stream + b`.
+    Layers [32 b, 32 b + 32) use the bits of Philox stream `stream | b`.
     """
     stream_0, stream_1 = stream & _UINT32_MASK_VALUE, stream >> 32
-    assert stream_0 + (depth - 1) // 32 <= _UINT32_MASK_VALUE
     if logits.stride(-1) != 1:
         logits = logits.contiguous()
     if contexts.stride(-1) != 1:
