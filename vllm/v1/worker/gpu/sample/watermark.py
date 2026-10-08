@@ -924,6 +924,7 @@ def _draft_step_kernel(
             )
             tl.debug_barrier()
             active = tl.load(skip_mask_ptr + row)
+            tl.debug_barrier()
         tl.store(skip_mask_ptr + row, active == 0)
 
 
