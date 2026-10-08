@@ -1,1 +1,2 @@
 Qwen3.5-4B-watermark.yaml
+Qwen3.5-4B-synthid-watermark.yaml
