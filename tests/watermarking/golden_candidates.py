@@ -914,9 +914,8 @@ def configured_prfs() -> set[str]:
 
 
 def configured_algorithm_prf_combinations() -> set[tuple[str, str]]:
-    # Goldens include detection, so only schemes with a detector belong here.
     return {
         (algorithm, prf)
-        for algorithm in DETECTOR_FACTORIES
+        for algorithm in configured_algorithms()
         for prf in configured_prfs()
     }

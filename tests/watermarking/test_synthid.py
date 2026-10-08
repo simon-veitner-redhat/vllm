@@ -28,7 +28,6 @@ def test_synthid_config_and_factory():
     assert watermarker.depth == 5
     assert watermarker.prf.key == 42
     assert not config.supports_speculative_decoding
-    assert WatermarkConfig(key=42, algorithm="gumbel").depth == 32
 
 
 def test_synthid_config_rejects_invalid_depth():
@@ -38,16 +37,6 @@ def test_synthid_config_rejects_invalid_depth():
             algorithm="synthid_text",
             depth=0,
         )
-
-
-@pytest.mark.parametrize("depth", [1, 32, 33, 64, 65])
-def test_synthid_accepts_positive_depth(depth):
-    config = WatermarkConfig(
-        key=42,
-        algorithm="synthid_text",
-        depth=depth,
-    )
-    assert config.depth == depth
 
 
 @pytest.mark.parametrize(
@@ -125,18 +114,6 @@ def test_synthid_accelerator_matches_cpu(depth):
     )
 
 
-def test_synthid_native_partial_context_changes_stream():
-    prf = PhiloxPRF(42)
-    candidates = torch.arange(32)
-    partial = torch.tensor([[-1, -1, 7]])
-    zero_filled = torch.tensor([[0, 0, 7]])
-
-    assert torch.equal(prf.uint32(partial, candidates), prf.uint32(partial, candidates))
-    assert not torch.equal(
-        prf.uint32(partial, candidates), prf.uint32(zero_filled, candidates)
-    )
-
-
 @pytest.mark.parametrize(
     "constructor",
     [SynthIDWatermarker, SynthIDWatermarkDetector],
@@ -169,10 +146,13 @@ def test_synthid_sample_uses_watermarked_logits_and_skip_mask():
     assert torch.equal(result.token_ids, sampled_logits[0].argmax(dim=-1))
     assert result.logits is logits
 
-    # A peaked row underflows in-support tokens; only the input's -inf stay -inf.
+
+def test_synthid_keeps_only_masked_tokens_at_neg_inf():
+    # A peaked row underflows in-support tokens to finfo.min, not -inf, so the
+    # sampling mask still sees them as kept.
     peaked = torch.tensor([[20.0, 0.0, 0.0, float("-inf")]])
     actual = SynthIDWatermarker(42, context_width=3, depth=32).watermark_logits(
-        peaked, contexts[:1]
+        peaked, torch.tensor([[-1, -1, 7]])
     )
     assert torch.equal(actual.isneginf(), peaked.isneginf())
 

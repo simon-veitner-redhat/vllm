@@ -12,15 +12,14 @@ from vllm.v1.watermarking import GumbelWatermarkDetector, SynthIDWatermarkDetect
     not current_platform.is_cuda_alike(), reason="requires a CUDA-like accelerator"
 )
 @pytest.mark.parametrize(
-    ("algorithm", "detector_cls", "recorded_p_value"),
+    ("algorithm", "detector_cls", "max_p_value"),
     [
-        ("gumbel", GumbelWatermarkDetector, 9.83e-20),
-        # Loose bound (1e-6 after the x10 tolerance) that holds across seeds/paths.
-        ("synthid_text", SynthIDWatermarkDetector, 1e-7),
+        ("gumbel", GumbelWatermarkDetector, 9.83e-19),
+        ("synthid_text", SynthIDWatermarkDetector, 1e-6),
     ],
 )
 def test_llm_generated_sequence_is_watermarked(
-    vllm_runner, algorithm, detector_cls, recorded_p_value
+    vllm_runner, algorithm, detector_cls, max_p_value
 ):
     """Engine-level watermarking must produce tokens the detector recognizes."""
     watermark_config = {"key": 42, "context_width": 4}
@@ -46,6 +45,6 @@ def test_llm_generated_sequence_is_watermarked(
     result_no_wm = detector.detect(list(output_no_wm[0].outputs[0].token_ids))
 
     assert result_use_wm.is_watermarked, result_use_wm
-    assert result_use_wm.p_value < recorded_p_value * 10  # tolerance
+    assert result_use_wm.p_value < max_p_value
 
     assert not result_no_wm.is_watermarked, result_no_wm

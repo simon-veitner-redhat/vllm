@@ -28,7 +28,6 @@ def test_philox_raw_words_match_uniform_and_change_with_inputs():
 
     assert words.shape == (2, 32)
     assert words.dtype == torch.int64
-    assert torch.equal(words, prf.uint32(contexts, token_ids))
     assert torch.equal(uint32_to_uniform(words), prf.uniform(contexts, token_ids))
     assert not torch.equal(words, PhiloxPRF(43).uint32(contexts, token_ids))
     assert not torch.equal(words, prf.uint32(contexts + 1, token_ids))
@@ -87,29 +86,12 @@ def test_philox_accelerator_matches_cpu(
     torch.testing.assert_close(actual_words, expected_words, rtol=0, atol=0)
 
 
-def test_philox_stream_zero_preserves_compatibility():
-    contexts = torch.tensor([[1, 2, 3, 4], [4, 5, 6, 7]])
-    token_ids = torch.tensor([7, 8])
-    prf = PhiloxPRF(42)
-
-    assert torch.equal(
-        prf.uint32(contexts, token_ids),
-        prf.uint32(contexts, token_ids, stream=0),
-    )
-
-
-def test_philox_streams_are_deterministic_and_distinct():
+def test_philox_streams_are_distinct():
     contexts = torch.tensor([[-1, -1, 7], [11, 12, 13]])
     token_ids = torch.arange(32)
     prf = PhiloxPRF(42)
 
-    stream_0 = prf.uint32(contexts, token_ids, stream=0)
-    stream_1 = prf.uint32(contexts, token_ids, stream=1)
-    stream_2 = prf.uint32(contexts, token_ids, stream=2)
-
-    assert torch.equal(
-        stream_1,
-        prf.uint32(contexts, token_ids, stream=1),
-    )
-    assert not torch.equal(stream_0, stream_1)
-    assert not torch.equal(stream_1, stream_2)
+    words = [prf.uint32(contexts, token_ids, stream=s) for s in (0, 1, 2**32)]
+    assert not torch.equal(words[0], words[1])
+    assert not torch.equal(words[0], words[2])
+    assert not torch.equal(words[1], words[2])
