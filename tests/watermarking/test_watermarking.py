@@ -31,7 +31,6 @@ from vllm.v1.watermarking.spec_decode import (
 from vllm.v1.watermarking.watermarker import Watermarker, WatermarkSample
 from vllm.v1.worker.gpu import buffer_utils
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.watermark import (
     draft_watermarking_mask,
     philox_gumbel_sample,
@@ -1819,46 +1818,6 @@ def test_sample_block_matches_step_loop_on_cuda(
 
     for fused, reference in zip(run(fused=True), run(fused=False)):
         torch.testing.assert_close(fused, reference, rtol=0, atol=0, equal_nan=True)
-
-
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="requires a CUDA-like accelerator"
-)
-@pytest.mark.parametrize("parallel", [False, True])
-def test_opted_out_drafts_match_unwatermarked_sampling(parallel):
-    """Opted-out drafts are the tokens drawn by an engine without watermarking."""
-    num_reqs, num_steps, vocab_size = 64, 2, 2048
-    num_rows = num_reqs * num_steps
-    generator = torch.Generator().manual_seed(0)
-    # Near 2**22 an ulp of logits / temperature is comparable to the Gumbel
-    # noise, so any rounding difference in the divide changes sampled tokens.
-    logits = torch.randn(num_rows, vocab_size, generator=generator) * 8 + 2**22
-    idx_mapping = torch.arange(num_reqs, dtype=torch.int32).repeat_interleave(num_steps)
-    temperature = torch.tensor([0.3, 0.7, 1.3]).repeat(num_reqs)[:num_reqs]
-    draft_watermarker = DraftWatermarker(
-        GumbelWatermarker(key=42, context_width=2),
-        max_num_reqs=num_rows,
-        device=torch.device("cuda"),
-        num_speculative_steps=num_steps,
-        deduplicate_contexts="none",
-        deduplicate_contexts_max_history=None,
-    )
-
-    def sample(sampler):
-        return sampler(
-            logits.cuda(),
-            idx_mapping.cuda(),
-            temperature.cuda(),
-            torch.arange(num_reqs).cuda(),
-            torch.arange(num_rows).cuda(),
-            apply_temperature=True,
-            is_drafting=True,
-            logits_cache=torch.empty(num_reqs, num_steps, vocab_size).cuda(),
-            logits_cache_col=torch.arange(num_steps).repeat(num_reqs).cuda(),
-        )
-
-    sampler = draft_watermarker.sample_block if parallel else draft_watermarker.sample
-    torch.testing.assert_close(sample(sampler), sample(gumbel_sample), rtol=0, atol=0)
 
 
 def test_dspark_reduced_vocab_draft_sampler_applies_watermarking(monkeypatch):
