@@ -952,10 +952,12 @@ def draft_philox_gumbel_sample(
 ) -> torch.Tensor:
     """Sample `num_steps` draft steps flattened as (request, step), in step order.
 
-    Bit-exact with sampling each step by `DraftWatermarker.sample`, but with two
-    kernel launches per step: the Philox block argmax (with the temperature
-    divide and the logits cache write), then a per-row kernel that picks the
-    token, shifts `contexts` and builds the next step's skip mask.
+    Bit-exact with sampling each step by `DraftWatermarker.sample`, in
+    2 * num_steps + 1 launches: a per-row kernel builds step 0's skip mask, then
+    each step runs the Philox block argmax (with the temperature divide and the
+    logits cache write) and a per-row kernel that picks the token, shifts
+    `contexts` and builds the next step's skip mask. `logits_cache_col` must
+    hold each row's step, which also indexes the deduplication history.
     """
     num_rows, vocab_size = logits.shape
     num_reqs = num_rows // num_steps
