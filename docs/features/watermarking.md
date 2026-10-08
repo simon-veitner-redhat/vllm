@@ -48,7 +48,7 @@ callers, or strip and validate the field at the ingress boundary.
 `context_width` controls how many prior tokens seed each watermark decision
 and defaults to 4. Larger values make the watermark less robust to
 edits because an insertion, deletion, or substitution changes more subsequent
-contexts for all algorithms. Values above 16 are allowed and trigger a warning.
+contexts. Values above 16 are allowed but emit a warning.
 
 `allow_target_only_watermarking` defaults to false and only has an effect when
 speculative decoding is enabled. It permits target-only Gumbel-max watermarking
@@ -210,13 +210,13 @@ vllm serve MODEL \
   '{"algorithm":"synthid_text","key":42,"context_width":4,"depth":32}'
 ```
 
-`depth` controls the number of tournament-sampling layers. Higher values
-strengthen the watermark but add sampling overhead. Depths above 32 require
-additional Philox evaluations.
+`depth` controls the number of tournament-sampling layers. Each layer adds
+sampling overhead, and depths above 32 require additional Philox evaluations.
 
 `SynthIDWatermarkDetector` implements the corresponding unweighted-mean detector
 using the same generation parameters. Its reported p-value assumes independent
-Bernoulli(0.5) values under the null.
+Bernoulli(0.5) values under the null. Later tournament layers carry less
+signal, so with this unweighted detector depths above 32 weaken detection.
 
 ## Pseudorandom functions
 
@@ -293,8 +293,6 @@ watermarked output or to modify watermarked text so it is no longer detected.
 
 - Watermarking is currently available only with Model Runner V2.
 - Not all watermarking algorithms have native speculative-decoding support.
-- Beam search expands candidates from model log probabilities and does not
-  support configured watermarking.
 - Models that replace the vLLM sampler with a custom sampler cannot use
   configured watermarking.
 - Global custom logits processors are unavailable because Model Runner V2 does
