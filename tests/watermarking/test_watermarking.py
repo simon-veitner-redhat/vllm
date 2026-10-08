@@ -1729,8 +1729,19 @@ def test_dflash_draft_sampler_watermarks_drafts_in_step_order(monkeypatch):
     not current_platform.is_cuda_alike(), reason="requires a CUDA-like accelerator"
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("deduplicate_contexts", ["none", "single_turn", "all"])
-def test_dflash_draft_sampler_matches_step_loop_on_cuda(deduplicate_contexts, dtype):
+@pytest.mark.parametrize(
+    ("deduplicate_contexts", "max_history"),
+    [
+        ("none", None),
+        ("single_turn", None),
+        ("single_turn", 2),
+        ("all", None),
+        ("all", 2),
+    ],
+)
+def test_sample_block_matches_step_loop_on_cuda(
+    deduplicate_contexts, max_history, dtype
+):
     """The fused CUDA `sample_block` is bit-exact with sampling step by step."""
     num_reqs, num_steps, vocab_size, max_num_reqs = 4, 5, 1500, 6
     generator = torch.Generator().manual_seed(0)
@@ -1757,7 +1768,7 @@ def test_dflash_draft_sampler_matches_step_loop_on_cuda(deduplicate_contexts, dt
             device=torch.device("cuda"),
             num_speculative_steps=num_steps,
             deduplicate_contexts=deduplicate_contexts,
-            deduplicate_contexts_max_history=None,
+            deduplicate_contexts_max_history=max_history,
         )
         draft_watermarker.prepare(
             contexts=contexts.cuda(),
