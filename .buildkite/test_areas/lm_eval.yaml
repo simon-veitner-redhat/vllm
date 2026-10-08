@@ -265,8 +265,9 @@ steps:
   key: lm-eval-dspark-watermark-2xh100
   device: h100
   num_devices: 2
-  # Local TP2 runs took 84–379 seconds, including startup.
-  timeout_in_minutes: 15
+  # Local TP2 DSpark runs took 84–379 seconds and the TP1 DFlash run took
+  # about 180 seconds, including startup.
+  timeout_in_minutes: 20
   source_file_dependencies:
   - .buildkite/test_areas/lm_eval.yaml
   - tests/evals/gsm8k/
@@ -285,6 +286,7 @@ steps:
   autorun_on_main: true
   commands:
   - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-watermark-dspark-tp2.txt
+  - pytest -s -v evals/gsm8k/test_gsm8k_correctness.py --config-list-file=configs/models-watermark-dflash.txt
   - pytest -s -v watermarking/test_compatibility.py watermarking/test_engine_compatibility.py watermarking/test_parallel_compatibility.py
   mirror:
     amd:
