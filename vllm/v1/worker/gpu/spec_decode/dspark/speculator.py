@@ -23,6 +23,7 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -30,9 +31,9 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 logger = init_logger(__name__)
 
@@ -113,6 +114,10 @@ class DSparkSpeculator(DFlashSpeculator):
             self.use_acceptance_estimator = False
         return model
 
+    def _draft_sampler(self) -> Callable[..., torch.Tensor]:
+        # DSpark samples one step at a time, unlike DFlash.
+        return DraftModelSpeculator._draft_sampler(self)
+
     def _sample_logits(
         self,
         logits: torch.Tensor,
@@ -135,12 +140,7 @@ class DSparkSpeculator(DFlashSpeculator):
 
         # sample_pos is the predicted token's position P. Sampling keys a draw
         # by the position before the sampled token, P-1.
-        sampler = (
-            gumbel_sample
-            if self.draft_watermarker is None
-            else self.draft_watermarker.sample
-        )
-        return sampler(
+        return self._draft_sampler()(
             logits,
             idx_map,
             self.temperature,

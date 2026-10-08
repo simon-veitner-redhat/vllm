@@ -1864,7 +1864,7 @@ def test_dspark_target_only_watermarking_leaves_drafts_unwatermarked(monkeypatch
     speculator.acceptance_estimator = None
     speculator.draft_watermarker = None
     monkeypatch.setattr(
-        "vllm.v1.worker.gpu.spec_decode.dspark.speculator.gumbel_sample",
+        "vllm.v1.worker.gpu.spec_decode.speculator.gumbel_sample",
         lambda *args, **kwargs: torch.tensor([3, 4]),
     )
 
