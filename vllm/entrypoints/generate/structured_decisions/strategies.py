@@ -339,7 +339,7 @@ class LiquidStrategy(NextTokenStrategy):
         groups = [self._single_tokens(f) for f in forms]
         seen: set[int] = set()
         for (label, *_), ids in zip(forms, groups):
-            if self._single_tokens([label]) != ids[:1] or seen & set(ids):
+            if not ids or self._single_tokens([label]) != ids[:1] or seen & set(ids):
                 raise StructuredDecisionError(
                     f"question {question.id!r}: label {label!r} is not one "
                     "distinct token for this model"
