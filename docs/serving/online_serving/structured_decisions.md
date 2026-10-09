@@ -45,8 +45,9 @@ is a non-empty string.
 | `Lfm2VlForConditionalGeneration` | Liquid's decision prompt, for [`LiquidAI/d1-3B`](https://huggingface.co/LiquidAI/d1-3B) |
 
 For Liquid models the server writes the prompt and reads the label tokens the
-way the `prompt.py` shipped with the checkpoint does, so answers match
-`model.system_one()`. A `null` state leaves the images as the whole state, and
+way the `prompt.py` shipped with the checkpoint does, so picks and probabilities
+match `model.system_one()`; `confidence` and `usage` follow the definitions
+below. A `null` state leaves the images as the whole state, and
 a `score` has at most 10 levels.
 
 ```bash
