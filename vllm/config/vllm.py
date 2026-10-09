@@ -1014,6 +1014,15 @@ class VllmConfig:
             tie_word_embeddings = model_config.hf_config.tie_word_embeddings
             hf_config.get_text_config().tie_word_embeddings = tie_word_embeddings
 
+        head_dtype = getattr(model_config.hf_config, "head_dtype", None)
+        if (
+            model_config.is_multimodal_model
+            and head_dtype is not None
+            and getattr(hf_config, "head_dtype", None) is None
+        ):
+            hf_config = copy.deepcopy(hf_config)
+            hf_config.head_dtype = head_dtype
+
         model_config.hf_config = hf_config
         model_config.model_arch_config = model_config.get_model_arch_config()
         model_config.is_submodel_config = True

@@ -418,6 +418,23 @@ def test_nixl_dcp_check_skipped_for_submodel_config():
     assert submodel_config.model_config.use_mla is False
 
 
+@pytest.mark.parametrize(
+    "hf_overrides,expected", [({"head_dtype": "float32"}, torch.float32), ({}, None)]
+)
+def test_with_hf_config_carries_head_dtype_to_multimodal_submodel(
+    hf_overrides, expected
+):
+    model_config = ModelConfig(
+        "Qwen/Qwen2-VL-2B-Instruct", max_model_len=2048, hf_overrides=hf_overrides
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config, device_config=DeviceConfig(device="cpu")
+    )
+    submodel = vllm_config.with_hf_config(model_config.hf_text_config)
+    assert submodel.model_config.head_dtype == (expected or model_config.dtype)
+    assert getattr(model_config.hf_text_config, "head_dtype", None) is None
+
+
 def test_nixl_dcp_check_rejects_non_mla_model_with_dcp(monkeypatch):
     # Pretend the model has a single KV head so the DCP feasibility checks
     # pass and the MLA-only assert is what actually fires.

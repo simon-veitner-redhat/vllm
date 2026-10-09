@@ -56,6 +56,28 @@ vllm serve LiquidAI/d1-3B
 When each request carries one question over a state that changes from request
 to request, `--no-enable-prefix-caching` lowers latency on this model.
 
+### Run-to-run stability
+
+The probabilities come from the logits of the reply's first token. With the
+default bf16 lm_head those logits are rounded to bf16, so near 10 to 30 they
+move in steps of 0.0625 or 0.125. Under concurrent load, which batch a request
+lands in changes the kernels' rounding, and a label logit can move by one step
+between two identical requests. That moves an option's probability by up to
+about 0.03, and flips the answer when the top two options are within one step
+of each other.
+
+To compute the logits in fp32, add:
+
+```bash
+vllm serve LiquidAI/d1-3B --hf-overrides '{"head_dtype": "float32"}'
+```
+
+The fp32 lm_head reads the same bf16 weights and costs no measurable latency
+or throughput on this model. The run-to-run spread then drops to a few
+thousandths, and only options whose logits are within about 0.01 of each
+other can still swap. The answers then differ from the bf16 reference by up
+to half a bf16 step.
+
 ## Example
 
 ```bash
