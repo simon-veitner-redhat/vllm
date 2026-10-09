@@ -10,7 +10,10 @@ from fastapi.testclient import TestClient
 from vllm.entrypoints.generate.structured_decisions.api_router import (
     register_structured_decisions_api_router,
 )
-from vllm.entrypoints.generate.structured_decisions.question_types import LABELS
+from vllm.entrypoints.generate.structured_decisions.question_types import (
+    LABELS,
+    StructuredDecisionError,
+)
 from vllm.entrypoints.generate.structured_decisions.serving import state_text
 from vllm.entrypoints.generate.structured_decisions.strategies import (
     CanvasStrategy,
@@ -100,6 +103,7 @@ def test_canvas_read():
     strategy = CanvasStrategy.__new__(CanvasStrategy)
     strategy.thought, strategy.end, strategy.pad = [10, 11, 12, 13], 106, 0
     strategy.width, strategy.vocab_size = 16, 1000
+    strategy.max_model_len = 23
     params = strategy._sampling_params([65, 66], prompt_ids=[1, 2, 3])
     assert params.extra_args is not None
     canvas = params.extra_args["diffusion_seed_canvas"]
@@ -115,3 +119,8 @@ def test_canvas_read():
         "type": "token",
         "prompt_token_ids": [1, 2, 3, 10, 11, 12, 13],
     }
+    # One token more and the thought and the canvas no longer fit.
+    with pytest.raises(StructuredDecisionError, match="max_model_len=23"):
+        strategy._read_input(
+            {"type": "token", "prompt_token_ids": [1, 2, 3, 4]}, [1, 2, 3, 4]
+        )
