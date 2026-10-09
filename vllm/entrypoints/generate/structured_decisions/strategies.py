@@ -189,6 +189,7 @@ class NextTokenStrategy(ReadStrategy):
             default_template=ctx.chat_template,
             default_template_content_format=ctx.chat_template_content_format,
             default_template_kwargs=ctx.default_chat_template_kwargs,
+            skip_mm_cache=True,
         )
         prompt_ids = extract_prompt_components(
             ctx.engine_client.model_config, engine_input
