@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from vllm.entrypoints.generate.structured_decisions.api_router import (
     register_structured_decisions_api_router,
@@ -17,6 +18,7 @@ from vllm.entrypoints.generate.structured_decisions.question_types import (
 from vllm.entrypoints.generate.structured_decisions.strategies import (
     LiquidStrategy,
     NextTokenStrategy,
+    cap_pixels,
     label_token_ids,
     reply_tail,
     select_read_strategy,
@@ -141,3 +143,12 @@ def test_liquid_prompt_matches_the_checkpoint(type_name, criteria, ask):
     assert strategy.content(None, q) == ask
     assert strategy.content("Hi.", q) == f"Hi.\n\n\nQUESTION:\n{ask}"
     assert strategy.content({"k": "é"}, q).startswith('{\n  "k": "é"\n}\n\n\nQUEST')
+
+
+def test_liquid_caps_images_like_the_checkpoint():
+    # runner.cap_pixels in LiquidAI/d1-3B: 1600x1598 becomes 1024x1023.
+    cap = LiquidStrategy.max_image_pixels
+    assert cap_pixels(Image.new("RGB", (1600, 1598)), cap).size == (1024, 1023)
+    small = Image.new("RGB", (640, 480))
+    assert cap_pixels(small, cap) is small
+    assert NextTokenStrategy.max_image_pixels is None

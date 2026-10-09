@@ -5,6 +5,7 @@
 Only models in READ_STRATEGIES are currently supported.
 """
 
+import asyncio
 import json
 import math
 from abc import ABC, abstractmethod
@@ -12,12 +13,16 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from PIL import Image
+
+from vllm import envs
 from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import ChatTemplateContentFormatOption
 from vllm.entrypoints.generate.label_reads import next_token_label_reads
 from vllm.inputs import EngineInput
 from vllm.lora.request import LoRARequest
+from vllm.multimodal.media import MEDIA_CONNECTOR_REGISTRY
 from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import SamplingParams
@@ -102,11 +107,23 @@ def label_token_ids(
     return ids
 
 
+def cap_pixels(image: Image.Image, max_pixels: int) -> Image.Image:
+    """Shrink ``image`` to at most ``max_pixels`` pixels (bicubic)."""
+    w, h = image.size
+    if w * h <= max_pixels:
+        return image
+    scale = math.sqrt(max_pixels / (w * h))
+    size = (max(1, int(w * scale)), max(1, int(h * scale)))
+    return image.resize(size, Image.Resampling.BICUBIC)
+
+
 class NextTokenStrategy(ReadStrategy):
     """Autoregressive models. Each question is one request: the state, then the
     question with its labeled options, and the logprobs of the label tokens as
     the reply's first token. The requests share the state. With prefix caching,
     it is prefilled once."""
+
+    max_image_pixels: int | None = None
 
     def __init__(self, context: ReadContext):
         super().__init__(context)
@@ -210,9 +227,25 @@ class NextTokenStrategy(ReadStrategy):
     ) -> list[QuestionRead]:
         ctx = self.context
         read_request = self._read_request(chat_template_kwargs)
-        if images and not ctx.engine_client.model_config.is_multimodal_model:
+        model_config = ctx.engine_client.model_config
+        if images and not model_config.is_multimodal_model:
             raise StructuredDecisionError("images: this model reads text only")
-        image_parts = [{"type": "image_url", "image_url": {"url": u}} for u in images]
+        # Fetch each image once, so that every question reads the same picture.
+        pictures = []
+        if images:
+            mm_config = model_config.multimodal_config
+            connector = MEDIA_CONNECTOR_REGISTRY.load(
+                envs.VLLM_MEDIA_CONNECTOR,
+                media_io_kwargs=mm_config.media_io_kwargs if mm_config else None,
+                allowed_local_media_path=model_config.allowed_local_media_path,
+                allowed_media_domains=model_config.allowed_media_domains,
+            )
+            pictures = await asyncio.gather(
+                *(connector.fetch_image_async(u) for u in images)
+            )
+        if self.max_image_pixels is not None:
+            pictures = [cap_pixels(p, self.max_image_pixels) for p in pictures]
+        image_parts = [{"type": "image_pil", "image_pil": p} for p in pictures]
 
         slots, engine_inputs = [], []
         for q in questions:
@@ -269,6 +302,9 @@ class NextTokenStrategy(ReadStrategy):
 class LiquidStrategy(NextTokenStrategy):
     """Liquid decision models (d1). The prompt and the label tokens are the
     ones the checkpoint was trained with, from the `prompt.py` it ships."""
+
+    # runner.py bounds every picture at 1024 x 1024 pixels before the processor.
+    max_image_pixels = 1024 * 1024
 
     def _single_tokens(self, texts: Sequence[str]) -> list[int]:
         ids: list[int] = []
