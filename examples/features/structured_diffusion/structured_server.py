@@ -253,8 +253,18 @@ def parse_schema(value):
         "chunk_rows": chunk_rows,
         "chunk_prompt": chunk_prompt,
         "sequential": sequential,
-        "format": "lines" if len(qs) <= 10 else "indexed",
+        "format": "indexed" if len(qs) > 10 and indexed_fits(qs) else "lines",
     }
+
+
+def indexed_fits(qs):
+    """Whether every label stays its own token when glued to its question id."""
+    for q in qs:
+        for pre in ("", " "):
+            base = enc(pre + q["id"])
+            if any(enc(pre + q["id"] + lb)[:-1] != base for lb in q["labels"]):
+                return False
+    return True
 
 
 # Answer template shape: (join between questions, what precedes the label,
