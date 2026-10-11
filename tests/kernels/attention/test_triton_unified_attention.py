@@ -984,3 +984,51 @@ def test_softcap_does_not_overflow_on_large_scores() -> None:
     ref = soft_cap * torch.tanh(scores / soft_cap)
     assert torch.isfinite(out).all(), out
     torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("chunk_offset", [3, 5, 8])
+@torch.inference_mode()
+def test_sliding_window_rows_do_not_depend_on_chunk_start(chunk_offset: int) -> None:
+    """A query row's output must not change with where its prefill chunk starts.
+
+    Q-blocks group rows from the chunk start, so a misaligned start puts fully
+    masked sliding-window tiles ahead of a row's first visible key.
+    """
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    num_q_heads, num_kv_heads, head_size, block_size = 16, 8, 128, 16
+    window, seq_len, chunk_start = 256, 1024, 512
+    num_blocks = seq_len // block_size
+    # q.k < 0 for every pair, so each row's maximum score is negative.
+    query = torch.randn(seq_len, num_q_heads, head_size).abs().to(torch.bfloat16)
+    key_cache = -torch.randn(num_blocks, block_size, num_kv_heads, head_size).abs()
+    key_cache = key_cache.to(torch.bfloat16)
+    value_cache = torch.randn_like(key_cache)
+    block_table = torch.arange(num_blocks, dtype=torch.int32)[None]
+
+    def run(start: int) -> torch.Tensor:
+        q = query[start:].contiguous()
+        out = torch.empty_like(q)
+        unified_attention(
+            q=q,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=torch.tensor([0, seq_len - start], dtype=torch.int32),
+            max_seqlen_q=seq_len - start,
+            seqused_k=torch.tensor([seq_len], dtype=torch.int32),
+            max_seqlen_k=seq_len,
+            softmax_scale=head_size**-0.5,
+            causal=True,
+            window_size=(window - 1, 0),
+            block_table=block_table,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+        )
+        return out
+
+    whole = run(chunk_start)
+    tail = run(chunk_start + chunk_offset)
+    torch.testing.assert_close(whole[chunk_offset:], tail, atol=0, rtol=0)
