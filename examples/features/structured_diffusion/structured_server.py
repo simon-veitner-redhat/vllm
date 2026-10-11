@@ -1201,6 +1201,11 @@ def message_text(m):
     return c if isinstance(c, str) else ""
 
 
+class Server(ThreadingHTTPServer):
+    # socketserver's default backlog of 5 resets concurrent clients
+    request_queue_size = 1024
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -1487,7 +1492,7 @@ def serve_tls(host, port, cert_dir):
     cert, key = self_signed(cert_dir)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
-    srv = ThreadingHTTPServer((host, port), Handler)
+    srv = Server((host, port), Handler)
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
@@ -1537,7 +1542,7 @@ def main():
         f"(canvas {CANVAS_LEN})",
         flush=True,
     )
-    ThreadingHTTPServer((ARGS.host, ARGS.port), Handler).serve_forever()
+    Server((ARGS.host, ARGS.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
