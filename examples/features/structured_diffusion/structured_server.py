@@ -1170,7 +1170,7 @@ def jev_state(body, image_parts=()):
     state = body.get("state")
     if state is None:
         raise SchemaError("state: required")
-    text = state if isinstance(state, str) else json.dumps(state)
+    text = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
     if not image_parts:
         return text
     return list(image_parts) + [{"type": "text", "text": text}]
