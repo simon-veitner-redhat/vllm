@@ -1176,6 +1176,17 @@ def jev_state(body, image_parts=()):
     return list(image_parts) + [{"type": "text", "text": text}]
 
 
+def request_seed(req):
+    """The body's seed: 42 when absent or null, else an integer."""
+    seed = req.get("seed")
+    if seed is None:
+        return 42
+    try:
+        return int(seed)
+    except (TypeError, ValueError):
+        raise SchemaError(f"seed: must be an integer, got {seed!r}") from None
+
+
 def jev_answer(q, a):
     if a is None:
         return None
@@ -1338,11 +1349,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             schema = jev_schema(req)
             state = jev_state(req, images + jev_images(req.get("images")))
+            seed = request_seed(req)
         except SchemaError as e:
             return self._json(
                 422, {"error": {"message": str(e), "type": "validation_error"}}
             )
-        code, result = self._decide(schema, state, int(req.get("seed", 42)))
+        code, result = self._decide(schema, state, seed)
         if code != 200:
             return self._json(code, result)
         body, completion_tokens = result
@@ -1412,6 +1424,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 state = message_text(msgs[1]).strip()
                 json.loads(state)
+            seed = request_seed(req)
         except SchemaError as e:
             return self._json(
                 400, {"error": {"message": str(e), "type": "invalid_request_error"}}
@@ -1429,7 +1442,7 @@ class Handler(BaseHTTPRequestHandler):
                     }
                 },
             )
-        code, result = self._decide(schema, state, int(req.get("seed", 42)))
+        code, result = self._decide(schema, state, seed)
         if code != 200:
             if code == 422:
                 result["error"]["type"] = "invalid_request_error"
