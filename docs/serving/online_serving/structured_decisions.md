@@ -142,8 +142,9 @@ digit is the level's label instead, so the model answers the number it reads.
 | `chat_template_kwargs` | passed to the chat template, for example `{"enable_thinking": false}` |
 | `cache_salt` | optional [prefix-cache salt](../../usage/security.md#cache-salting) applied to every question |
 
-A question with any field other than `type`, `instructions` and `criteria` is
-rejected with a 400.
+A request with a field not listed here (for example `images`, `seed` or
+`temperature`), or a question with any field other than `type`, `instructions`
+and `criteria`, is rejected with a 400.
 
 When [tracing](../../../examples/observability/opentelemetry/README.md) is enabled
 with `--otlp-traces-endpoint`, the HTTP `traceparent` and `tracestate` headers are
