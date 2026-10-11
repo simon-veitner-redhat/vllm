@@ -163,11 +163,16 @@ def parse_schema(value):
             labels = [chr(ord("A") + i) for i in range(len(choices))]
         elif kind == "score":
             choices = [(str(level), None) for level in (q.get("levels") or [])]
-            labels = (
-                [str(i + 1) for i in range(len(choices))]
-                if len(choices) <= 9
-                else [chr(ord("A") + i) for i in range(len(choices))]
-            )
+            names = [c[0] for c in choices]
+            if len(set(names)) == len(names) and all(
+                len(n) == 1 and n.isdigit() for n in names
+            ):
+                # digit levels label themselves, so "2" never means level "1"
+                labels = names
+            elif len(choices) <= 9:
+                labels = [str(i + 1) for i in range(len(choices))]
+            else:
+                labels = [chr(ord("A") + i) for i in range(len(choices))]
         else:
             raise SchemaError(f"question {qid!r}: unknown type {kind!r}")
         if len(choices) < 2:
