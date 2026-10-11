@@ -125,6 +125,25 @@ def test_labels_start_the_reply(qwen):
         reply_label_ids(tokenizer, tokenizer.encode("team:"))
 
 
+def test_thinking_only_template_disables_reads(qwen):
+    tokenizer, _ = qwen
+    thinking_only = (
+        "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}"
+        "<|im_end|>\n{% endfor %}<|im_start|>assistant\n<think>\n"
+    )
+    context = SimpleNamespace(
+        online_renderer=SimpleNamespace(
+            renderer=SimpleNamespace(get_tokenizer=lambda: tokenizer)
+        ),
+        chat_template=thinking_only,
+        default_chat_template_kwargs={},
+    )
+    with pytest.raises(ValueError, match="opens a thinking block"):
+        NextTokenStrategy(context)
+    context.chat_template = None
+    assert NextTokenStrategy(context).tail
+
+
 @pytest.fixture
 def serving_and_engine(qwen):
     tokenizer, _ = qwen

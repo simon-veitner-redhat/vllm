@@ -135,6 +135,13 @@ class NextTokenStrategy(ReadStrategy):
         # Every prompt ends with the same generation prompt, so a label's token
         # is the same for every question.
         prompt = self._generation_prompt()
+        # Thinking-only templates (e.g. Qwen3-*-Thinking-2507) ignore enable_thinking.
+        text = self._tokenizer().decode(prompt)
+        if text.rfind("<think>") > text.rfind("</think>"):
+            raise ValueError(
+                "this model's chat template opens a thinking block even with "
+                "enable_thinking=False, so a reply's first token is not an answer"
+            )
         self.tail = prompt_tail(self._tokenizer(), prompt)
         self.label_ids = type_label_ids(self._tokenizer(), prompt)
 
