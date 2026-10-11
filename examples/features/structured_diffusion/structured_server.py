@@ -75,7 +75,8 @@ Serve the model with a canvas that holds the answer template, for example:
       --enable-prefix-caching
 then run this in front of it:
   python structured_server.py --upstream http://127.0.0.1:8000 \
-      --tokenizer google/diffusiongemma-26B-A4B-it --canvas 64 --port 8011
+      --tokenizer google/diffusiongemma-26B-A4B-it --canvas 64 --port 8011 \
+      --model google/diffusiongemma-26B-A4B-it
 """
 
 import argparse
@@ -1525,7 +1526,7 @@ def main():
     global ARGS, CANVAS_LEN, CANVAS_STEP
     p = argparse.ArgumentParser()
     p.add_argument("--upstream", default="http://127.0.0.1:8010")
-    p.add_argument("--model", default="dgemma")
+    p.add_argument("--model", default="dgemma", help="the upstream's served model name")
     p.add_argument("--tokenizer", default="/models/dgemma", help="HF id or local path")
     p.add_argument("--canvas", type=int, default=64, help="the served canvas length")
     p.add_argument(

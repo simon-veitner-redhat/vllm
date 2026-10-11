@@ -23,7 +23,8 @@ with a standard error over a few noise draws.
 vllm serve google/diffusiongemma-26B-A4B-it \
     --diffusion-config '{"canvas_length": 64}' --max-logprobs 32 --enable-prefix-caching
 python examples/features/structured_diffusion/structured_server.py \
-    --upstream http://127.0.0.1:8000 --tokenizer google/diffusiongemma-26B-A4B-it --canvas 64
+    --upstream http://127.0.0.1:8000 --tokenizer google/diffusiongemma-26B-A4B-it --canvas 64 \
+    --model google/diffusiongemma-26B-A4B-it
 curl -s localhost:8011/v1/chat/completions -H 'content-type: application/json' -d '{
   "messages": [
     {"role": "system", "content": "{\"questions\": [{\"id\": \"urgent\", \"type\": \"noul\", \"instructions\": \"Does the customer need a reply within the hour?\"}]}"},
