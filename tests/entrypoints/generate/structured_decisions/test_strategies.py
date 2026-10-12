@@ -34,6 +34,7 @@ from vllm.entrypoints.generate.structured_decisions.strategies import (
 )
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.exception_handling.register import (
     init_exception_handler,
 )
@@ -229,6 +230,22 @@ async def test_request_metadata_reaches_every_question(
         assert call.kwargs["trace_headers"] == (
             TRACE_HEADERS if request_headers else None
         )
+
+
+@pytest.mark.asyncio
+async def test_unknown_request_fields_are_rejected(serving_and_engine):
+    serving, engine = serving_and_engine
+    request = StructuredDecisionRequest(
+        state="A photo of the parcel.",
+        questions={"damaged": {"type": "noul"}},
+        images=["https://example.com/parcel.jpg"],
+        seed=7,
+    )
+    response = await serving.create_decision(request)
+    assert isinstance(response, ErrorResponse)
+    assert response.error.code == 400
+    assert "unknown field(s) ['images', 'seed']" in response.error.message
+    engine.generate.assert_not_called()
 
 
 def test_canvas_read():

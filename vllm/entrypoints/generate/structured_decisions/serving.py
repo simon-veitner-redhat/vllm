@@ -32,6 +32,9 @@ def parse_questions(
     request: StructuredDecisionRequest,
     limits: DecisionLimits,
 ) -> list[Question]:
+    if request.model_extra:
+        # e.g. images, seed or temperature, which this endpoint would ignore
+        raise StructuredDecisionError(f"unknown field(s) {sorted(request.model_extra)}")
     if not request.questions:
         raise StructuredDecisionError("questions: needs at least one question")
     if len(request.questions) > limits.max_questions:
