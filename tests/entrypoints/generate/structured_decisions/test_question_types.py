@@ -142,7 +142,6 @@ def test_score_numbered_levels_keep_their_numbers():
     assert stars.type.prompt(stars).splitlines()[1] == "1 star"
     answer = q.type.answer(q, [0, 0, 0, 1, 0], 1.0)
     assert answer["score"] == 3 and answer["legend"]["3"] == "4"
-    # Not every level numbered, or two share a digit: labels stay 0-indexed.
     assert score(criteria=["never", "1 week"]).labels == ("0", "1")
     assert score(criteria=["1-3", "1-5"]).labels == ("0", "1")
     assert score(criteria=["10", "20"]).labels == ("0", "1")
