@@ -133,6 +133,20 @@ def test_score_labels_are_levels():
         score(criteria=[str(i) for i in range(11)])
 
 
+def test_score_numbered_levels_keep_their_numbers():
+    q = score(criteria=["1", "2", "3", "4", "5"])
+    assert q.labels == ("1", "2", "3", "4", "5")
+    assert q.type.prompt(q).splitlines()[1:3] == ["1", "2"]
+    stars = score(criteria=["1 star", "2 stars", "3 stars"])
+    assert stars.labels == ("1", "2", "3")
+    assert stars.type.prompt(stars).splitlines()[1] == "1 star"
+    answer = q.type.answer(q, [0, 0, 0, 1, 0], 1.0)
+    assert answer["score"] == 3 and answer["legend"]["3"] == "4"
+    assert score(criteria=["never", "1 week"]).labels == ("0", "1")
+    assert score(criteria=["1-3", "1-5"]).labels == ("0", "1")
+    assert score(criteria=["10", "20"]).labels == ("0", "1")
+
+
 def test_score_prompt():
     q = score()
     assert q.type.prompt(q) == (

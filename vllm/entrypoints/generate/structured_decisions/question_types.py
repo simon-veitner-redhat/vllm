@@ -8,6 +8,7 @@ probabilities.
 """
 
 import math
+import re
 import string
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -46,6 +47,9 @@ class QuestionType(ABC):
 
     @abstractmethod
     def parse_options(self, qid: str, criteria: Any) -> list[Option]: ...
+
+    def labels(self, options: list[Option]) -> tuple[str, ...]:
+        return self.label_set[: len(options)]
 
     @abstractmethod
     def answer(
@@ -118,7 +122,7 @@ def build_question(
         type=qtype,
         instructions=instructions,
         options=tuple(options),
-        labels=qtype.label_set[: len(options)],
+        labels=qtype.labels(options),
     )
 
 
@@ -223,6 +227,19 @@ class ScoreQuestion(QuestionType):
                 f"question {qid!r}: score criteria must be an ordered list of levels"
             )
         return [Option(str(level)) for level in criteria]
+
+    def labels(self, options: list[Option]) -> tuple[str, ...]:
+        # Levels the user numbered ("1".."5", "1 star") keep their own number.
+        digits = [re.match(r"\s*(\d)(?!\d)", o.name) for o in options]
+        own = tuple(m.group(1) for m in digits if m)
+        if len(own) == len(options) and len(set(own)) == len(own):
+            return own
+        return super().labels(options)
+
+    def reply_line(self, label: str, option: Option) -> str:
+        if option.name.lstrip().startswith(label):
+            return option.name
+        return super().reply_line(label, option)
 
     def answer(
         self, question: Question, probs: list[float], label_mass: float

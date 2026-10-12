@@ -120,7 +120,9 @@ whole vocabulary: its share of the labels times `label_mass`.
 
 Labels follow the type: a `choice` labels its options `A` to `Z` in the order
 the request lists them, a `noul` labels its options `yes` and `no`, and a
-`score` labels its levels `0` to `9`, so a level's label is its score.
+`score` labels its levels `0` to `9`, so a level's label is its score. When
+every level name starts with its own digit (`"1"` to `"5"`, or `"1 star"`), that
+digit is the level's label instead, so the model answers the number it reads.
 
 ## Limits
 
