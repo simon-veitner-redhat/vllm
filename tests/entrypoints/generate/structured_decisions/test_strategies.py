@@ -37,6 +37,7 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.exception_handling.register import (
     init_exception_handler,
 )
+from vllm.exceptions import QueueOverflowError
 from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.renderers.hf import HfRenderer
@@ -73,10 +74,11 @@ def test_route_is_registered_by_default():
     assert "/v1/systemone" in paths
 
 
-def test_unsupported_model_returns_501():
+def test_disabled_endpoint_returns_501_with_reason():
     app = FastAPI()
     app.state.args = SimpleNamespace(log_error_stack=False)
     app.state.serving_structured_decisions = None
+    app.state.structured_decisions_disabled_reason = "canary question 'team'"
     init_exception_handler(app)
     register_structured_decisions_api_router(app)
 
@@ -90,6 +92,9 @@ def test_unsupported_model_returns_501():
             },
         )
     assert response.status_code == 501
+    assert response.json()["error"]["message"] == (
+        "/v1/systemone is disabled: canary question 'team'"
+    )
 
 
 def test_structured_state_keeps_unicode_in_prompt():
@@ -125,6 +130,34 @@ def test_labels_start_the_reply(qwen):
         reply_label_ids(tokenizer, tokenizer.encode("team:"))
 
 
+def label_generate(label_logprob: float):
+    """A fake engine generate that gives every label ``label_logprob``."""
+
+    async def generate(prompt, params, request_id, **kwargs):
+        label_ids = params.logprob_token_ids
+        yield RequestOutput(
+            request_id=request_id,
+            prompt=None,
+            prompt_token_ids=prompt["prompt_token_ids"],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="A",
+                    token_ids=[label_ids[0]],
+                    cumulative_logprob=None,
+                    logprobs=[
+                        {token_id: Logprob(label_logprob) for token_id in label_ids}
+                    ],
+                    finish_reason="length",
+                )
+            ],
+            finished=True,
+        )
+
+    return generate
+
+
 @pytest.fixture
 def serving_and_engine(qwen):
     tokenizer, _ = qwen
@@ -149,27 +182,7 @@ def serving_and_engine(qwen):
         chat_template_content_format="auto",
     )
 
-    async def generate(prompt, params, request_id, **kwargs):
-        label_ids = params.logprob_token_ids
-        yield RequestOutput(
-            request_id=request_id,
-            prompt=None,
-            prompt_token_ids=prompt["prompt_token_ids"],
-            prompt_logprobs=None,
-            outputs=[
-                CompletionOutput(
-                    index=0,
-                    text="A",
-                    token_ids=[label_ids[0]],
-                    cumulative_logprob=None,
-                    logprobs=[{token_id: Logprob(-1.0) for token_id in label_ids}],
-                    finish_reason="length",
-                )
-            ],
-            finished=True,
-        )
-
-    engine.generate.side_effect = generate
+    engine.generate.side_effect = label_generate(-1.0)
     strategy = NextTokenStrategy(ReadContext(engine, online_renderer, None, "auto", {}))
     models = OpenAIServingModels(
         engine, [BaseModelPath(name=model_config.model, model_path=model_config.model)]
@@ -229,6 +242,26 @@ async def test_request_metadata_reaches_every_question(
         assert call.kwargs["trace_headers"] == (
             TRACE_HEADERS if request_headers else None
         )
+
+
+@pytest.mark.asyncio
+async def test_canary_disables_reads_below_the_label_mass_floor(serving_and_engine):
+    serving, engine = serving_and_engine
+    await serving.strategy.self_test()
+    assert engine.generate.call_count == 3
+    # Thinking-only checkpoints put about 1e-10 on the labels.
+    engine.generate.side_effect = label_generate(-23.0)
+    with pytest.raises(ValueError, match="canary question 'team' has label_mass"):
+        await serving.strategy.self_test()
+
+
+@pytest.mark.asyncio
+async def test_canary_engine_error_disables_reads(serving_and_engine):
+    serving, engine = serving_and_engine
+    # e.g. --max-num-queued-reqs below the canary's three reads
+    engine.generate.side_effect = QueueOverflowError()
+    with pytest.raises(ValueError, match="the canary reads failed"):
+        await serving.strategy.self_test()
 
 
 def test_canvas_read():

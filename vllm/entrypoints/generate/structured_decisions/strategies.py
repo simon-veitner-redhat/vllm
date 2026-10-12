@@ -24,6 +24,7 @@ from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
+from vllm.utils import random_uuid
 
 from .protocol import ReadPromptRequest
 from .question_types import (
@@ -31,8 +32,22 @@ from .question_types import (
     QUESTION_TYPES,
     Question,
     StructuredDecisionError,
+    build_question,
     label_softmax,
 )
+
+#: A canary read with less label_mass means the model does not reply with a label.
+CANARY_MIN_LABEL_MASS = 1e-3
+CANARY_STATE = "The customer says: My card was charged twice for one order."
+CANARY_QUESTIONS = {
+    "team": (
+        "choice",
+        "Which team should handle this ticket?",
+        dict.fromkeys(("billing", "shipping", "security")),
+    ),
+    "money": ("noul", "Is the ticket about money?", None),
+    "tone": ("score", "How upset is the customer?", ["calm", "annoyed", "furious"]),
+}
 
 
 @dataclass
@@ -81,6 +96,34 @@ class ReadStrategy(ABC):
         trace_headers: Mapping[str, str] | None = None,
     ) -> list[QuestionRead]:
         """One read per question, in order."""
+
+    async def self_test(self) -> None:
+        """Raise ValueError when the canary reads fail or one has a label_mass
+        below CANARY_MIN_LABEL_MASS."""
+        max_options = self.limits().max_options
+        questions = [
+            build_question(qid, qtype, instructions, criteria, max_options)
+            for qid, (qtype, instructions, criteria) in CANARY_QUESTIONS.items()
+        ]
+        try:
+            reads = await self.read(
+                questions,
+                None,
+                CANARY_STATE,
+                request_id=f"systemone-canary-{random_uuid()}",
+                chat_template_kwargs=None,
+                lora_request=None,
+                priority=0,
+            )
+        except Exception as e:
+            raise ValueError(f"the canary reads failed: {e!r}") from e
+        for q, r in zip(questions, reads):
+            if r.label_mass < CANARY_MIN_LABEL_MASS:
+                raise ValueError(
+                    f"canary question {q.id!r} has label_mass {r.label_mass:.1e}, "
+                    f"below {CANARY_MIN_LABEL_MASS}, so the reply does not start "
+                    "with a label (as with thinking-only checkpoints)"
+                )
 
 
 def prompt_tail(tokenizer: TokenizerLike, prompt_ids: Sequence[int]) -> list[int]:

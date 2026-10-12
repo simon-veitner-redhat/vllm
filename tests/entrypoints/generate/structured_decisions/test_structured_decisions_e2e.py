@@ -44,6 +44,26 @@ COPY = {
 }
 
 
+# Like Qwen3-*-Thinking-2507: the reply always starts inside a thought.
+THINKING_ONLY_TEMPLATE = (
+    "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}"
+    "<|im_end|>\n{% endfor %}<|im_start|>assistant\n<think>\n"
+)
+
+
+def test_thinking_only_template_fails_the_canary():
+    # First in the file, so its server stops before the module-scoped one starts.
+    args = ["--enforce-eager", "--chat-template", THINKING_ONLY_TEMPLATE]
+    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
+        response = post(
+            remote_server,
+            {"model": MODEL_NAME, "state": "x", "questions": {"q": {"type": "noul"}}},
+        )
+    assert response.status_code == 501
+    message = response.json()["error"]["message"]
+    assert "canary question 'team' has label_mass" in message
+
+
 def test_choice_decision(server):
     response = post(
         server,
