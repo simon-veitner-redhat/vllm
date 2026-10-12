@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import asyncio
 import json
 from io import BytesIO
 from types import SimpleNamespace
@@ -374,6 +375,82 @@ async def test_splice_falls_back_to_full_render(make_context, chat_template, sta
             priority=0,
         )
     assert render.call_count == len(QUESTIONS) == len(reads)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy,in_engine", [("fcfs", 2), ("priority", 3)])
+async def test_long_decisions_take_turns(make_context, monkeypatch, policy, in_engine):
+    context = make_context()
+    scheduler_config = context.engine_client.vllm_config.scheduler_config
+    scheduler_config.policy = policy
+    strategy = NextTokenStrategy(context)
+    release, built_all = asyncio.Event(), asyncio.Event()
+    admitted: set[str] = set()
+    built = []
+
+    async def held(prompt, params, request_id, **kwargs):
+        if request_id.startswith("long"):
+            admitted.add(request_id.rsplit("-", 1)[0])
+            await release.wait()
+        async for output in generate(prompt, params, request_id):
+            yield output
+
+    def build(*args):
+        built.append(args)
+        if len(built) == 6:
+            built_all.set()
+        return read_input(*args)
+
+    read_input = strategy._read_input
+    monkeypatch.setattr(strategy, "_read_input", build)
+    context.engine_client.generate.side_effect = held
+
+    def read(questions, state, request_id):
+        return strategy.read(
+            questions,
+            None,
+            state,
+            request_id=request_id,
+            chat_template_kwargs=None,
+            lora_request=None,
+            priority=0,
+        )
+
+    # The engine prefills a shared state once, so only a state over budget is long.
+    budget = scheduler_config.max_num_batched_tokens
+    long_state = "state " * budget
+    long = [
+        asyncio.create_task(read(QUESTIONS[:2], long_state, f"long{i}"))
+        for i in range(3)
+    ]
+    await asyncio.wait_for(built_all.wait(), 30)
+    short_state = "state " * (budget * 3 // 4)
+    for questions, state in [(QUESTIONS[:2], short_state), (QUESTIONS[:1], long_state)]:
+        reads = await asyncio.wait_for(read(questions, state, "short"), 30)
+        assert len(reads) == len(questions)
+    assert len(admitted) == in_engine
+    release.set()
+    await asyncio.gather(*long)
+    assert len(admitted) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("architecture", SPLICE_ARCHITECTURES)
+async def test_long_decision_reads_through_the_gate(make_context, architecture):
+    context = make_context(SPLICE_MODELS[architecture])
+    model_config = context.engine_client.model_config
+    strategy = select_read_strategy(model_config, ("generate",))(context)
+    budget = context.engine_client.vllm_config.scheduler_config.max_num_batched_tokens
+    reads = await strategy.read(
+        QUESTIONS[:2],
+        None,
+        "state " * budget,
+        request_id="r",
+        chat_template_kwargs=None,
+        lora_request=None,
+        priority=0,
+    )
+    assert len(reads) == 2
 
 
 @pytest.mark.asyncio

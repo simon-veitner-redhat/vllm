@@ -6,9 +6,11 @@ Only models in READ_STRATEGIES are currently supported.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import math
+import os
 import random
 import time
 from abc import ABC, abstractmethod
@@ -62,6 +64,8 @@ _M = TypeVar("_M")
 
 logger = init_logger(__name__)
 
+_BIG_DECISIONS_IN_ENGINE = 2
+
 
 @dataclass
 class ReadContext:
@@ -99,6 +103,14 @@ class ReadStrategy(ABC):
 
     def __init__(self, context: ReadContext):
         self.context = context
+        scheduler_config = context.engine_client.vllm_config.scheduler_config
+        # The priority policy orders requests in the engine instead.
+        self._big_decision_tokens = (
+            math.inf
+            if scheduler_config.policy == "priority"
+            else scheduler_config.max_num_batched_tokens
+        )
+        self._big_decision_gate = asyncio.Semaphore(_BIG_DECISIONS_IN_ENGINE)
 
     @abstractmethod
     def limits(self) -> DecisionLimits: ...
@@ -358,7 +370,7 @@ class NextTokenStrategy(ReadStrategy):
                 for text in texts
             ]
 
-        slots, engine_inputs, params = [], [], []
+        slots, prompts, engine_inputs, params = [], [], [], []
         for q, engine_input in zip(questions, rendered):
             prompt_ids = list(
                 extract_prompt_components(
@@ -371,19 +383,30 @@ class NextTokenStrategy(ReadStrategy):
                     "these chat options end the prompt differently, so the "
                     "labels' tokens are unknown"
                 )
+            prompts.append(prompt_ids)
             slots.append([self.label_ids[label] for label in q.labels])
             engine_inputs.append(self._read_input(engine_input, prompt_ids))
             params.append(self._sampling_params(slots[-1], prompt_ids))
 
-        label_reads = await next_token_label_reads(
-            ctx.engine_client,
-            engine_inputs,
-            params,
-            request_id,
-            lora_request=lora_request,
-            trace_headers=trace_headers,
-            priority=priority,
+        # Decisions over one engine step take turns so short ones need not wait.
+        shared = len(os.path.commonprefix(prompts))
+        num_tokens = shared + sum(len(p) - shared for p in prompts)
+        del prompts  # Do not hold the id copies while waiting at the gate.
+        gate: contextlib.AbstractAsyncContextManager[None] = (
+            self._big_decision_gate
+            if len(questions) > 1 and num_tokens > self._big_decision_tokens
+            else contextlib.nullcontext()
         )
+        async with gate:
+            label_reads = await next_token_label_reads(
+                ctx.engine_client,
+                engine_inputs,
+                params,
+                request_id,
+                lora_request=lora_request,
+                trace_headers=trace_headers,
+                priority=priority,
+            )
 
         reads = []
         for ids, label_read in zip(slots, label_reads):
