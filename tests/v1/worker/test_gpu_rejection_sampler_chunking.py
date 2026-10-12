@@ -289,3 +289,49 @@ def test_replay_on_off_preserves_rejection_sampling_and_rng(monkeypatch):
     assert masks == expected_masks
     assert all(token_id in mask for token_id, mask in zip(emitted, masks))
     assert torch.equal(on_logprobs.logprobs[mapped_rows, 0], expected_logprobs)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_verify_returns_logprob_token_ids():
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.sample.logprob import LogprobTokenIdsState
+    from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+
+    device = torch.device("cuda")
+    # Request 2 asks for three label ids only; request 1 wants no logprobs.
+    cu_num_logits_np = np.array([0, 3, 4], dtype=np.int32)
+    idx_mapping_np = np.array([1, 2], dtype=np.int32)
+    input_batch = _make_input_batch(cu_num_logits_np, idx_mapping_np, device)
+    state = LogprobTokenIdsState(max_num_reqs=4, device=device)
+    state.add_request(2, SamplingParams(max_tokens=1, logprob_token_ids=[5, 9, 11]))
+    state.apply_staged_writes()
+    rejection_sampler = _make_rejection_sampler(
+        SimpleNamespace(
+            logprobs_mode="raw_logprobs",
+            return_sampling_mask=False,
+            logprob_token_ids_state=state,
+        ),
+        num_speculative_steps=2,
+    )
+
+    def fake_verify(self, logits, _dl, _ds, _pos, cu_num_logits, *_rest):
+        num_sampled = torch.diff(cu_num_logits).to(torch.int32)
+        sampled = torch.zeros((num_sampled.shape[0], 3), dtype=torch.int64)
+        return logits, sampled.to(device), num_sampled
+
+    rejection_sampler._verify = MethodType(fake_verify, rejection_sampler)
+    logits = torch.randn(4, 17, device=device)
+    _, _, logprobs, _ = rejection_sampler._verify_in_chunks(
+        logits,
+        input_batch,
+        draft_logits=None,
+        draft_sampled=torch.zeros(4, dtype=torch.int64, device=device),
+        pos=torch.arange(4, device=device),
+        max_chunk_logits=8,
+        max_num_logprobs=NO_LOGPROBS,
+        max_per_req_token_ids=3,
+    )
+    assert logprobs is not None
+    expected = torch.log_softmax(logits[3], dim=-1)[[5, 9, 11]]
+    assert logprobs.logprob_token_ids[3, 1:4].tolist() == [5, 9, 11]
+    torch.testing.assert_close(logprobs.logprobs[3, 1:4], expected)
