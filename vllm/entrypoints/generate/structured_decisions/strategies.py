@@ -9,17 +9,20 @@ import hashlib
 import json
 import math
 import random
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.generate.label_reads import next_token_label_reads
-from vllm.inputs import EngineInput, tokens_input
+from vllm.inputs import EngineInput, TextPrompt, TokensPrompt, tokens_input
 from vllm.lora.request import LoRARequest
 from vllm.renderers.chat_utils import ChatTemplateContentFormatOption
+from vllm.renderers.hf import HfRenderer
+from vllm.renderers.inputs import TokPrompt
 from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import SamplingParams
@@ -124,6 +127,19 @@ def type_label_ids(
     return label_ids
 
 
+# Marks where a question goes in the rendered prompt.
+_MARKER = "\ue000"
+
+
+def _messages(
+    state: str, question: str, instructions: str | None
+) -> list[dict[str, Any]]:
+    messages = [{"role": "user", "content": f"{state}\n\n{question}"}]
+    if instructions:
+        messages.insert(0, {"role": "system", "content": instructions})
+    return messages
+
+
 class NextTokenStrategy(ReadStrategy):
     """Autoregressive models. Each question is one request: the state, then the
     question with its labeled options, and the logprobs of the label tokens as
@@ -188,7 +204,7 @@ class NextTokenStrategy(ReadStrategy):
 
     async def _render(
         self, read_request: ReadPromptRequest, messages: list[dict[str, Any]]
-    ) -> tuple[EngineInput, list[int]]:
+    ) -> EngineInput:
         ctx = self.context
         _, (engine_input,) = await ctx.online_renderer.preprocess_chat(
             read_request,
@@ -197,10 +213,77 @@ class NextTokenStrategy(ReadStrategy):
             default_template_content_format=ctx.chat_template_content_format,
             default_template_kwargs=ctx.default_chat_template_kwargs,
         )
-        prompt_ids = extract_prompt_components(
-            ctx.engine_client.model_config, engine_input
-        ).token_ids
-        return engine_input, list(prompt_ids or [])
+        return engine_input
+
+    async def _render_spliced(
+        self,
+        read_request: ReadPromptRequest,
+        question_texts: list[str],
+        instructions: str | None,
+        state: str,
+    ) -> list[EngineInput] | None:
+        """Every prompt with the state tokenized once, or None to fall back."""
+        ctx = self.context
+        online_renderer = ctx.online_renderer
+        renderer = online_renderer.renderer
+        if not isinstance(renderer, HfRenderer):
+            return None
+        chat_params = online_renderer.build_chat_params(
+            read_request,
+            ctx.chat_template,
+            ctx.chat_template_content_format,
+            ctx.default_chat_template_kwargs,
+        )
+        tok_params = read_request.build_tok_params(online_renderer.model_config)
+
+        def render(question: str) -> str | list[int] | None:
+            messages = _messages(state, question, instructions)
+            return renderer.render_messages(messages, chat_params)[1].get("prompt")
+
+        def ids(prompts: Sequence[TokPrompt]) -> list[list[int]]:
+            return [list(cast(TokensPrompt, p)["prompt_token_ids"]) for p in prompts]
+
+        arrival_time = time.time()
+        probe = await renderer.run_chat_template_job_async(lambda: render(_MARKER))
+        if not isinstance(probe, str) or probe.count(_MARKER) != 1:
+            return None
+        prefix, tail = probe.split(_MARKER)
+        if not prefix.endswith("\n\n"):
+            return None
+        (prefix_ids,) = ids(
+            await renderer.tokenize_prompts_async(
+                [TextPrompt(prompt=prefix)], tok_params
+            )
+        )
+        head = prefix[-64:]
+        prompts = [prefix + q + tail for q in question_texts]
+
+        def window_ids() -> list[list[int]] | None:
+            if any(render(q) != p for q, p in zip(question_texts, prompts)):
+                return None
+            texts = [head, *(head + q + tail for q in question_texts)]
+            return ids(
+                renderer.tokenize_prompts(
+                    [TextPrompt(prompt=t) for t in texts], tok_params
+                )
+            )
+
+        tokenized = await renderer.run_chat_template_job_async(window_ids)
+        if tokenized is None:
+            return None
+        head_ids, *windows = tokenized
+        if any(w[: len(head_ids)] != head_ids for w in windows):
+            return None
+        engine_inputs = await online_renderer.preprocess_cmpl(
+            read_request,
+            [
+                TokensPrompt(prompt=p, prompt_token_ids=prefix_ids + w[len(head_ids) :])
+                for p, w in zip(prompts, windows)
+            ],
+        )
+        for engine_input in engine_inputs:
+            engine_input["arrival_time"] = arrival_time
+        return engine_inputs
 
     async def read(
         self,
@@ -218,12 +301,26 @@ class NextTokenStrategy(ReadStrategy):
         ctx = self.context
         read_request = self._read_request(chat_template_kwargs, cache_salt)
 
+        texts = [q.type.prompt(q) for q in questions]
+        rendered = None
+        if len(texts) > 1:
+            rendered = await self._render_spliced(
+                read_request, texts, instructions, state
+            )
+        if rendered is None:
+            rendered = [
+                await self._render(read_request, _messages(state, text, instructions))
+                for text in texts
+            ]
+
         slots, engine_inputs, params = [], [], []
-        for q in questions:
-            messages = [{"role": "user", "content": f"{state}\n\n{q.type.prompt(q)}"}]
-            if instructions:
-                messages.insert(0, {"role": "system", "content": instructions})
-            engine_input, prompt_ids = await self._render(read_request, messages)
+        for q, engine_input in zip(questions, rendered):
+            prompt_ids = list(
+                extract_prompt_components(
+                    ctx.engine_client.model_config, engine_input
+                ).token_ids
+                or []
+            )
             if prompt_ids[len(prompt_ids) - len(self.tail) :] != self.tail:
                 raise StructuredDecisionError(
                     "these chat options end the prompt differently, so the "

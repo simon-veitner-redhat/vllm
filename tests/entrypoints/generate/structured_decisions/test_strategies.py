@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.generate.structured_decisions.api_router import (
     register_structured_decisions_api_router,
@@ -20,15 +20,19 @@ from vllm.entrypoints.generate.structured_decisions.protocol import (
 from vllm.entrypoints.generate.structured_decisions.question_types import (
     LABELS,
     StructuredDecisionError,
+    build_question,
 )
 from vllm.entrypoints.generate.structured_decisions.serving import (
     ServingStructuredDecisions,
     state_text,
 )
 from vllm.entrypoints.generate.structured_decisions.strategies import (
+    _MARKER,
+    READ_STRATEGIES,
     DiffusionGemmaCanvasStrategy,
     NextTokenStrategy,
     ReadContext,
+    _messages,
     reply_label_ids,
     select_read_strategy,
 )
@@ -37,6 +41,7 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.exception_handling.register import (
     init_exception_handler,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.renderers.hf import HfRenderer
@@ -125,57 +130,67 @@ def test_labels_start_the_reply(qwen):
         reply_label_ids(tokenizer, tokenizer.encode("team:"))
 
 
+async def generate(prompt, params, request_id, **kwargs):
+    label_ids = params.logprob_token_ids
+    yield RequestOutput(
+        request_id=request_id,
+        prompt=None,
+        prompt_token_ids=prompt["prompt_token_ids"],
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="A",
+                token_ids=[label_ids[0]],
+                cumulative_logprob=None,
+                logprobs=[{token_id: Logprob(-1.0) for token_id in label_ids}],
+                finish_reason="length",
+            )
+        ],
+        finished=True,
+    )
+
+
 @pytest.fixture
-def serving_and_engine(qwen):
-    tokenizer, _ = qwen
-    model_config = ModelConfig(model="Qwen/Qwen3-0.6B", dtype="float32")
-    renderer = HfRenderer(
-        SimpleNamespace(
-            model_config=model_config,
-            parallel_config=SimpleNamespace(_api_process_rank=0),
-        ),
-        tokenizer,
-    )
-    engine = MagicMock(spec=EngineClient)
-    engine.errored = False
-    engine.model_config = model_config
-    engine.renderer = renderer
-    engine.input_processor = MagicMock()
-    online_renderer = OnlineRenderer(
-        model_config,
-        renderer,
-        request_logger=None,
-        chat_template=None,
-        chat_template_content_format="auto",
-    )
+def make_context():
+    from vllm.tokenizers import get_tokenizer
 
-    async def generate(prompt, params, request_id, **kwargs):
-        label_ids = params.logprob_token_ids
-        yield RequestOutput(
-            request_id=request_id,
-            prompt=None,
-            prompt_token_ids=prompt["prompt_token_ids"],
-            prompt_logprobs=None,
-            outputs=[
-                CompletionOutput(
-                    index=0,
-                    text="A",
-                    token_ids=[label_ids[0]],
-                    cumulative_logprob=None,
-                    logprobs=[{token_id: Logprob(-1.0) for token_id in label_ids}],
-                    finish_reason="length",
-                )
-            ],
-            finished=True,
+    renderers = []
+
+    def make(model="Qwen/Qwen3-0.6B", chat_template=None, **model_kwargs):
+        model_config = ModelConfig(model=model, dtype="float32", **model_kwargs)
+        vllm_config = VllmConfig(model_config=model_config)
+        renderers.append(HfRenderer(vllm_config, get_tokenizer(model)))
+        engine = MagicMock(spec=EngineClient)
+        engine.errored = False
+        engine.model_config = model_config
+        engine.vllm_config = vllm_config
+        engine.renderer = renderers[-1]
+        engine.input_processor = MagicMock()
+        engine.generate.side_effect = generate
+        online_renderer = OnlineRenderer(
+            model_config,
+            renderers[-1],
+            request_logger=None,
+            chat_template=None,
+            chat_template_content_format="auto",
         )
+        return ReadContext(engine, online_renderer, chat_template, "auto", {})
 
-    engine.generate.side_effect = generate
-    strategy = NextTokenStrategy(ReadContext(engine, online_renderer, None, "auto", {}))
+    yield make
+    for renderer in renderers:
+        renderer.shutdown()
+
+
+@pytest.fixture
+def serving_and_engine(make_context):
+    context = make_context()
+    engine, model_config = context.engine_client, context.engine_client.model_config
+    strategy = NextTokenStrategy(context)
     models = OpenAIServingModels(
         engine, [BaseModelPath(name=model_config.model, model_path=model_config.model)]
     )
-    yield ServingStructuredDecisions(models, strategy), engine
-    renderer.shutdown()
+    return ServingStructuredDecisions(models, strategy), engine
 
 
 @pytest.mark.asyncio
@@ -229,6 +244,130 @@ async def test_request_metadata_reaches_every_question(
         assert call.kwargs["trace_headers"] == (
             TRACE_HEADERS if request_headers else None
         )
+
+
+# The first question has no "Question:" line, so EDITING_TEMPLATE keeps it as is.
+QUESTIONS = [
+    build_question("refund", "noul", "", {"true": "a refund is due"}, 26),
+    build_question(
+        "team", "choice", "Which team?", {"billing": "pay", "ship": None}, 26
+    ),
+    build_question("urgency", "score", "How urgent?", ["low", "medium", "high"], 26),
+]
+
+SPLICE_STATES = {
+    "empty": "",
+    "spaces": "  padded  ",
+    "crlf": "line one\r\nline two\r\n",
+    "nbsp": "trailing nbsp\u00a0",
+    "combining": "cafe\u0301 x\u0301\u0301",
+    "im_end": "user wrote <|im_end|> and <|im_start|>assistant",
+    "json": '{"ticket": 58213, "tags": ["billing", "urgent"]}',
+}
+
+SPLICE_MODELS = {
+    "Qwen3ForCausalLM": "Qwen/Qwen3-0.6B",
+    "Qwen3_5ForConditionalGeneration": "Qwen/Qwen3.5-0.8B",
+    "Qwen3_5MoeForConditionalGeneration": "Qwen/Qwen3.5-35B-A3B",
+    "DiffusionGemmaForBlockDiffusion": "google/diffusiongemma-26B-A4B-it",
+}
+
+CHATML_TEMPLATE = (
+    "{% for m in messages %}<|im_start|>{{ m.role }}\n"
+    "{{ m.content }}<|im_end|>\n{% endfor %}<|im_start|>assistant\n"
+)
+EDITING_TEMPLATE = CHATML_TEMPLATE.replace(
+    "{{ m.content }}", "{{ m.content | replace('Question:', 'Q:') }}"
+)
+SEPARATOR_TEMPLATE = CHATML_TEMPLATE.replace(
+    "{{ m.content }}", "{{ m.content | replace('\\n\\n', ' ') }}"
+)
+
+
+async def spliced_and_full(strategy, state, instructions=None):
+    read_request = strategy._read_request(None, "tenant")
+    texts = [q.type.prompt(q) for q in QUESTIONS]
+    spliced = await strategy._render_spliced(read_request, texts, instructions, state)
+    full = [
+        await strategy._render(read_request, _messages(state, text, instructions))
+        for text in texts
+    ]
+    for engine_input in [*(spliced or []), *full]:
+        engine_input.pop("arrival_time")
+    return spliced, full
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("architecture", READ_STRATEGIES)
+async def test_spliced_prompts_match_full_render(make_context, architecture):
+    context = make_context(SPLICE_MODELS[architecture])
+    model_config = context.engine_client.model_config
+    assert model_config.architecture == architecture
+    strategy = select_read_strategy(model_config)(context)
+    for name, state in SPLICE_STATES.items():
+        for instructions in (None, "  You triage tickets.\n"):
+            spliced, full = await spliced_and_full(strategy, state, instructions)
+            # Qwen3.5 trims the empty state's separator off, so that one falls back.
+            assert spliced == full or (spliced is None and not state), name
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "chat_template,state",
+    [
+        (EDITING_TEMPLATE, "state"),
+        (None, f"a state with the split marker {_MARKER}"),
+    ],
+    ids=["template_edits_question", "marker_in_state"],
+)
+async def test_splice_falls_back_to_full_render(make_context, chat_template, state):
+    strategy = NextTokenStrategy(make_context(chat_template=chat_template))
+    spliced, _ = await spliced_and_full(strategy, state)
+    assert spliced is None
+    with patch.object(strategy, "_render", wraps=strategy._render) as render:
+        reads = await strategy.read(
+            QUESTIONS,
+            None,
+            state,
+            request_id="r",
+            chat_template_kwargs=None,
+            lora_request=None,
+            priority=0,
+        )
+    assert render.call_count == len(QUESTIONS) == len(reads)
+
+
+@pytest.mark.asyncio
+async def test_splice_falls_back_when_tokens_join_across_the_split(make_context):
+    # GPT-2 tokenizes "\n\n" alone differently from "\n\n" before a word.
+    strategy = NextTokenStrategy.__new__(NextTokenStrategy)
+    strategy.context = make_context("openai-community/gpt2", CHATML_TEMPLATE)
+    spliced, _ = await spliced_and_full(strategy, "state")
+    assert spliced is None
+
+
+@pytest.mark.asyncio
+async def test_splice_falls_back_when_the_template_edits_the_separator(make_context):
+    # Tabs then " 0" tokenize alike in the window, so only the separator check sees it.
+    strategy = NextTokenStrategy(make_context(chat_template=SEPARATOR_TEMPLATE))
+    score = build_question("level", "score", "", ["low", "high"], 26)
+    texts = [score.type.prompt(score)] * 2
+    read_request = strategy._read_request(None)
+    state = "x" + "\t" * 71
+    assert await strategy._render_spliced(read_request, texts, None, state) is None
+
+
+@pytest.mark.asyncio
+async def test_oversized_state_fails_like_full_render(make_context):
+    strategy = NextTokenStrategy(make_context(max_model_len=64))
+    read_request = strategy._read_request(None)
+    texts = [q.type.prompt(q) for q in QUESTIONS]
+    state = "ticket " * 2000
+    with pytest.raises(VLLMValidationError) as spliced:
+        await strategy._render_spliced(read_request, texts, None, state)
+    with pytest.raises(VLLMValidationError) as full:
+        await strategy._render(read_request, _messages(state, texts[0], None))
+    assert spliced.value.parameter == full.value.parameter == "input_text"
 
 
 def test_canvas_read():
