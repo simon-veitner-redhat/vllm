@@ -267,6 +267,14 @@ def test_sm100_576_priority_unchanged():
     assert order[0] == "FLASHMLA_SPARSE", order
 
 
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "fp8_e4m3"])
+def test_sm100_fp8_low_heads_keeps_flashinfer_default(kv_cache_dtype):
+    """FA4 accepts fp8 KV but is opt-in until benchmarked: not in the list."""
+    order = _sparse_order(kv_cache_dtype, 576, num_heads=16)
+    assert order[0] == "FLASHINFER_MLA_SPARSE", order
+    assert "FLASH_ATTN_MLA_SPARSE_FA4" not in order, order
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA backends")
 def test_sm90_nope_fp8_ds_mla_resolves_to_flashmla():
     """The sparse backends ranked ahead of FLASHMLA_SPARSE for SM90 NoPE-512

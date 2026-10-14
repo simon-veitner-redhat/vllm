@@ -57,6 +57,15 @@ pytestmark = pytest.mark.skip_global_cleanup
                 not current_platform.is_cuda(), reason="CUDA only"
             ),
         ),
+        pytest.param(
+            AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE_FA4,
+            "fp8",
+            True,
+            64 * 576,
+            marks=pytest.mark.skipif(
+                not current_platform.is_cuda(), reason="CUDA only"
+            ),
+        ),
         (AttentionBackendEnum.FLASHMLA_SPARSE, "auto", True, 1152),
         (AttentionBackendEnum.FLASHMLA_SPARSE, "fp8_ds_mla", False, MultipleOf(64)),
         (AttentionBackendEnum.FLASHMLA_SPARSE, "fp8_ds_mla", True, 656),
