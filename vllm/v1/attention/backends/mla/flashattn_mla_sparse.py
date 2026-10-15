@@ -449,6 +449,7 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
                 num_sms,
                 width // 128,
                 fp8_kv=is_quantized_kv_cache(self.kv_cache_dtype),
+                dcp_size=self.dcp_world_size,
             )
             first_size.setdefault(grid, num_tokens)
 
@@ -557,6 +558,8 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
             return_softmax_lse=self.need_to_return_lse_for_decode,
             # the warmup's eager calls size the ticket buffers before graph capture
             fa4_sparse_decode_fused_combine=self._fa4_fused_combine,
+            # DCP ranks see ~ topk / dcp valid rows: FA4 picks its grid by it
+            fa4_sparse_decode_dcp_size=self.dcp_world_size,
         )
         out, lse = (
             kernel_out if self.need_to_return_lse_for_decode else (kernel_out, None)

@@ -218,6 +218,8 @@ def flash_attn_varlen_func(
     gather_kv_valid_length=None,
     # FA4 sparse MLA decode: reduce the KV splits inside the decode kernel
     fa4_sparse_decode_fused_combine: bool = False,
+    # FA4 sparse MLA decode: the DCP size, which picks the decode grid
+    fa4_sparse_decode_dcp_size: int = 1,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -488,6 +490,11 @@ def flash_attn_varlen_func(
             **(
                 {"sparse_decode_fused_combine": True}
                 if fa4_sparse_decode_fused_combine
+                else {}
+            ),
+            **(
+                {"sparse_decode_dcp_size": fa4_sparse_decode_dcp_size}
+                if fa4_sparse_decode_dcp_size > 1
                 else {}
             ),
         )
