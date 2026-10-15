@@ -409,9 +409,11 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
         kv_cache = layer.kv_cache  # type: ignore[attr-defined]
         block_size = kv_cache.shape[1]
         if isinstance(self.index_group, HiSparseMLAIndexGroup):
-            # layer.kv_cache is the host cache; FA4 reads the hot device cache.
-            hot = self.index_group.cache(self.index_group_index).runtime.hot
-            kv_cache, block_size = hot.attention_cache, hot.block_size
+            # layer.kv_cache is the host cache; FA4 reads the hot device cache, the
+            # same buffer the HiSparse forward passes (physical_kv_cache).
+            group, layer_index = self.index_group, self.index_group_index
+            kv_cache = group.physical_kv_cache(layer_index)
+            block_size = group.cache(layer_index).runtime.hot.block_size
         device = kv_cache.device
         max_tokens, width = self.topk_indices_buffer.shape
         heads = self.num_heads * self.dcp_world_size
