@@ -4016,6 +4016,7 @@ def _fa4_impl(topk_indices_buffer, **fields):
         kv_cache_dtype="auto",
         dcp_world_size=1,
         dcp_rank=0,
+        pcp_world_size=1,
         need_to_return_lse_for_decode=False,
         is_nope_mla=False,
         _workspace_buffer=None,
@@ -4087,15 +4088,21 @@ def _record_fa4_kernels(monkeypatch, num_heads, *, device):
     def fake_fa4(**kwargs):
         fa4_calls.append(kwargs)
         rows = kwargs["q"].shape[0]
-        out = torch.ones(rows, num_heads, 512, dtype=torch.bfloat16, device=device)
+        out = kwargs.get("out")
+        if out is None:
+            out = torch.empty(rows, num_heads, 512, dtype=torch.bfloat16, device=device)
+        out.fill_(1.0)
         return (out, lse(rows)) if kwargs.get("return_softmax_lse") else out
 
     def fake_trtllm(**kwargs):
         trtllm_calls.append(kwargs)
         rows = kwargs["query"].shape[0]
-        out = torch.full(
-            (rows, 1, num_heads, 512), 2.0, dtype=torch.bfloat16, device=device
-        )
+        out = kwargs.get("out")
+        if out is None:
+            out = torch.empty(
+                (rows, 1, num_heads, 512), dtype=torch.bfloat16, device=device
+            )
+        out.fill_(2.0)
         return (out, lse(rows)) if kwargs.get("return_lse") else out
 
     monkeypatch.setattr(flashattn_sparse_module, "flash_attn_varlen_func", fake_fa4)
@@ -4200,7 +4207,7 @@ def test_fa4_sparse_hook_routes_lanes(monkeypatch, is_decode):
     impl._convert_logical_to_physical_topk = MagicMock()
     dcp_filter = MagicMock(return_value=(inputs.topk_indices, inputs.valid_counts))
     monkeypatch.setattr(sparse_mla, "triton_filter_and_convert_dcp_index", dcp_filter)
-    inputs.metadata.num_decode_tokens = num_tokens if is_decode else 1
+    inputs.metadata.num_decode_tokens = num_tokens if is_decode else 0
 
     with torch.inference_mode():
         out, lse = impl.forward_mqa(q, inputs.kv_cache, inputs.metadata, None)
@@ -4224,6 +4231,59 @@ def test_fa4_sparse_hook_routes_lanes(monkeypatch, is_decode):
         # trtllm-gen's LSE is base 2; the DCP merge expects natural log.
         expected = calls.lse(num_tokens) * math.log(2.0)
         torch.testing.assert_close(lse, expected, rtol=0, atol=1e-5)
+
+
+@pytest.mark.parametrize("pcp", [1, 2], ids=["no_pcp", "pcp"])
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+def test_fa4_sparse_splits_mixed_batch(monkeypatch, kv_cache_dtype, pcp):
+    """A mixed batch runs its decodes on FA4 and the rest on trtllm-gen, into
+    one output, with the natural-log LSEs concatenated for the DCP merge."""
+    import vllm.model_executor.layers.attention.sparse_mla_attention as sparse_mla
+
+    counts, num_decodes, num_heads = [1, 2, 3, 4, 5], 2, 32
+    num_tokens = len(counts)
+    inputs = _fa4_inputs(counts, num_heads=num_heads, device="cpu")
+    calls = _record_fa4_kernels(monkeypatch, num_heads, device="cpu")
+    fp8 = kv_cache_dtype != "auto"
+    q = torch.cat((inputs.ql_nope, inputs.q_pe), dim=-1)
+    kv_cache = inputs.kv_cache
+    if fp8:
+        q = q.to(current_platform.fp8_dtype())
+        kv_cache = kv_cache.to(current_platform.fp8_dtype()).view(torch.uint8)
+    impl = _fa4_impl(
+        topk_indices_buffer=inputs.topk_indices,
+        kv_cache_dtype=kv_cache_dtype,
+        dcp_world_size=2,
+        pcp_world_size=pcp,
+        need_to_return_lse_for_decode=True,
+    )
+    dcp_filter = MagicMock(return_value=(inputs.topk_indices, inputs.valid_counts))
+    monkeypatch.setattr(sparse_mla, "triton_filter_and_convert_dcp_index", dcp_filter)
+    inputs.metadata.num_decode_tokens = num_decodes
+    layer = SimpleNamespace(_q_scale_float=1.0, _k_scale_float=1.0)
+
+    with torch.inference_mode():
+        out, lse = impl.forward_mqa(q, kv_cache, inputs.metadata, layer)
+
+    assert out.shape == (num_tokens, num_heads, 512)
+    assert out.dtype == torch.bfloat16
+    if pcp > 1:
+        # Gated off under PCP: one trtllm-gen call for the whole batch.
+        assert calls.fa4 == [] and len(calls.trtllm) == 1
+        return
+    (fa4,) = calls.fa4
+    (trtllm,) = calls.trtllm
+    assert fa4["q"].shape[0] == num_decodes
+    assert torch.equal(fa4["gather_kv_indices"], inputs.topk_indices[:num_decodes])
+    assert torch.equal(trtllm["block_tables"][:, 0], inputs.topk_indices[num_decodes:])
+    # Both lanes wrote straight into the one output buffer.
+    assert fa4["out"].data_ptr() == out.data_ptr()
+    assert trtllm["out"].data_ptr() == out[num_decodes:].data_ptr()
+    assert (out[:num_decodes] == 1.0).all() and (out[num_decodes:] == 2.0).all()
+    expected_lse = torch.cat(
+        (calls.lse(num_decodes), calls.lse(num_tokens - num_decodes) * math.log(2.0))
+    )
+    torch.testing.assert_close(lse, expected_lse, rtol=0, atol=1e-5)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")

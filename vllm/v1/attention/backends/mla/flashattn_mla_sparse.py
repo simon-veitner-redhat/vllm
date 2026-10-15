@@ -388,6 +388,57 @@ def _fa4_varlen_scalars(
 class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
     # FA4 emits a natural-log LSE; prefill converts trtllm-gen's log2 LSE.
     lse_base_on_e: bool = True
+    # Mixed batches: decodes on FA4, the rest on trtllm-gen.
+    split_mixed_mqa_batch: ClassVar[bool] = True
+
+    def warmup_decode_variants(self, layer: AttentionLayer) -> int:
+        """Compile every (head_groups, splits) decode grid FA4 can pick.
+
+        Split mixed batches hand FA4 decode slices of any size, so compile them
+        all before serving instead of on first use mid-run.
+        """
+        from vllm.vllm_flash_attn.cute.cute_dsl_utils import (
+            get_num_sms_for_selection,
+        )
+        from vllm.vllm_flash_attn.cute.interface import mla_decode_splits
+
+        assert self.topk_indices_buffer is not None
+        kv_cache = layer.kv_cache  # type: ignore[attr-defined]
+        device = kv_cache.device
+        max_tokens, width = self.topk_indices_buffer.shape
+        heads = self.num_heads * self.dcp_world_size
+        props = torch.cuda.get_device_properties(device)
+        num_sms = get_num_sms_for_selection(
+            device.index, props.major * 10 + props.minor
+        )
+        first_size: dict[tuple[int, int], int] = {}
+        for num_tokens in range(1, max_tokens + 1):
+            grid = mla_decode_splits(num_tokens, 1, heads, num_sms, width // 128)
+            first_size.setdefault(grid, num_tokens)
+
+        quantized = is_quantized_kv_cache(self.kv_cache_dtype)
+        q_dtype = (
+            current_platform.fp8_dtype()
+            if quantized and self.supports_quant_query_input
+            else torch.bfloat16
+        )
+        kv_rows, _ = flat_kv_row_view(kv_cache, kv_cache.shape[1])
+        rows = torch.arange(width, dtype=torch.int32, device=device) % kv_rows.shape[0]
+        for num_tokens in first_size.values():
+            self._forward_mqa_kernel(
+                torch.zeros(
+                    (num_tokens, heads, self.kv_lora_rank + self.qk_rope_head_dim),
+                    dtype=q_dtype,
+                    device=device,
+                ),
+                kv_cache,
+                rows.expand(num_tokens, -1).contiguous(),
+                torch.full((num_tokens,), width, dtype=torch.int32, device=device),
+                layer=layer,
+                block_size=kv_cache.shape[1],
+                is_decode=True,
+            )
+        return len(first_size)
 
     def _forward_mqa_kernel(
         self,
@@ -399,6 +450,7 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
         layer: AttentionLayer,
         block_size: int,
         is_decode: bool,
+        out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not is_decode:
             out, lse = super()._forward_mqa_kernel(
@@ -409,6 +461,7 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
                 layer=layer,
                 block_size=block_size,
                 is_decode=is_decode,
+                out=out,
             )
             return out, None if lse is None else lse * math.log(2.0)
         if isinstance(q, tuple):
@@ -442,6 +495,7 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
             k=kv_rows[:, self.kv_lora_rank :].unsqueeze(1),
             v=kv_rows[:, : self.kv_lora_rank].unsqueeze(1),
             q_v=ql_nope,
+            out=out,
             max_seqlen_q=1,
             cu_seqlens_q=cu_seqlens_q[: num_tokens + 1],
             max_seqlen_k=num_kv_rows,

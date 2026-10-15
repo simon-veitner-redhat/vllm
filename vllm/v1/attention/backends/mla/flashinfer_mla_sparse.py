@@ -565,6 +565,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         layer: AttentionLayer,
         block_size: int,
         is_decode: bool,
+        out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if isinstance(q, tuple):
             ql_nope, q_pe = q
@@ -631,6 +632,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             bmm1_scale=self.bmm1_scale,
             bmm2_scale=self.bmm2_scale,
             sparse_mla_top_k=sparse_topk_capacity,
+            out=None if out is None else out.unsqueeze(1),
             return_lse=self.need_to_return_lse_for_decode,
             **extra_kwargs,
         )

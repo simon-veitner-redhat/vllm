@@ -27,6 +27,7 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     autotune_hisparse_flashinfer_attention,
     deepseek_v4_sparse_mla_attention_warmup,
+    fa4_sparse_mla_decode_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
 from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
@@ -232,6 +233,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         rocm_segmented_attn_autotune_warmup(worker)
 
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
+    fa4_sparse_mla_decode_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
 
     # Deep GEMM warmup

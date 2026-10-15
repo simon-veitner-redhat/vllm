@@ -240,6 +240,31 @@ def _deepseek_v4_sparse_mla_decode_autotune(
     )
 
 
+def fa4_sparse_mla_decode_warmup(worker: "Worker") -> None:
+    """Compile every FA4 sparse decode grid a split mixed batch can reach."""
+    runner = worker.model_runner
+    if (
+        runner.is_pooling_model
+        or not worker.vllm_config.kernel_config.enable_jit_warmup
+    ):
+        return
+    done: set[tuple[object, ...]] = set()
+    for layer in runner.vllm_config.compilation_config.static_forward_context.values():
+        impl = getattr(layer, "impl", None)
+        warmup = getattr(impl, "warmup_decode_variants", None)
+        if warmup is None or getattr(layer, "kv_cache", None) is None:
+            continue
+        key = (
+            impl.kv_cache_dtype,
+            impl.num_heads * impl.dcp_world_size,
+            impl.need_to_return_lse_for_decode,
+            tuple(impl.topk_indices_buffer.shape),
+        )
+        if key not in done:
+            done.add(key)
+            logger.info("Compiled %d FA4 sparse MLA decode grids.", warmup(layer))
+
+
 def flashinfer_sparse_mla_decode_autotune_warmup(worker: "Worker") -> None:
     """Autotune generic FlashInfer sparse MLA decode when selected."""
     runner = worker.model_runner
