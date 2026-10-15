@@ -90,7 +90,11 @@ def _get_hisparse_worker(runner: VllmRunner) -> HiSparseConnectorWorker:
         # Offloading does not touch the attention kernels: FA4 runs standalone.
         pytest.param(False, "FLASH_ATTN_MLA_SPARSE_FA4", "auto", id="standalone-fa4"),
         pytest.param(
-            False, "FLASH_ATTN_MLA_SPARSE_FA4", "fp8", id="standalone-fa4-fp8"
+            False,
+            "FLASH_ATTN_MLA_SPARSE_FA4",
+            "fp8",
+            id="standalone-fa4-fp8",
+            marks=pytest.mark.slow_test,
         ),
     ],
 )

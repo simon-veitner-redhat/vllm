@@ -600,13 +600,11 @@ def test_sparse_backend_decode_correctness(
     # Compute per-rank heads for simulated TP
     num_heads = max(1, total_num_heads // tensor_parallel_size)
 
-    if backend_cls == FlashAttnMLASparseFA4Backend:
-        if not current_platform.is_device_capability_family(100):
-            pytest.skip("FA4 sparse MLA requires SM 10.x")
-        if (reason := _fa4_cute_mla_available()) is not None:
-            pytest.skip(reason)
-        if kv_cache_dtype != "auto" and num_heads == 128:
-            pytest.skip("FA4 sparse MLA supports fp8 KV only up to 64 heads")
+    if (
+        backend_cls == FlashAttnMLASparseFA4Backend
+        and not current_platform.is_device_capability_family(100)
+    ):
+        pytest.skip("FA4 sparse MLA requires SM 10.x")
 
     kv_lora_rank = 512
     head_size = kv_lora_rank + qk_rope_head_dim
@@ -655,6 +653,22 @@ def test_sparse_backend_decode_correctness(
     )
     model_config.get_head_size = MethodType(lambda self: head_size, model_config)
     model_config.get_sliding_window = MethodType(lambda self: None, model_config)
+    if backend_cls == FlashAttnMLASparseFA4Backend:
+        # The backend's own gate: FA4 availability, head counts, fp8 vs 128 heads.
+        with set_current_vllm_config(vllm_config):
+            reason = backend_cls.supports_combination(
+                head_size,
+                dtype,
+                kv_cache_dtype,
+                block_size,
+                True,
+                False,
+                True,
+                False,
+                current_platform.get_device_capability(),
+            )
+        if reason is not None:
+            pytest.skip(reason)
 
     kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
 

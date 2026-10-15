@@ -224,6 +224,7 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
         layer: AttentionLayer,
         block_size: int,
         is_decode: bool,
+        out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not isinstance(q, tuple):
             raise NotImplementedError(
@@ -249,6 +250,7 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
             k=k_cache,
             v=v_cache,
             q_v=q_nope,
+            out=out,
             max_seqlen_q=1,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_k=topk_indices.shape[1],
@@ -423,7 +425,13 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
             else torch.bfloat16
         )
         kv_rows, _ = flat_kv_row_view(kv_cache, kv_cache.shape[1])
-        rows = torch.arange(width, dtype=torch.int32, device=device) % kv_rows.shape[0]
+        # The indexer rewrites this shared buffer every forward.
+        topk_rows = self.topk_indices_buffer
+        topk_rows.copy_(
+            (
+                torch.arange(width, dtype=torch.int32, device=device) % kv_rows.shape[0]
+            ).expand_as(topk_rows)
+        )
         for num_tokens in first_size.values():
             self._forward_mqa_kernel(
                 torch.zeros(
@@ -432,7 +440,7 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
                     device=device,
                 ),
                 kv_cache,
-                rows.expand(num_tokens, -1).contiguous(),
+                topk_rows[:num_tokens],
                 torch.full((num_tokens,), width, dtype=torch.int32, device=device),
                 layer=layer,
                 block_size=kv_cache.shape[1],

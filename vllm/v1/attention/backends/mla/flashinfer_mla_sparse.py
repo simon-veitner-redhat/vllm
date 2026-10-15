@@ -488,6 +488,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # for query and kv_cache (mixed bf16+fp8 is not supported).
         self.supports_quant_query_input = True
 
+    def _mqa_out_dtype(self) -> torch.dtype:
+        # trtllm-gen MLA (and FA4 on the decode lane) write a bf16 latent.
+        return torch.bfloat16
+
     def _prepare_mqa_kernel(
         self,
         layer: AttentionLayer,
