@@ -489,7 +489,11 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
             kv_cache = kv_cache.view(fp8_dtype)
             # The layer fuses q into fp8 (supports_quant_query_input, shared with
             # the trtllm-gen lane and the DCP q gather): FA4 runs fp8 MMAs on it.
-            assert q_pe.dtype == fp8_dtype, "FA4 fp8 KV decode needs an fp8 query"
+            if q_pe.dtype != fp8_dtype:
+                raise ValueError(
+                    "FA4 sparse MLA decode over an fp8 KV cache needs the fused fp8 "
+                    f"query, got {q_pe.dtype}"
+                )
             softmax_scale *= layer._q_scale_float
             # Cache rows hold x / k_scale for latent and rope alike, and V is the
             # latent: k_scale scales the logits and, as the V scale, the output.
