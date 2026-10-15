@@ -423,7 +423,14 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
         )
         first_size: dict[tuple[int, int], int] = {}
         for num_tokens in range(1, max_tokens + 1):
-            grid = mla_decode_splits(num_tokens, 1, heads, num_sms, width // 128)
+            grid = mla_decode_splits(
+                num_tokens,
+                1,
+                heads,
+                num_sms,
+                width // 128,
+                fp8_kv=is_quantized_kv_cache(self.kv_cache_dtype),
+            )
             first_size.setdefault(grid, num_tokens)
 
         q_dtype = (
