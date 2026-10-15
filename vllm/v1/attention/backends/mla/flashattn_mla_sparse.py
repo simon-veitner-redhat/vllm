@@ -485,7 +485,8 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
         softmax_scale, out_scale = self.scale, 1.0
         if is_quantized_kv_cache(self.kv_cache_dtype):
             fp8_dtype = current_platform.fp8_dtype()
-            # The HiSparse warmup hands over the raw uint8 hot cache.
+            # vLLM allocates quantized caches as uint8 (the HiSparse hot cache
+            # included); FA4 takes them as float8_e4m3fn.
             kv_cache = kv_cache.view(fp8_dtype)
             # The layer fuses q into fp8 (supports_quant_query_input, shared with
             # the trtllm-gen lane and the DCP q gather): FA4 runs fp8 MMAs on it.
