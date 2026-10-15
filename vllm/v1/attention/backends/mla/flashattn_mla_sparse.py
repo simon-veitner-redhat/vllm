@@ -394,6 +394,25 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
     # Mixed batches: decodes on FA4, the rest on trtllm-gen.
     split_mixed_mqa_batch: ClassVar[bool] = True
 
+    # Set when micro-batches may run attention concurrently on different streams.
+    _fa4_ubatching: bool = False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        self._fa4_ubatching = (
+            vllm_config is not None and vllm_config.parallel_config.use_ubatching
+        )
+
+    @property
+    def _fa4_fused_combine(self) -> bool:
+        # fp8 KV: FA4 reduces its KV splits inside the decode kernel through ticket
+        # counters shared by every launch with the same split count, so two such
+        # launches must not run concurrently on different streams (ubatching does).
+        return is_quantized_kv_cache(self.kv_cache_dtype) and not self._fa4_ubatching
+
     def warmup_decode_variants(self, layer: AttentionLayer) -> int:
         """Compile every (head_groups, splits) decode grid FA4 can pick.
 
@@ -536,6 +555,8 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
             causal=False,
             fa_version=4,
             return_softmax_lse=self.need_to_return_lse_for_decode,
+            # the warmup's eager calls size the ticket buffers before graph capture
+            fa4_sparse_decode_fused_combine=self._fa4_fused_combine,
         )
         out, lse = (
             kernel_out if self.need_to_return_lse_for_decode else (kernel_out, None)

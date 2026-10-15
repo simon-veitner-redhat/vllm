@@ -216,6 +216,8 @@ def flash_attn_varlen_func(
     dynamic_causal: "torch.Tensor | None" = None,
     gather_kv_indices=None,
     gather_kv_valid_length=None,
+    # FA4 sparse MLA decode: reduce the KV splits inside the decode kernel
+    fa4_sparse_decode_fused_combine: bool = False,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -483,6 +485,11 @@ def flash_attn_varlen_func(
             v_descale=v_descale,
             output_scale=output_scale,
             fp8_kv_dequant=fa4_fp8_kv_dequant,
+            **(
+                {"sparse_decode_fused_combine": True}
+                if fa4_sparse_decode_fused_combine
+                else {}
+            ),
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")
