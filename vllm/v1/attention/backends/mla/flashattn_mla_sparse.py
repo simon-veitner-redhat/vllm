@@ -31,6 +31,7 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseTRTLLMBackend,
     FlashInferMLASparseTRTLLMMetadataBuilder,
 )
+from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.sparse_utils import (
     align_blocks_to_rows,
     flat_kv_row_view,
@@ -406,6 +407,11 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
 
         assert self.topk_indices_buffer is not None
         kv_cache = layer.kv_cache  # type: ignore[attr-defined]
+        block_size = kv_cache.shape[1]
+        if isinstance(self.index_group, HiSparseMLAIndexGroup):
+            # layer.kv_cache is the host cache; FA4 reads the hot device cache.
+            hot = self.index_group.cache(self.index_group_index).runtime.hot
+            kv_cache, block_size = hot.attention_cache, hot.block_size
         device = kv_cache.device
         max_tokens, width = self.topk_indices_buffer.shape
         heads = self.num_heads * self.dcp_world_size
@@ -423,7 +429,7 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
             if is_quantized_kv_cache(self.kv_cache_dtype)
             else torch.bfloat16
         )
-        kv_rows, _ = flat_kv_row_view(kv_cache, kv_cache.shape[1])
+        kv_rows, _ = flat_kv_row_view(kv_cache, block_size)
         # The indexer rewrites this shared buffer every forward.
         topk_rows = self.topk_indices_buffer
         topk_rows.copy_(
@@ -442,7 +448,7 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
                 topk_rows[:num_tokens],
                 torch.full((num_tokens,), width, dtype=torch.int32, device=device),
                 layer=layer,
-                block_size=kv_cache.shape[1],
+                block_size=block_size,
                 is_decode=True,
             )
         return len(first_size)

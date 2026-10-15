@@ -178,6 +178,17 @@ def test_hisparse_spill_and_prefix_restore(
         worker = _get_hisparse_worker(runner)
         engine_core = runner.llm.llm_engine.engine_core.engine_core
         model_runner = engine_core.model_executor.driver_worker.worker.model_runner
+        if attention_backend is not None:
+            # vllm_runner disables JIT warmup; run the FA4 decode warmup a server
+            # start runs, which must use the hot cache, not the host layer.kv_cache.
+            from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
+                fa4_sparse_mla_decode_warmup,
+            )
+
+            gpu_worker = engine_core.model_executor.driver_worker.worker
+            kernel_config = gpu_worker.vllm_config.kernel_config
+            monkeypatch.setattr(kernel_config, "enable_jit_warmup", True)
+            fa4_sparse_mla_decode_warmup(gpu_worker)
         full_graph_calls = 0
         full_replay_pending = False
         original_run_fullgraph = model_runner.cudagraph_manager.run_fullgraph
