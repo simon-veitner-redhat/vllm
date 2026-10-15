@@ -418,10 +418,9 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
             grid = mla_decode_splits(num_tokens, 1, heads, num_sms, width // 128)
             first_size.setdefault(grid, num_tokens)
 
-        quantized = is_quantized_kv_cache(self.kv_cache_dtype)
         q_dtype = (
             current_platform.fp8_dtype()
-            if quantized and self.supports_quant_query_input
+            if is_quantized_kv_cache(self.kv_cache_dtype)
             else torch.bfloat16
         )
         kv_rows, _ = flat_kv_row_view(kv_cache, kv_cache.shape[1])
@@ -483,9 +482,9 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
             # The HiSparse warmup hands over the raw uint8 hot cache.
             kv_cache = kv_cache.view(fp8_dtype)
             # The layer fuses q into fp8 (supports_quant_query_input, shared with
-            # the trtllm-gen lane and the DCP q gather); FA4 upconverts it exactly.
-            if q_pe.dtype == fp8_dtype:
-                softmax_scale *= layer._q_scale_float
+            # the trtllm-gen lane and the DCP q gather): FA4 runs fp8 MMAs on it.
+            assert q_pe.dtype == fp8_dtype, "FA4 fp8 KV decode needs an fp8 query"
+            softmax_scale *= layer._q_scale_float
             # Cache rows hold x / k_scale for latent and rope alike, and V is the
             # latent: k_scale scales the logits and, as the V scale, the output.
             out_scale = layer._k_scale_float

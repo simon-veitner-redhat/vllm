@@ -793,7 +793,6 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                     block_stride_rows=block_stride_rows,
                     return_valid_counts=True,
                 )
-            is_decode = num_decode_tokens >= num_tokens
             # Mixed batches run eagerly (UNIFORM_BATCH); never split in a capture.
             if (
                 self.split_mixed_mqa_batch
@@ -817,7 +816,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                 valid_counts,
                 layer=layer,
                 block_size=block_size,
-                is_decode=is_decode,
+                is_decode=num_decode_tokens >= num_tokens,
             )
 
         assert self.dcp_world_size == 1
