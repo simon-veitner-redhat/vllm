@@ -1122,6 +1122,7 @@ def _synthid_tournament_kernel(
     factors_ptr,  # [B, DEPTH, 2]: (1 - m_l, 2 - m_l)
     local_hist_ptr,  # [B, num_blocks, 2**CHUNK_BITS]
     local_max_ptr,  # [B, num_blocks]
+    skip_ptr,  # [B] bool: final pass keeps these rows' logits
     key_0_value,
     key_1_value,
     stream_0_value,
@@ -1133,6 +1134,7 @@ def _synthid_tournament_kernel(
     CHUNK_BITS: tl.constexpr,
     CHUNK: tl.constexpr,
     FINAL: tl.constexpr,
+    HAS_SKIP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     # Pass CHUNK (not FINAL) applies chunk CHUNK - 1 to the probs that pass
@@ -1166,6 +1168,7 @@ def _synthid_tournament_kernel(
     )
 
     if FINAL:
+        skip = tl.load(skip_ptr + row) if HAS_SKIP else False
         if NUM_CHUNKS == 1:
             logits = tl.load(logits_ptrs, mask=mask, other=float("-inf")).to(tl.float32)
             row_max = tl.load(row_stats_ptr + row * 2)
@@ -1181,13 +1184,18 @@ def _synthid_tournament_kernel(
                 probs, words, row, factors_ptr, NUM_CHUNKS - 1, DEPTH, CHUNK_BITS
             )
             # Logits only matter where probs is 0 (underflow or masked token)
-            # or NaN (fully masked row); probs > 0 keeps log_probs anyway.
-            logits = tl.load(logits_ptrs, mask=mask & ~(probs > 0.0), other=0.0)
+            # or NaN (fully masked row), since probs > 0 keeps log_probs, and
+            # in skipped rows.
+            logits = tl.load(
+                logits_ptrs, mask=mask & (~(probs > 0.0) | skip), other=0.0
+            ).to(tl.float32)
             logits_is_neg_inf = logits == float("-inf")
         log_probs = tl.log(probs)
         # Same as the eager path: masked tokens stay -inf, underflow -> min.
         keep = (log_probs > float("-inf")) | logits_is_neg_inf
         log_probs = tl.where(keep, log_probs, -3.4028234663852886e38)
+        # Same as torch.where(skip_mask[:, None], logits, log_probs).
+        log_probs = tl.where(skip, logits, log_probs)
         tl.store(output_ptrs, log_probs, mask=mask)
     else:
         if CHUNK == 0:
@@ -1293,8 +1301,12 @@ def synthid_watermark_logits(
     key: int,
     depth: int,
     stream: int = 0,
+    skip_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Return FP32 SynthID-Text log-probs of `logits` [B, V]."""
+    """Return FP32 SynthID-Text log-probs of `logits` [B, V].
+
+    Rows where `skip_mask` [B] is True get `logits` cast to FP32 instead.
+    """
     stream_0, stream_1 = stream & _UINT32_MASK_VALUE, stream >> 32
     assert 1 <= depth <= 32
     if logits.stride(-1) != 1:
@@ -1306,6 +1318,9 @@ def synthid_watermark_logits(
     num_blocks = triton.cdiv(vocab_size, block_size)
     num_bins = 1 << _SYNTHID_CHUNK_BITS
     output = logits.new_empty(num_tokens, vocab_size, dtype=torch.float32)
+    if skip_mask is not None:
+        assert skip_mask.shape == (num_tokens,) and skip_mask.dtype == torch.bool
+        skip_mask = skip_mask.contiguous()
     if num_tokens == 0:
         return output
     row_stats = logits.new_empty(num_tokens, 2, dtype=torch.float32)
@@ -1323,6 +1338,7 @@ def synthid_watermark_logits(
         factors,
         local_hist,
         local_max,
+        logits if skip_mask is None else skip_mask,
         key & _UINT32_MASK_VALUE,
         key >> 32,
         stream_0,
@@ -1338,6 +1354,7 @@ def synthid_watermark_logits(
             CHUNK_BITS=_SYNTHID_CHUNK_BITS,
             CHUNK=chunk,
             FINAL=False,
+            HAS_SKIP=False,
             BLOCK_SIZE=block_size,
         )
         _synthid_reduce_kernel[(num_tokens,)](
@@ -1358,6 +1375,7 @@ def synthid_watermark_logits(
         CHUNK_BITS=_SYNTHID_CHUNK_BITS,
         CHUNK=0,
         FINAL=True,
+        HAS_SKIP=skip_mask is not None,
         BLOCK_SIZE=block_size,
     )
     return output
