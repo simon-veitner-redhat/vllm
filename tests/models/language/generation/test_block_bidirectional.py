@@ -71,7 +71,9 @@ def build_tiny_checkpoint(path: str) -> None:
             "num_key_value_heads": 2,
             "head_dim": 256,
             "linear_num_key_heads": 2,
-            "linear_num_value_heads": 4,
+            # With the fp32 recurrent state, two value heads keep the
+            # attention block size a power of two, which FlexAttention needs.
+            "linear_num_value_heads": 2,
             "linear_key_head_dim": 128,
             "linear_value_head_dim": 128,
             "mtp_num_hidden_layers": 0,
