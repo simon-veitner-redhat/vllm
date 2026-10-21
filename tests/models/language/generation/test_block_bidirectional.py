@@ -4,8 +4,9 @@
 the transformers block mask.
 
 A four-layer random Qwen3.5 (GatedDeltaNet and full attention, twice) with
-the checkpoints' `modeling_overrides` is served in fp32 with each backend
-that applies request attention blocks. With a single full-attention layer at
+the checkpoints' `modeling_overrides` is served in bf16 (vLLM's chunked
+GatedDeltaNet kernel has no fp32 path) with each backend that applies request
+attention blocks. With a single full-attention layer at
 the top, the last token would see every key under either mask. The oracle
 is transformers' `create_causal_mask(block_sequence_ids=...)`, the mask the
 reference engine (qev) and training use: causal, or query and key in the
@@ -28,7 +29,10 @@ from vllm.platforms import current_platform
 
 BASE = os.environ.get("BLOCK_ATTN_BASE", "baselabs/elephant-1")
 NUM_SCORED = 256
-ATOL = 2e-3
+# vLLM runs in bf16 against an fp32 reference, so a read must be close to the
+# block-mask reference and much closer to it than the causal reference is.
+ATOL = 0.1
+MAX_ERROR_VS_MASK_GAP = 0.2
 
 OVERRIDES = {
     "attention": {
@@ -68,8 +72,8 @@ def build_tiny_checkpoint(path: str) -> None:
             "head_dim": 256,
             "linear_num_key_heads": 2,
             "linear_num_value_heads": 4,
-            "linear_key_head_dim": 64,
-            "linear_value_head_dim": 64,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
             "mtp_num_hidden_layers": 0,
             "dtype": "float32",
         }
@@ -88,10 +92,14 @@ def build_tiny_checkpoint(path: str) -> None:
     torch.manual_seed(0)
     model = Qwen3_5ForConditionalGeneration(config).to(torch.float32)
     # Random init is near-uniform; sharper logits make mask errors visible.
+    # Stronger full-attention values and outputs make the mask move the last
+    # token's logits by about 1.4 instead of 0.05, well above bf16 noise.
     with torch.no_grad():
-        for param in model.parameters():
+        for name, param in model.named_parameters():
             if param.dim() > 1:
                 param.normal_(0.0, 0.08)
+                if "self_attn.v_proj" in name or "self_attn.o_proj" in name:
+                    param.mul_(4.0)
     model.save_pretrained(path)
     AutoProcessor.from_pretrained(BASE).save_pretrained(path)
 
@@ -189,9 +197,22 @@ def test_block_attention_matches_transformers(
             ),
         )
     )
-    causal = hf_logprobs(checkpoint, [questions["q0"]], [None], "cuda")[0]
-    # The mask must matter, or the comparison proves nothing.
-    assert (causal - expected["q0"]).abs().max() > 10 * ATOL
+    causal = dict(
+        zip(
+            order,
+            hf_logprobs(checkpoint, [questions[q] for q in order], [None] * 3, "cuda"),
+        )
+    )
+    for q in order:
+        # The mask must matter, or the comparison proves nothing.
+        assert (causal[q] - expected[q]).abs().max() > 5 * ATOL, q
+
+    def check(got: torch.Tensor, name: str) -> None:
+        error = (got - expected[name]).abs().max().item()
+        gap = (causal[name] - expected[name]).abs().max().item()
+        print(f"{backend} {name}: max error {error:.4f}, causal gap {gap:.4f}")
+        assert error < ATOL, (name, error)
+        assert error < MAX_ERROR_VS_MASK_GAP * gap, (name, error, gap)
 
     def params(blocks):
         return SamplingParams(
@@ -203,8 +224,10 @@ def test_block_attention_matches_transformers(
 
     with vllm_runner(
         checkpoint,
-        dtype="float32",
+        dtype="bfloat16",
         max_model_len=2048,
+        # vllm_runner turns chunked prefill off, which Mamba prefix caching needs.
+        enable_chunked_prefill=True,
         max_num_batched_tokens=2048,
         enable_prefix_caching=True,
         enforce_eager=True,
@@ -230,7 +253,7 @@ def test_block_attention_matches_transformers(
         # Fresh prefill.
         got, cached = run("q0")
         assert cached == 0
-        torch.testing.assert_close(got, expected["q0"], atol=ATOL, rtol=0)
+        check(got, "q0")
 
         # The prefix block alone, then a question that hits inside it.
         llm.generate(
@@ -240,17 +263,17 @@ def test_block_attention_matches_transformers(
         )
         got, cached = run("q1")
         assert 0 < cached <= p, cached
-        torch.testing.assert_close(got, expected["q1"], atol=ATOL, rtol=0)
+        check(got, "q1")
 
         # A question whose suffix starts like q1's must not read q1's suffix.
         got, cached = run("q2")
         assert cached <= p, cached
-        torch.testing.assert_close(got, expected["q2"], atol=ATOL, rtol=0)
+        check(got, "q2")
 
         # The full prompt again: everything but the last token is cached.
         got, cached = run("q2")
         assert cached > p, cached
-        torch.testing.assert_close(got, expected["q2"], atol=ATOL, rtol=0)
+        check(got, "q2")
 
 
 def test_unsupported_backend_fails_at_startup(vllm_runner, checkpoint, monkeypatch):
@@ -258,11 +281,19 @@ def test_unsupported_backend_fails_at_startup(vllm_runner, checkpoint, monkeypat
     # Build the engine in this process so the startup error reaches the test.
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     with (
-        pytest.raises(Exception, match="does not apply request attention blocks"),
+        # On GPUs where FLASH_ATTN cannot serve the PrefixLM path at all, the
+        # backend selector refuses it before the attention-blocks check does.
+        pytest.raises(
+            Exception,
+            match="does not apply request attention blocks|"
+            "is not valid for this configuration",
+        ),
         vllm_runner(
             checkpoint,
             dtype="bfloat16",
             max_model_len=2048,
+            # vllm_runner turns chunked prefill off, which Mamba prefix caching needs.
+            enable_chunked_prefill=True,
             enforce_eager=True,
             gpu_memory_utilization=0.4,
             attention_config={"backend": "FLASH_ATTN"},
@@ -281,8 +312,10 @@ def test_causal_switch_serves_without_blocks(vllm_runner, checkpoint, monkeypatc
     monkeypatch.setenv("VLLM_MODELING_OVERRIDES", "ignore")
     with vllm_runner(
         checkpoint,
-        dtype="float32",
+        dtype="bfloat16",
         max_model_len=2048,
+        # vllm_runner turns chunked prefill off, which Mamba prefix caching needs.
+        enable_chunked_prefill=True,
         enforce_eager=True,
         gpu_memory_utilization=0.4,
         limit_mm_per_prompt={"image": 0, "video": 0},
