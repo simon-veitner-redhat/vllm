@@ -132,3 +132,23 @@ def test_baseten_key_is_read_and_conflicts_fail(monkeypatch):
     }
     with pytest.raises(ValueError, match="disagree"):
         convert(config)
+
+
+@pytest.mark.parametrize("mode", ["apply", "causal", "ignore"])
+def test_ssm_cache_dtype_follows_the_checkpoint(monkeypatch, mode):
+    """Every architecture the convertor can pick keeps Qwen3.5's config hook,
+    which caches the GatedDeltaNet state in the checkpoint's mamba_ssm_dtype."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+
+    monkeypatch.setenv("VLLM_MODELING_OVERRIDES", mode)
+    config = make_config()
+    config.text_config.mamba_ssm_dtype = "float32"
+    (architecture,) = convert(config).architectures
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_ssm_cache_dtype="auto"),
+        model_config=SimpleNamespace(hf_text_config=config.text_config),
+    )
+    MODELS_CONFIG_MAP[architecture].verify_and_update_config(vllm_config)
+    assert vllm_config.cache_config.mamba_ssm_cache_dtype == "float32"

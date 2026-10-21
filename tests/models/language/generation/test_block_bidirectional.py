@@ -237,6 +237,10 @@ def test_block_attention_matches_transformers(
     ) as runner:
         llm = runner.llm
         assert llm.llm_engine.model_config.request_attention_blocks
+        # The GatedDeltaNet state is cached in the checkpoint's fp32.
+        assert llm.llm_engine.vllm_config.cache_config.mamba_ssm_cache_dtype == (
+            "float32"
+        )
 
         def run(name: str, request_blocks=None):
             prompt = questions[name]
