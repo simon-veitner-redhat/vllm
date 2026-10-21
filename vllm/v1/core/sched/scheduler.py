@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm.attention_blocks import block_aligned_chunk_end
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -585,6 +586,73 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    def _attention_block_split(
+        self,
+        request: Request,
+        start: int,
+        num_new_tokens: int,
+        budget: int,
+    ) -> int:
+        """Clip a prefill step so it never ends inside one of the request's
+        attention blocks (see `vllm.attention_blocks`).
+
+        ``num_new_tokens`` is the step after the other clips, Mamba alignment
+        included, and ``budget`` the most tokens the step could take. Returns
+        0 when the request must wait for a step with more budget.
+        """
+        assert request.attention_blocks is not None
+        end = block_aligned_chunk_end(
+            request.attention_blocks,
+            start,
+            budget_end=start + budget,
+            prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+            align_end=start + num_new_tokens,
+            mamba_block_size=(
+                self.cache_config.block_size
+                if self.need_mamba_block_aligned_split
+                else None
+            ),
+        )
+        return end - start
+
+    def _fit_attention_block_hit(
+        self,
+        request: Request,
+        computed_blocks: KVCacheBlocks,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> tuple[KVCacheBlocks, int]:
+        """Drop a local prefix-cache hit that the request could not resume
+        from, even with a whole step's budget, without ending a step inside an
+        attention block or running a Mamba block's stale state into the cache.
+
+        Such a hit ends inside a Mamba block, and the next block boundary lies
+        inside an attention block. The hit cannot be shortened to that Mamba
+        block's start, which has no cached state, so the request is computed
+        from scratch.
+        """
+        start = num_local_computed_tokens + num_external_computed_tokens
+        remaining = request.num_tokens - start
+        if remaining <= 0:
+            return computed_blocks, num_local_computed_tokens
+        num_new_tokens = remaining
+        if self.need_mamba_block_aligned_split:
+            num_new_tokens = self._mamba_block_aligned_split(
+                request,
+                remaining,
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+        if self._attention_block_split(request, start, num_new_tokens, remaining) > 0:
+            return computed_blocks, num_local_computed_tokens
+        logger.debug(
+            "Request %s cannot resume from its %d-token prefix-cache hit "
+            "within its attention blocks; computing it from scratch.",
+            request.request_id,
+            num_local_computed_tokens,
+        )
+        return self.kv_cache_manager.empty_kv_cache_blocks, 0
+
     def _get_local_prefix_cache_hit(
         self, request: Request
     ) -> tuple[KVCacheBlocks, int, int, bool]:
@@ -760,6 +828,9 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            # Attention blocks are computed in one step, past the long-prefill
+            # threshold if need be.
+            block_budget = min(num_new_tokens, token_budget, input_budget - draft_slots)
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(
@@ -779,6 +850,10 @@ class Scheduler(SchedulerInterface):
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
+                )
+            if request.attention_blocks is not None:
+                num_new_tokens = self._attention_block_split(
+                    request, request.num_computed_tokens, num_new_tokens, block_budget
                 )
 
             # Schedule encoder inputs.
@@ -1121,6 +1196,22 @@ class Scheduler(SchedulerInterface):
                         num_computed_tokens = 0
                         load_kv_async = False
 
+                    if (
+                        request.attention_blocks is not None
+                        and num_new_local_computed_tokens > 0
+                    ):
+                        new_computed_blocks, num_new_local_computed_tokens = (
+                            self._fit_attention_block_hit(
+                                request,
+                                new_computed_blocks,
+                                num_new_local_computed_tokens,
+                                num_external_computed_tokens,
+                            )
+                        )
+                        num_computed_tokens = (
+                            num_new_local_computed_tokens + num_external_computed_tokens
+                        )
+
                     # Skip request with pending mm encoding prefetches
                     if self._ec_transfer_pending(request, num_computed_tokens):
                         skip_request(request_queue)
@@ -1182,6 +1273,7 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    block_budget = min(num_new_tokens, request_token_budget)
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1246,6 +1338,13 @@ class Scheduler(SchedulerInterface):
                             # so drop the padding instead of shortening it.
                             num_new_tokens = 1
                             pad_spec_decode = False
+                    if request.attention_blocks is not None:
+                        num_new_tokens = self._attention_block_split(
+                            request, num_computed_tokens, num_new_tokens, block_budget
+                        )
+                        if num_new_tokens == 0:
+                            # Not enough budget to finish a block this step.
+                            break
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:

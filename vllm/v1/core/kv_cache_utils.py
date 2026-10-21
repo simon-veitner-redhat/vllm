@@ -19,6 +19,7 @@ from typing import (
 )
 
 from vllm import envs
+from vllm.attention_blocks import block_hash_extra_keys
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal.utils import get_mm_features_in_window
@@ -638,8 +639,8 @@ def generate_block_hash_extra_keys(
     request: Request, start_token_idx: int, end_token_idx: int, start_mm_idx: int
 ) -> tuple[tuple[Any, ...] | None, int]:
     """Generate extra keys for the block hash. The extra keys can come from
-    the multi-modal inputs, request specific metadata (e.g., LoRA names), and
-    hashed data from prompt embeddings.
+    the multi-modal inputs, request specific metadata (e.g., LoRA names),
+    hashed data from prompt embeddings, and the request's attention blocks.
 
     Args:
         request: The request object.
@@ -664,9 +665,23 @@ def generate_block_hash_extra_keys(
     prompt_embeds_keys = _gen_prompt_embeds_extra_hash_keys(
         request, start_token_idx, end_token_idx
     )
+    attention_block_keys: list[Any] = []
+    if attention_blocks := getattr(request, "attention_blocks", None):
+        # A block-bidirectional block's KV depends on all of its tokens.
+        attention_block_keys = block_hash_extra_keys(
+            request.all_token_ids,
+            attention_blocks,
+            start_token_idx,
+            end_token_idx,
+            request._attention_block_digests,
+        )
 
     extra_keys: list[Any] = (
-        lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys
+        lora_extra_keys
+        + mm_extra_keys
+        + cache_salt_keys
+        + prompt_embeds_keys
+        + attention_block_keys
     )
 
     if not extra_keys:
