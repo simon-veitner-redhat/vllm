@@ -1219,6 +1219,38 @@ class VllmConfig:
                         f"{connector_name}; PD auxiliary output is not supported."
                     )
 
+    def _verify_attention_blocks(self) -> None:
+        """Refuse configurations that would drop request attention blocks.
+
+        Without its blocks a block-bidirectional checkpoint still returns
+        plausible numbers, so every path that cannot carry them is an error
+        rather than a silent causal fallback. The attention backend is checked
+        per layer in `Attention`.
+        """
+        if self.model_config is None or not self.model_config.request_attention_blocks:
+            return
+        unsupported = []
+        if self.kv_transfer_config is not None:
+            # Connectors and KV offloading key blocks without the attention
+            # block hashes.
+            unsupported.append("KV transfer connectors and KV offloading")
+        if self.speculative_config is not None:
+            unsupported.append("speculative decoding")
+        parallel = self.parallel_config
+        if parallel.prefill_context_parallel_size > 1:
+            unsupported.append("prefill context parallelism")
+        if parallel.decode_context_parallel_size > 1:
+            unsupported.append("decode context parallelism")
+        if parallel.use_ubatching:
+            unsupported.append("micro-batching")
+        if unsupported:
+            raise ValueError(
+                f"{self.model_config.model} applies per-request attention "
+                "blocks (block_bidirectional in modeling_overrides), which "
+                f"{', '.join(unsupported)} would drop. Disable them, or set "
+                "VLLM_MODELING_OVERRIDES=ignore to serve the model causally."
+            )
+
     def _verify_kv_transfer_compat(self) -> None:
         """Reject configurations that silently corrupt KV transfers."""
         if (
@@ -2323,6 +2355,7 @@ class VllmConfig:
                 custom_ops.append("+quant_fp8")
 
         self._verify_kv_transfer_compat()
+        self._verify_attention_blocks()
         if self.use_cumem_cudagraph_pool:
             # NCCL graph registration pins the offloaded pool; workers inherit this.
             value = os.environ.setdefault("NCCL_GRAPH_REGISTER", "0")

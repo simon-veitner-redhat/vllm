@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.attention_blocks import get_attention_blocks
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
@@ -221,6 +222,12 @@ class Request:
         # the scheduler when --per-request-spec-decode-metrics is set (eagerly on
         # add_request, then observed each verify step); stays None otherwise.
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
+
+        # Bidirectional attention blocks of block-bidirectional checkpoints
+        # (see `vllm.attention_blocks`); they key the prefix cache, so they
+        # must be set before the first block hashes.
+        self.attention_blocks = get_attention_blocks(sampling_params)
+        self._attention_block_digests: dict[tuple[int, int], bytes] = {}
 
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a

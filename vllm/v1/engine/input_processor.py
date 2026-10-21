@@ -7,6 +7,12 @@ from functools import partial
 from typing import Any, Literal
 
 import vllm.envs as envs
+from vllm.attention_blocks import (
+    ATTENTION_BLOCKS_KEY,
+    AttentionBlocksError,
+    check_attention_blocks,
+    get_attention_blocks,
+)
 from vllm.config import VllmConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import (
@@ -494,6 +500,9 @@ class InputProcessor:
                 sampling_params.update_from_tokenizer(self.tokenizer)
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)
+            self._validate_attention_blocks(
+                sampling_params, prompt_len, decoder_input["type"]
+            )
         else:
             pooling_params = params.clone()
 
@@ -553,6 +562,38 @@ class InputProcessor:
             session_id=session_id,
             kv_hints=kv_hints,
         )
+
+    def _validate_attention_blocks(
+        self, params: SamplingParams, prompt_len: int, input_type: str
+    ) -> None:
+        """Check a request's attention blocks (see `vllm.attention_blocks`)
+        and store them normalized, so the engine only reads valid blocks."""
+        try:
+            blocks = get_attention_blocks(params)
+            if blocks is None:
+                return
+            if not self.model_config.request_attention_blocks:
+                raise AttentionBlocksError(
+                    f"{ATTENTION_BLOCKS_KEY} needs a model whose full attention "
+                    "is block_bidirectional in its modeling_overrides"
+                )
+            if input_type != "token":
+                raise AttentionBlocksError(
+                    f"{ATTENTION_BLOCKS_KEY} takes text-only token prompts"
+                )
+            scheduler_config = self.vllm_config.scheduler_config
+            check_attention_blocks(
+                blocks,
+                prompt_len,
+                scheduler_config.max_num_scheduled_tokens
+                or scheduler_config.max_num_batched_tokens,
+            )
+        except AttentionBlocksError as e:
+            raise VLLMValidationError(
+                str(e), parameter="extra_args", value=ATTENTION_BLOCKS_KEY
+            ) from e
+        assert params.extra_args is not None
+        params.extra_args[ATTENTION_BLOCKS_KEY] = [list(b) for b in blocks]
 
     def _validate_prompt_len(
         self,

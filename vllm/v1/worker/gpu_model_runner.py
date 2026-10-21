@@ -21,6 +21,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+from vllm.attention_blocks import doc_ranges, get_attention_blocks
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -527,6 +528,7 @@ class GPUModelRunner(
         # Model-related.
         self.inputs_embeds_size = model_config.get_inputs_embeds_size()
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
+        self.request_attention_blocks = self.model_config.request_attention_blocks
         # Deprecated: cascade attention has been removed. Kept for
         # out-of-tree model runners.
         self.cascade_attn_enabled = False
@@ -2375,6 +2377,17 @@ class GPUModelRunner(
                         image_doc_ranges.append(r)
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 req_doc_ranges[req_idx] = image_doc_ranges
+
+        # Block-bidirectional checkpoints: each request's attention blocks
+        # are PrefixLM ranges too (see `vllm.attention_blocks`).
+        if self.request_attention_blocks:
+            for req_id in self.input_batch.req_ids:
+                blocks = get_attention_blocks(self.requests[req_id].sampling_params)
+                if blocks:
+                    if req_doc_ranges is None:
+                        req_doc_ranges = {}
+                    req_idx = self.input_batch.req_id_to_index[req_id]
+                    req_doc_ranges[req_idx] = doc_ranges(blocks)
 
         # Reference Sliding Window Attention (R-SWA): pass per-request prompt
         # lengths so the attention backend can keep the prefix globally visible.

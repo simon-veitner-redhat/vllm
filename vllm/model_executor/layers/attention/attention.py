@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.attention_blocks import RANGE_BACKENDS
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
     CacheConfig,
@@ -341,7 +342,16 @@ class Attention(nn.Module, AttentionLayerBase):
 
         # NOTE: model_config may be None during certain tests
         model_config = vllm_config.model_config
-        self.use_mm_prefix = model_config is not None and model_config.is_mm_prefix_lm
+        # Block-bidirectional checkpoints pass per-request blocks through the
+        # same PrefixLM ranges as images (`vllm.attention_blocks`).
+        self.request_attention_blocks = (
+            model_config is not None
+            and model_config.request_attention_blocks
+            and attn_type == AttentionType.DECODER
+        )
+        self.use_mm_prefix = (
+            model_config is not None and model_config.is_mm_prefix_lm
+        ) or self.request_attention_blocks
 
         # During model initialization, the default dtype is set as the model
         # weight and activation dtype.
@@ -360,6 +370,17 @@ class Attention(nn.Module, AttentionLayerBase):
             )
         else:
             self.attn_backend = attn_backend
+        if (
+            self.request_attention_blocks
+            and self.attn_backend.get_name() not in RANGE_BACKENDS
+        ):
+            raise ValueError(
+                f"{prefix} uses the {self.attn_backend.get_name()} attention "
+                "backend, which does not apply request attention blocks "
+                "(block_bidirectional in modeling_overrides). Use one of "
+                f"{sorted(RANGE_BACKENDS)} with --attention-backend, or set "
+                "VLLM_MODELING_OVERRIDES=ignore to serve the model causally."
+            )
         backend_supports_alibi_sqrt = self.attn_backend.supports_alibi_sqrt()
         use_alibi_sqrt = use_alibi_sqrt if use_alibi_sqrt else False
         if use_alibi_sqrt and not backend_supports_alibi_sqrt:

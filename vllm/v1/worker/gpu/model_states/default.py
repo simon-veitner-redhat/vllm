@@ -5,6 +5,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm.attention_blocks import AttentionBlocks, doc_ranges, get_attention_blocks
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.core.sched.output import NewRequestData
@@ -64,6 +65,12 @@ class DefaultModelState(ModelState):
             self.model_config, model, self.rope_state, encoder_cache
         )
 
+        # Per-request bidirectional blocks of block-bidirectional checkpoints,
+        # by request id (see `vllm.attention_blocks`).
+        self.attention_blocks: dict[str, AttentionBlocks] | None = (
+            {} if self.model_config.request_attention_blocks else None
+        )
+
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         if self.rope_state is not None:
             assert new_req_data.prefill_token_ids is not None
@@ -80,10 +87,30 @@ class DefaultModelState(ModelState):
             )
         if self.prompt_embeds_state is not None:
             self.prompt_embeds_state.add_request(req_index, new_req_data)
+        if self.attention_blocks is not None:
+            blocks = get_attention_blocks(new_req_data.sampling_params)
+            if blocks:
+                self.attention_blocks[new_req_data.req_id] = blocks
 
     def remove_request(self, req_id: str) -> None:
         if self.prompt_embeds_state is not None:
             self.prompt_embeds_state.remove_request(req_id)
+        if self.attention_blocks is not None:
+            self.attention_blocks.pop(req_id, None)
+
+    def attention_block_ranges(
+        self, req_ids: list[str]
+    ) -> dict[int, list[tuple[int, int]]] | None:
+        """The batch's request attention blocks as PrefixLM ranges, by batch
+        row, or None without any."""
+        if not self.attention_blocks:
+            return None
+        ranges = {
+            i: doc_ranges(blocks)
+            for i, req_id in enumerate(req_ids)
+            if (blocks := self.attention_blocks.get(req_id))
+        }
+        return ranges or None
 
     def apply_staged_writes(self) -> None:
         if self.rope_state is not None:
@@ -210,6 +237,10 @@ class DefaultModelState(ModelState):
                 mm_features=self.encoder_cache.mm_features,
                 sliding_window=self.model_config.get_sliding_window(),
             )
+        if not for_capture and (
+            blocks := self.attention_block_ranges(input_batch.req_ids)
+        ):
+            req_doc_ranges = {**(req_doc_ranges or {}), **blocks}
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,

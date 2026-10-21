@@ -340,6 +340,11 @@ class MambaHybridModelState(DefaultModelState):
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            mm_req_doc_ranges=(
+                None
+                if for_capture
+                else self.attention_block_ranges(input_batch.req_ids)
+            ),
         )
         if self.recoverssm is not None:
             self.recoverssm.record_step(
