@@ -737,7 +737,20 @@ class FlexAttentionMetadata:
             block_ends = block_starts + self.block_size
 
             if self.causal:
-                future_blocks = block_starts[None, :] > logical_q_idx[:, None]
+                # A query inside a PrefixLM range also sees the later keys of
+                # its range, so keep their blocks: the prefix LM mask_mod is
+                # ORed into the causal one, but only within kept blocks.
+                visible_end = logical_q_idx
+                for req, doc_ranges in (self.mm_prefix_range or {}).items():
+                    in_req = self.doc_ids == req
+                    for start, end in doc_ranges:
+                        in_range = (
+                            in_req & (logical_q_idx >= start) & (logical_q_idx <= end)
+                        )
+                        visible_end = torch.where(
+                            in_range, torch.clamp(visible_end, min=end), visible_end
+                        )
+                future_blocks = block_starts[None, :] > visible_end[:, None]
                 used_pages.masked_fill_(future_blocks, 0)
 
             if self.sliding_window:
