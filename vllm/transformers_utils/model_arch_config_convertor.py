@@ -19,6 +19,10 @@ from vllm.transformers_utils.config import (
     get_safetensors_params_metadata,
 )
 from vllm.transformers_utils.deepseek_v4_utils import get_compress_ratios
+from vllm.transformers_utils.modeling_overrides import (
+    get_raw_modeling_overrides,
+    parse_modeling_overrides,
+)
 from vllm.transformers_utils.repo_utils import (
     file_or_path_exists,
     get_hf_file_to_dict,
@@ -363,6 +367,14 @@ class ModelArchConfigConvertorBase:
             return False
         return self.hf_config.model_type in MM_PREFIX_LM_MODELS
 
+    def request_attention_blocks(self) -> bool:
+        """Set by the model's convertor from `modeling_overrides`, on the text
+        config too so that `with_hf_config` sub-configs keep it."""
+        return bool(
+            getattr(self.hf_config, "request_attention_blocks", False)
+            or getattr(self.hf_text_config, "request_attention_blocks", False)
+        )
+
     def rswa_window(self) -> int | None:
         value = getattr(self.hf_config, "rswa_window", None)
         if value is None:
@@ -449,6 +461,7 @@ class ModelArchConfigConvertorBase:
             quantization_config=self.get_quantization_config(),
             is_deepseek_mla=self.is_deepseek_mla(),
             is_mm_prefix_lm=self.is_mm_prefix_lm(supports_multimodal),
+            request_attention_blocks=self.request_attention_blocks(),
             rswa_window=self.rswa_window(),
             derived_max_model_len_and_key=self.derive_max_model_len_and_key(),
         )
@@ -617,6 +630,40 @@ class MimoV2ModelArchConfigConvertor(ModelArchConfigConvertorBase):
         _strip_mimo_v2_attention_chunk_size(hf_config, hf_text_config)
 
 
+def _apply_modeling_overrides(
+    hf_config: PreTrainedConfig, hf_text_config: PreTrainedConfig
+) -> None:
+    """Serve a Base Labs checkpoint (mammoth-1, elephant-1) as it was trained.
+
+    Its `modeling_overrides` select block-bidirectional full attention, which
+    requests supply as `attention_blocks`, and the slot readout, served by the
+    `Qwen3_5ForSlotDecision` read strategy with an fp32 LM head. See
+    `vllm/transformers_utils/modeling_overrides.py` for
+    `VLLM_MODELING_OVERRIDES`.
+    """
+    raw = get_raw_modeling_overrides(hf_config)
+    mode = envs.VLLM_MODELING_OVERRIDES
+    if raw is None or mode == "ignore":
+        return
+    overrides = parse_modeling_overrides(raw)
+    assert overrides is not None
+    blocks = overrides.block_attention and mode == "apply"
+    if overrides.block_attention and not blocks:
+        logger.warning_once(
+            "VLLM_MODELING_OVERRIDES=%s: serving a checkpoint trained with "
+            "block-bidirectional attention with a causal mask.",
+            mode,
+        )
+    for config in (hf_config, hf_text_config):
+        config.request_attention_blocks = blocks
+    hf_config.architectures = ["Qwen3_5ForSlotDecision"]
+    # The slot logits are read in fp32, as in training and the reference
+    # engine. An explicit --hf-overrides head_dtype wins; the read strategy
+    # refuses to start without fp32.
+    if getattr(hf_config, "head_dtype", None) is None:
+        hf_config.head_dtype = "float32"
+
+
 class Qwen3_5ModelArchConfigConvertor(ModelArchConfigConvertorBase):
     def __init__(
         self,
@@ -635,6 +682,8 @@ class Qwen3_5ModelArchConfigConvertor(ModelArchConfigConvertorBase):
                 hf_config.joint_head_config = get_hf_file_to_dict(
                     "joint_head_config.json", model_path, revision
                 )
+            else:
+                _apply_modeling_overrides(hf_config, hf_text_config)
         elif getattr(hf_config, "architectures", None) == ["Qwen3_5Model"]:
             # Decision 3.0 checkpoints are a bare backbone plus a code readout
             # described by decision_config.json.

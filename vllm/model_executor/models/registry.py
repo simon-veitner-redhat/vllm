@@ -600,6 +600,9 @@ _MULTIMODAL_MODELS = {
         "Qwen3VLMoeForConditionalGeneration",
     ),
     "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+    # Qwen3.5 checkpoints with a slot readout in `modeling_overrides` (Base Labs
+    # mammoth-1, elephant-1). Same model; the name selects the read strategy.
+    "Qwen3_5ForSlotDecision": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
     "Qwen3_5MoeForConditionalGeneration": (
         "qwen3_5",
         "Qwen3_5MoeForConditionalGeneration",

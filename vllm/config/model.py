@@ -1637,6 +1637,12 @@ class ModelConfig:
         return self.model_arch_config.is_mm_prefix_lm
 
     @property
+    def request_attention_blocks(self) -> bool:
+        """Whether full-attention layers apply each request's
+        `attention_blocks` (see `vllm.attention_blocks`)."""
+        return self.model_arch_config.request_attention_blocks
+
+    @property
     def rswa_window(self) -> int | None:
         return self.model_arch_config.rswa_window
 

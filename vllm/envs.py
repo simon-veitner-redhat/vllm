@@ -306,6 +306,7 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    VLLM_MODELING_OVERRIDES: Literal["apply", "causal", "ignore"] = "apply"
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2125,6 +2126,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Flag to control the v2 model runner. If unset, use config defaults.
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
+    ),
+    # How to serve a checkpoint's `modeling_overrides` block (Base Labs
+    # mammoth-1/elephant-1): "apply" serves its block-bidirectional attention
+    # and slot readout, "causal" keeps the slot readout with a causal mask
+    # (the mask ablation), and "ignore" serves the checkpoint as a stock
+    # Qwen3.5 model.
+    "VLLM_MODELING_OVERRIDES": env_with_choices(
+        "VLLM_MODELING_OVERRIDES",
+        "apply",
+        ["apply", "causal", "ignore"],
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model

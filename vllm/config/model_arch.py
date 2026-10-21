@@ -65,6 +65,11 @@ class ModelArchitectureConfig:
     derived_max_model_len_and_key: tuple[float, str | None]
     """Derived maximum model length and key from the hf config."""
 
+    request_attention_blocks: bool = False
+    """Whether full-attention layers take per-request bidirectional blocks
+    (`vllm.attention_blocks`), from a `block_bidirectional` mask in the
+    checkpoint's `modeling_overrides`."""
+
     per_layer_overrides: "list[dict[str, Any]] | None" = None
     """Per-layer values for the fields that vary, `None` unless some field does.
 
