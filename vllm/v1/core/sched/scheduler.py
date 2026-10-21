@@ -831,7 +831,10 @@ class Scheduler(SchedulerInterface):
             # Attention blocks are computed in one step, past the long-prefill
             # threshold if need be.
             block_budget = min(num_new_tokens, token_budget, input_budget - draft_slots)
-            if 0 < long_prefill_token_threshold < num_new_tokens:
+            if (
+                0 < long_prefill_token_threshold < num_new_tokens
+                and request.attention_blocks is None
+            ):
                 num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
@@ -1299,7 +1302,15 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
 
-                    if 0 < long_prefill_token_threshold < num_new_tokens:
+                    # Attention blocks are computed in one step, so the
+                    # threshold would only make the Mamba split stop short of
+                    # where the hit check in _fit_attention_block_hit (which
+                    # has no threshold) found the request could resume, and
+                    # the request would wait forever.
+                    if (
+                        0 < long_prefill_token_threshold < num_new_tokens
+                        and request.attention_blocks is None
+                    ):
                         num_new_tokens = long_prefill_token_threshold
 
                     # chunked prefill has to be enabled explicitly to allow
