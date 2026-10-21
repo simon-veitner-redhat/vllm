@@ -6,6 +6,7 @@ Only models in READ_STRATEGIES are currently supported.
 """
 
 import asyncio
+import bisect
 import hashlib
 import json
 import math
@@ -18,9 +19,11 @@ from functools import cached_property
 from typing import Any, ClassVar, TypeVar
 
 import numpy as np
+import torch
 from PIL import Image
 
 import vllm.envs as envs
+from vllm.attention_blocks import ATTENTION_BLOCKS_KEY
 from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.generate.label_reads import next_token_label_reads
@@ -43,7 +46,12 @@ from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.tokenizers import TokenizerLike
+from vllm.transformers_utils.modeling_overrides import (
+    get_raw_modeling_overrides,
+    parse_modeling_overrides,
+)
 
+from . import slot_prompt
 from .question_types import (
     LABELS,
     QUESTION_TYPES,
@@ -58,6 +66,8 @@ logger = init_logger(__name__)
 
 # Fewer shared tokens are not worth an extra round trip before the reads.
 MIN_WARM_PREFIX_TOKENS = 128
+#: The levels a score question takes on slot-readout checkpoints, as in training.
+SLOT_MAX_SCORE_LEVELS = 10
 
 
 def common_prefix_len(prompts: Sequence[Sequence[int]]) -> int:
@@ -96,6 +106,9 @@ class QuestionRead:
     output_tokens: int
     cached_tokens: int = 0
     cache_write_tokens: int = 0
+    #: Whether the read ran with the model's bidirectional attention blocks.
+    #: None for models without them.
+    attention_blocks: bool | None = None
 
 
 class ReadPromptRequest(OpenAIBaseModel):
@@ -1216,6 +1229,259 @@ class D3Strategy(ReadStrategy):
         return reads
 
 
+class SlotLMStrategy(ReadStrategy):
+    """Slot-readout decision checkpoints (Base Labs mammoth-1, elephant-1),
+    read the way their reference engine (qev) reads them.
+
+    Each question is one request on the fixed prompt of ``slot_prompt``: a
+    system prompt, then the state and the question in the user turn, with
+    options under slot labels A to Z, then AA, AB and so on, and thinking off.
+    Slot i is option i for every type: a noul question's yes is A, a score's
+    level 0 is A. The answer is the softmax of the slot labels' logits at the
+    last token (temperature 1; the checkpoints ship no calibration), from an
+    fp32 LM head.
+
+    The checkpoints were trained with block-bidirectional full attention, so
+    every request carries two attention blocks: the prefix every question
+    shares (system turn and state) and its own suffix.
+    """
+
+    modalities = frozenset()
+
+    def __init__(self, context: ReadContext):
+        super().__init__(context)
+        model_config = context.engine_client.model_config
+        overrides = parse_modeling_overrides(
+            get_raw_modeling_overrides(model_config.hf_config)
+        )
+        if overrides is None:
+            raise ValueError(f"{model_config.model} has no modeling_overrides")
+        self.attention_blocks = model_config.request_attention_blocks
+        if (
+            overrides.block_attention
+            and not self.attention_blocks
+            and envs.VLLM_MODELING_OVERRIDES != "causal"
+        ):
+            raise ValueError(
+                "this checkpoint was trained with block-bidirectional attention, "
+                "which the model config does not apply"
+            )
+        if model_config.head_dtype != torch.float32:
+            raise ValueError(
+                "slot reads need the fp32 LM head the checkpoint was trained "
+                f"with, but head_dtype is {model_config.head_dtype}"
+            )
+        if context.chat_template is not None:
+            logger.warning(
+                "Structured decisions on %s use the checkpoint's own chat "
+                "template, not --chat-template.",
+                model_config.model,
+            )
+        self.tokenizer = context.online_renderer.renderer.get_tokenizer()
+        self.max_model_len = model_config.max_model_len
+        self.slot_ids = self._slot_ids(min(overrides.n_slots, slot_prompt.MAX_SLOTS))
+        # The block boundary is checked against character offsets.
+        self.tokenizer("x", add_special_tokens=False, return_offsets_mapping=True)
+
+    def limits(self) -> DecisionLimits:
+        return DecisionLimits(
+            max_questions=64, max_options=len(self.slot_ids), labeled=False
+        )
+
+    def render_state(self, state: Any) -> str:
+        return slot_prompt.render_state(state)
+
+    def _render(self, state: str, suffix: str) -> str:
+        prompt = self.tokenizer.apply_chat_template(
+            slot_prompt.build_messages(state, suffix),
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        assert isinstance(prompt, str)
+        return prompt
+
+    def _tokens(self, text: str) -> list[int]:
+        return self.tokenizer.encode(text, add_special_tokens=False)
+
+    def _slot_ids(self, n_slots: int) -> list[int]:
+        """The token of each slot label. qev reads a label's own token; the
+        same token must also be the reply's first token after the generation
+        prompt, or the logits would be read for the wrong token."""
+        labels = slot_prompt.SLOT_LABELS[:n_slots]
+        ids = []
+        for label in labels:
+            enc = self._tokens(label)
+            if len(enc) != 1 or self.tokenizer.decode(enc) != label:
+                raise ValueError(f"slot label {label!r} is not one token")
+            ids.append(enc[0])
+        probe = self._tokens(self._render("x", "y"))
+        _, reply_ids = reply_label_ids(self.tokenizer, probe, labels)
+        if reply_ids != ids:
+            raise ValueError("the slot labels' tokens differ at the start of the reply")
+        return ids
+
+    def _suffix(self, q: Question) -> str:
+        type_name = q.type.name
+        if q.raw is None:
+            # A question not built from a /v1/systemone request: its options
+            # as a choice.
+            type_name = "choice"
+            instructions: Any = q.instructions
+            criteria: Any = {o.name: o.description for o in q.options}
+        else:
+            instructions, criteria = q.raw
+        if type_name not in ("choice", "noul", "score"):
+            raise StructuredDecisionError(
+                f"question {q.id!r}: this model does not answer {type_name!r} questions"
+            )
+        if type_name == "score" and len(q.options) > SLOT_MAX_SCORE_LEVELS:
+            raise StructuredDecisionError(
+                f"question {q.id!r}: a score has at most "
+                f"{SLOT_MAX_SCORE_LEVELS} levels for this model"
+            )
+        return slot_prompt.render_suffix(type_name, instructions, criteria)
+
+    def _prefix_len(self, state: str, prompts: list[list[int]]) -> int:
+        """The tokens every question shares, up to the end of the state block:
+        the longest common prefix of the prompts that ends at or before the
+        start of the suffix text."""
+        marked = self._render(state, slot_prompt.PREFIX_MARK)
+        prefix_ids = self._tokens(marked[: marked.index(slot_prompt.PREFIX_MARK)])
+        n = len(prefix_ids)
+        while n > 0 and not all(ids[:n] == prefix_ids[:n] for ids in prompts):
+            n -= 1
+        return n
+
+    def _offset_prefix_len(self, prompt: str, suffix: str) -> tuple[list[int], int]:
+        """The prompt's tokens, and how many of them end at or before the
+        suffix text: the block boundary training used."""
+        enc = self.tokenizer(
+            prompt, add_special_tokens=False, return_offsets_mapping=True
+        )
+        start = prompt.rindex(suffix)
+        ends = [end for _, end in enc["offset_mapping"]]
+        return list(enc["input_ids"]), bisect.bisect_right(ends, start)
+
+    async def read(
+        self,
+        questions: list[Question],
+        instructions: str | None,
+        state: str,
+        *,
+        request_id: str,
+        chat_template_kwargs: dict[str, Any] | None,
+        lora_request: LoRARequest | None,
+        priority: int,
+        cache_salt: str | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        media: Mapping[str, Sequence[str]] | None = None,
+    ) -> list[QuestionRead]:
+        if instructions:
+            raise StructuredDecisionError(
+                "this model reads a fixed prompt, so it takes no instructions"
+            )
+        if chat_template_kwargs and chat_template_kwargs != {"enable_thinking": False}:
+            raise StructuredDecisionError(
+                "this model reads a fixed prompt, so it takes no chat_template_kwargs"
+            )
+        suffixes = [self._suffix(q) for q in questions]
+        texts = [self._render(state, suffix) for suffix in suffixes]
+        prompts = [self._tokens(text) for text in texts]
+        prefix_len = self._prefix_len(state, prompts)
+        for q, text, suffix, ids in zip(questions, texts, suffixes, prompts):
+            if len(ids) > self.max_model_len:
+                raise StructuredDecisionError(
+                    f"question {q.id!r}: the prompt has {len(ids)} tokens, more "
+                    f"than max_model_len={self.max_model_len}; nothing is truncated"
+                )
+            offset_ids, offset_prefix_len = self._offset_prefix_len(text, suffix)
+            if (
+                offset_ids != ids
+                or offset_prefix_len != prefix_len
+                or not (0 < prefix_len < len(ids))
+            ):
+                raise StructuredDecisionError(
+                    f"question {q.id!r}: the shared prefix ends at token "
+                    f"{prefix_len}, but the state block at token "
+                    f"{offset_prefix_len}"
+                )
+
+        def blocks(*ends: int) -> dict[str, Any] | None:
+            if not self.attention_blocks:
+                return None
+            starts = (0, *ends[:-1])
+            return {
+                ATTENTION_BLOCKS_KEY: [
+                    [start, end - 1] for start, end in zip(starts, ends)
+                ]
+            }
+
+        engine_inputs: list[EngineInput] = []
+        params: list[SamplingParams] = []
+        for q, ids in zip(questions, prompts):
+            engine_inputs.append(tokens_input(ids, cache_salt=cache_salt))
+            params.append(
+                SamplingParams(
+                    max_tokens=1,
+                    temperature=0.0,
+                    logprob_token_ids=self.slot_ids[: len(q.options)],
+                    extra_args=blocks(prefix_len, len(ids)),
+                )
+            )
+
+        engine_client = self.context.engine_client
+        if (
+            len(questions) >= 2
+            and prefix_len >= MIN_WARM_PREFIX_TOKENS
+            and engine_client.model_config.is_hybrid
+            and engine_client.vllm_config.cache_config.enable_prefix_caching
+        ):
+            # The prefix block alone: its cache is exactly what every question
+            # reads, which the token LCP is not when the questions' text starts
+            # alike.
+            async for _ in engine_client.generate(
+                tokens_input(prompts[0][:prefix_len], cache_salt=cache_salt),
+                SamplingParams(
+                    max_tokens=1, temperature=0.0, extra_args=blocks(prefix_len)
+                ),
+                f"{request_id}-prefix",
+                lora_request=lora_request,
+                trace_headers=trace_headers,
+                priority=priority,
+            ):
+                pass
+
+        label_reads = await next_token_label_reads(
+            engine_client,
+            engine_inputs,
+            params,
+            request_id,
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            priority=priority,
+        )
+        reads = []
+        for p, label_read in zip(params, label_reads):
+            output = label_read.result.outputs[0]
+            reads.append(
+                QuestionRead(
+                    probs=label_softmax(label_read.logprobs),
+                    label_mass=sum(math.exp(lp) for lp in label_read.logprobs),
+                    argmax_is_label=bool(output.token_ids)
+                    and output.token_ids[0] in (p.logprob_token_ids or ()),
+                    input_tokens=len(label_read.result.prompt_token_ids or ()),
+                    output_tokens=len(output.token_ids),
+                    cached_tokens=label_read.result.num_cached_tokens or 0,
+                    cache_write_tokens=(
+                        label_read.result.num_cache_creation_tokens or 0
+                    ),
+                    attention_blocks=self.attention_blocks,
+                )
+            )
+        return reads
+
+
 READ_STRATEGIES: dict[str, type[ReadStrategy]] = {
     "ClefFlashForJointSchema": ClefFlashStrategy,
     "ClefOmniForJointSchema": JointSchemaStrategy,
@@ -1226,6 +1492,7 @@ READ_STRATEGIES: dict[str, type[ReadStrategy]] = {
     "Lfm2VlForConditionalGeneration": LiquidStrategy,
     "Qwen3ForCausalLM": NextTokenStrategy,
     "Qwen3_5ForConditionalGeneration": NextTokenStrategy,
+    "Qwen3_5ForSlotDecision": SlotLMStrategy,
     "Qwen3_5MoeForConditionalGeneration": NextTokenStrategy,
     "DiffusionGemmaForBlockDiffusion": DiffusionGemmaCanvasStrategy,
 }

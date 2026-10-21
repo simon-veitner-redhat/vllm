@@ -7,10 +7,13 @@ from starlette.datastructures import State
 
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+from vllm.logger import init_logger
 from vllm.tasks import SupportedTask
 
 from .serving import OpenAIServingDecisions
 from .strategies import ReadContext, ReadStrategy, select_read_strategy
+
+logger = init_logger(__name__)
 
 
 def init_decisions_state(
@@ -34,7 +37,8 @@ def init_decisions_state(
                 default_chat_template_kwargs=default_chat_template_kwargs,
             )
         )
-    except ValueError:
+    except ValueError as e:
+        logger.info("Structured decisions are unavailable: %s", e)
         return None
 
     if strategy.task == "generate":

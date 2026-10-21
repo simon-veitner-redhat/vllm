@@ -71,6 +71,11 @@ class QuestionDiagnostics(OpenAIBaseModel):
         "that are not labels."
     )
     argmax_is_label: bool
+    attention_blocks: bool | None = Field(
+        default=None,
+        description="For checkpoints trained with block-bidirectional "
+        "attention: whether the read applied it. Absent for other models.",
+    )
 
 
 class StructuredDecisionResponse(OpenAIBaseModel):

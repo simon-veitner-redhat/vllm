@@ -109,7 +109,9 @@ class ServingStructuredDecisions(BaseServingDecisions):
         for q, read in zip(questions, reads):
             answers[q.id] = q.type.answer(q, read.probs, read.label_mass)
             diagnostics[q.id] = QuestionDiagnostics(
-                label_mass=read.label_mass, argmax_is_label=read.argmax_is_label
+                label_mass=read.label_mass,
+                argmax_is_label=read.argmax_is_label,
+                attention_blocks=read.attention_blocks,
             )
         return StructuredDecisionResponse(
             id=request_id,

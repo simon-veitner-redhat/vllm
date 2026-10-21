@@ -36,6 +36,10 @@ class Question:
     instructions: str
     options: tuple[Option, ...]
     labels: tuple[str, ...]
+    #: The request's instructions and criteria as sent, for prompts that
+    #: render non-string entries themselves. None when not built from a
+    #: request question.
+    raw: tuple[Any, Any] | None = None
 
 
 class QuestionType(ABC):
@@ -112,6 +116,7 @@ def build_question(
         raise StructuredDecisionError(
             f"question {qid!r}: at most {limit} options for this model"
         )
+    raw_instructions = instructions
     if not isinstance(instructions, str):
         instructions = "" if instructions is None else str(instructions)
     return Question(
@@ -120,6 +125,7 @@ def build_question(
         instructions=instructions,
         options=tuple(options),
         labels=qtype.label_set[: len(options)],
+        raw=(raw_instructions, criteria),
     )
 
 
