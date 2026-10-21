@@ -32,11 +32,13 @@ pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="DeepSeek V4 MegaMoE requires CUDA",
 )
+is_sm90 = current_platform.is_device_capability(90)
+is_mega_moe_gpu = is_sm90 or current_platform.is_device_capability_family(100)
 
 
 @pytest.fixture(autouse=True)
 def sm100_mega_moe_layout(monkeypatch):
-    """Build the SM100 kernel layout on any GPU; kernels are gated per test."""
+    """Skip the MegaMoE support check; kernels are gated per test."""
     monkeypatch.setattr(
         "vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe."
         "check_deep_gemm_mega_moe_supported",
@@ -94,8 +96,8 @@ def test_deepseek_v41_moe_routes_without_hash_table(
     use_cudagraph,
 ):
     """Main and draft layers select experts by score and preserve image routing."""
-    if not current_platform.is_device_capability_family(100):
-        pytest.skip("DeepGEMM Mega Gate requires SM100")
+    if not is_mega_moe_gpu:
+        pytest.skip("DeepSeek V4 MegaMoE routing requires SM90 or SM100")
 
     config = v41_moe_config.model_config.hf_config
     config.hidden_size = 256
@@ -234,8 +236,8 @@ def test_deepseek_v4_moe_preserves_configured_hash_layers(v41_moe_config):
 def test_deepseek_v4_mega_gate_hash_routing_correctness(
     v41_moe_config, monkeypatch, num_tokens
 ):
-    if not current_platform.is_device_capability_family(100):
-        pytest.skip("DeepGEMM Mega Gate requires SM100")
+    if not is_mega_moe_gpu:
+        pytest.skip("DeepSeek V4 MegaMoE routing requires SM90 or SM100")
 
     config = v41_moe_config.model_config.hf_config
     config.hidden_size = 256
@@ -388,8 +390,8 @@ def test_dspark_draft_registers_mixture_of_experts(
     v4_dspark_config, monkeypatch, dist_init
 ):
     """DSV4 DSpark MoE drafts expose MixtureOfExperts for EPLB registration."""
-    if not current_platform.is_device_capability_family(100):
-        pytest.skip("DeepGEMM MegaMoE requires SM100")
+    if not is_mega_moe_gpu:
+        pytest.skip("DeepGEMM MegaMoE requires SM90 or SM100")
 
     hf_config = v4_dspark_config.model_config.hf_config
     monkeypatch.setattr(

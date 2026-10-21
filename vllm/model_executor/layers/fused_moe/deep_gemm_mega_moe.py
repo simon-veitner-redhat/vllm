@@ -2,15 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepGEMM MegaMoE experts: fused EP dispatch, expert GEMMs and combine.
 
-Each ``MEGA_MOE_*`` format is one row of the SM100 feature matrix. MX weights
-and activations carry one UE8M0 scale per 1x32 block. NVFP4 weights carry one
+Each ``MEGA_MOE_*`` format is one row of the feature matrix. MX weights and
+activations carry one UE8M0 scale per 1x32 block (1x128 for
+``MEGA_MOE_MXFP4_SM90`` activations). NVFP4 weights carry one
 E4M3 scale per 1x16 block plus a per-expert FP32 global scale; NVFP4 dispatch
 scales each token by its own FP32 scale.
 """
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from inspect import signature
 from typing import Any, ClassVar, Literal
 
@@ -21,6 +22,12 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_ep_group
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.distributed.parallel_state import (
+    GroupCoordinator,
+    get_ep_node_group,
+    get_ep_rail_group,
+    in_the_same_node_as,
+)
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.prepare_megamoe import (
@@ -31,7 +38,10 @@ from vllm.model_executor.layers.fused_moe.router.base_router import (
     eplb_map_to_physical_and_record,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    FP8_DTYPE,
+    GroupShape,
     QuantKey,
+    ScaleDesc,
     kMxfp8Dynamic,
     kNvfp4DynamicToken,
 )
@@ -183,10 +193,22 @@ MEGA_MOE_WEIGHT_FORMATS = {
     fmt.name: fmt
     for fmt in (MEGA_MOE_MXFP4, MEGA_MOE_MXFP8, MEGA_MOE_NVFP4, MEGA_MOE_BF16)
 }
+MEGA_MOE_MXFP4_SM90 = replace(
+    MEGA_MOE_MXFP4,
+    hidden_quant=QuantKey(
+        FP8_DTYPE,
+        ScaleDesc(torch.float8_e8m0fnu, False, GroupShape(1, 128)),
+        symmetric=True,
+    ),
+    activations=frozenset({"swiglu"}),
+)
 
 
 def check_deep_gemm_mega_moe_supported(
-    device: torch.device, hidden_size: int, intermediate_size: int
+    device: torch.device,
+    hidden_size: int,
+    intermediate_size: int,
+    weight_format: MegaMoEWeightFormat,
 ) -> None:
     """Raise unless DeepGEMM MegaMoE can run on ``device`` with these shapes.
 
@@ -195,10 +217,15 @@ def check_deep_gemm_mega_moe_supported(
         ValueError: If the shapes are unsupported.
 
     """
-    if not current_platform.is_device_capability_family(
-        100, device_id=device.index or 0
-    ):
-        raise NotImplementedError("DeepGEMM MegaMoE requires SM100 GPUs.")
+    device_id = device.index or 0
+    if current_platform.is_device_capability(90, device_id=device_id):
+        if weight_format.mma_type != MEGA_MOE_MXFP4.mma_type:
+            raise NotImplementedError(
+                "DeepGEMM MegaMoE on SM90 supports MXFP4 experts only, "
+                f"not {weight_format.name}."
+            )
+    elif not current_platform.is_device_capability_family(100, device_id=device_id):
+        raise NotImplementedError("DeepGEMM MegaMoE requires SM90 or SM100 GPUs.")
     if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
         raise ValueError(
             "DeepGEMM MegaMoE requires hidden and intermediate sizes "
@@ -277,17 +304,23 @@ class DeepGemmMegaMoEExperts(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        if activation.name not in weight_format.activations:
-            raise NotImplementedError(
-                f"DeepGEMM MegaMoE {weight_format.name} experts support "
-                f"{sorted(weight_format.activations)}, not {activation.name!r}."
-            )
         device = torch.get_default_device()
         if device.type != current_platform.device_type:  # meta under ipc_cache
             device = torch.device(
                 current_platform.device_type, torch.accelerator.current_device_index()
             )
-        check_deep_gemm_mega_moe_supported(device, hidden_size, intermediate_size)
+        check_deep_gemm_mega_moe_supported(
+            device, hidden_size, intermediate_size, weight_format
+        )
+        if weight_format == MEGA_MOE_MXFP4 and current_platform.is_device_capability(
+            90, device_id=device.index or 0
+        ):
+            weight_format = MEGA_MOE_MXFP4_SM90
+        if activation.name not in weight_format.activations:
+            raise NotImplementedError(
+                f"DeepGEMM MegaMoE {weight_format.name} experts support "
+                f"{sorted(weight_format.activations)}, not {activation.name!r}."
+            )
 
         self.prefix = prefix
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
@@ -303,15 +336,40 @@ class DeepGemmMegaMoEExperts(nn.Module):
         self.intermediate_size = intermediate_size
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.weight_format = weight_format
+        # Over two nodes, each node runs its experts on both rail peers' tokens.
+        self.rail_group = (
+            get_ep_rail_group() if weight_format == MEGA_MOE_MXFP4_SM90 else None
+        )
+        self.node_group = None
+        self.num_nodes = 1
+        if self.rail_group is not None:
+            self.node_group = get_ep_node_group()
+            self.num_nodes = self.rail_group.world_size
+            if (
+                get_ep_group().world_size
+                != vllm_config.parallel_config.data_parallel_size
+            ):
+                raise NotImplementedError(
+                    "DeepGEMM MegaMoE over two nodes needs TP=1 (EP rank = DP rank)."
+                )
+            peer_rank = self.rail_group.ranks[1 - self.rail_group.rank_in_group]
+            self._rail_peer_dp_rank = get_ep_group().ranks.index(peer_rank)
+        self._kernel_num_experts = num_experts // self.num_nodes
+        self._kernel_max_num_tokens = self.max_num_tokens * self.num_nodes
         self.activation = activation
         self.fast_math = fast_math
         self._kernel_kwargs = activation.kernel_kwargs()
+        if weight_format == MEGA_MOE_MXFP4_SM90:
+            group_k = weight_format.hidden_quant.scale.group_shape.col
+            self._kernel_kwargs["recipe"] = (1, 1, group_k)
         self.eplb_state = EplbLayerState()
         # L2 input scale of every logical expert; the NVFP4 kernel takes the max.
         self._w2_input_scales = torch.zeros(self.num_logical_experts, device="cpu")
         self.l2_activation_scale = 1.0
         # The first of each expert's w1/w3 weight_scale_2 until the other loads.
         self._pending_l1_scales: dict[int, tuple[str, float]] = {}
+        # Shared-expert shards loaded since the last SM90 requantization.
+        self._loaded_shared_shards: dict[str, set[tuple[str, bool]]] = {}
 
         self.num_shared_experts, self.shared_spec = self._fusable_shared_experts(
             shared_experts
@@ -352,7 +410,9 @@ class DeepGemmMegaMoEExperts(nn.Module):
             ),
             None,
         )
-        if (
+        if self.rail_group is not None:
+            reason = "the EP group spans two nodes"
+        elif (
             tuple(gate_up.weight.shape) != (2 * shared_size, hidden)
             or tuple(down.weight.shape) != (hidden, shared_size)
             or shared_size % inter
@@ -487,6 +547,10 @@ class DeepGemmMegaMoEExperts(nn.Module):
             return False if return_success else None
         is_global_scale = weight_name.endswith(("weight_scale_2", "input_scale"))
         is_scale = weight_name.endswith("weight_scale")
+        if self.weight_format == MEGA_MOE_MXFP4_SM90 and not loaded_weight.is_meta:
+            loaded_weight = self._sm90_fp4_shard(
+                loaded_weight.to(param.device), is_scale
+            )
         for local_expert_id in local_expert_ids:
             if is_global_scale:
                 param.data[local_expert_id].copy_(loaded_weight.reshape(()))
@@ -542,6 +606,25 @@ class DeepGemmMegaMoEExperts(nn.Module):
         )
         is_scale = "weight_scale" in weight_name
         self._load_weight(param.data, loaded_weight, shard_id, is_scale)
+        if self.weight_format == MEGA_MOE_MXFP4_SM90 and not loaded_weight.is_meta:
+            self._requantize_loaded_shared_weight(shard_id, is_scale)
+
+    def _requantize_loaded_shared_weight(self, shard_id: str, is_scale: bool) -> None:
+        """Requantize a shared linear to SM90 scales once all its shards loaded."""
+        name = "shared_l2" if shard_id == "w2" else "shared_l1"
+        loaded = self._loaded_shared_shards.setdefault(name, set())
+        loaded.add((shard_id, is_scale))
+        if len(loaded) < (2 if shard_id == "w2" else 4):
+            return
+        loaded.clear()
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        weight, scale = self._kernel_weights(name)
+        requantized = _import_deep_gemm().requantize_fp8_weights_for_sm90_mega_moe(
+            (weight.data, scale.data), is_sf_transposed_for_utccp=True
+        )
+        for param, data in zip((weight, scale), requantized):
+            param.data.copy_(data)
 
     def _load_weight(
         self,
@@ -568,6 +651,22 @@ class DeepGemmMegaMoEExperts(nn.Module):
                 )
         dst, src = self._kernel_layout_shard(dst, src, shard_id, is_scale)
         dst.copy_(src)
+
+    @staticmethod
+    def _sm90_fp4_shard(src: torch.Tensor, is_scale: bool) -> torch.Tensor:
+        """Repack a routed FP4 shard for the SM90 kernel's dequantization.
+
+        Raises:
+            AssertionError: If a row's UE8M0 scales are out of the kernel's range.
+
+        """
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        deep_gemm = _import_deep_gemm()
+        if is_scale:
+            sf = src.view(torch.uint8).contiguous().view(torch.int32)
+            return deep_gemm.transform_fp4_sf_for_sm90_mega_moe(sf)
+        return deep_gemm.relayout_fp4_weights_for_sm90_mega_moe(src.view(torch.int8))
 
     @staticmethod
     def _pack_scale(sf: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
@@ -603,16 +702,21 @@ class DeepGemmMegaMoEExperts(nn.Module):
         dst = dst.view(-1, 2, 2, 8, 4, k)[:, :, half].permute(0, 3, 1, 2, 4)
         return dst, src.reshape(-1, 4, 2, 8, k)
 
+    @property
+    def _kernel_group(self) -> GroupCoordinator:
+        """The ranks one launch spans: the EP group, or this node's part of it."""
+        return get_ep_group() if self.node_group is None else self.node_group
+
     def get_symm_buffer(self):
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
-        group = get_ep_group().device_group
+        group = self._kernel_group.device_group
         key = (
             id(group),
             torch.accelerator.current_device_index(),
-            self.num_experts,
-            self.max_num_tokens,
+            self._kernel_num_experts,
+            self._kernel_max_num_tokens,
             self.top_k,
             self.hidden_size,
             self.intermediate_size,
@@ -623,10 +727,17 @@ class DeepGemmMegaMoEExperts(nn.Module):
         )
         symm_buffer = self._symm_buffers.get(key)
         if symm_buffer is None:
+            if self.weight_format == MEGA_MOE_MXFP4_SM90 and not all(
+                in_the_same_node_as(self._kernel_group.cpu_group)
+            ):
+                raise NotImplementedError(
+                    "DeepGEMM MegaMoE on SM90 needs the EP group within one "
+                    "NVLink node, or split evenly over two nodes."
+                )
             args = (
                 group,
-                self.num_experts,
-                self.max_num_tokens,
+                self._kernel_num_experts,
+                self._kernel_max_num_tokens,
                 self.top_k,
                 self.hidden_size,
                 self.intermediate_size,
@@ -650,15 +761,18 @@ class DeepGemmMegaMoEExperts(nn.Module):
         return symm_buffer
 
     def get_block_m(self, num_tokens: int) -> int:
-        """BLOCK_M the MegaMoE scheduler runs ``num_tokens`` local tokens with."""
+        """BLOCK_M the MegaMoE scheduler runs ``num_tokens`` local tokens with.
+
+        Over two nodes the rail peer is assumed to have as many tokens.
+        """
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
         args = (
-            get_ep_group().world_size,
-            self.num_experts,
+            self._kernel_group.world_size,
+            self._kernel_num_experts,
             self.get_symm_buffer().num_max_tokens_per_rank,
-            num_tokens,
+            num_tokens * self.num_nodes,
             self.top_k,
         )
         if self.weight_format.uses_nvfp4_api:
@@ -718,6 +832,27 @@ class DeepGemmMegaMoEExperts(nn.Module):
         torch.accelerator.synchronize()
         torch.distributed.barrier(group=ep_group.cpu_group)
         self._synchronized_ep_groups.add(key)
+
+    def _rail_peer_num_tokens(self, num_tokens: int) -> int:
+        if is_forward_context_available():
+            dp_metadata = get_forward_context().dp_metadata
+            if dp_metadata is not None:
+                return int(
+                    dp_metadata.num_tokens_across_dp_cpu[self._rail_peer_dp_rank]
+                )
+        # Warmup: every rank runs the same token counts.
+        return num_tokens
+
+    def _rail_exchange(self, tensors: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+        """Batched send of each ``send`` to the rail peer, recv into each ``recv``."""
+        assert self.rail_group is not None
+        pynccl = self.rail_group.device_communicator.pynccl_comm
+        peer = 1 - self.rail_group.rank_in_group
+        pynccl.group_start()
+        for send, recv in tensors:
+            pynccl.send(send, peer)
+            pynccl.recv(recv, peer)
+        pynccl.group_end()
 
     def forward(
         self,
@@ -783,6 +918,19 @@ class DeepGemmMegaMoEExperts(nn.Module):
                 else None,
             )
 
+        rail = self.rail_group
+        num_peer_tokens = 0
+        if rail is not None:
+            # Split the routing by node into node-local expert ids.
+            num_peer_tokens = self._rail_peer_num_tokens(num_tokens)
+            node, peer = rail.rank_in_group, 1 - rail.rank_in_group
+            expert_node = topk_ids.div(self._kernel_num_experts, rounding_mode="floor")
+            if is_padding is not None:
+                expert_node = torch.where(is_padding.unsqueeze(1), -1, expert_node)
+            node_ids = topk_ids % self._kernel_num_experts
+            peer_topk_ids = torch.where(expert_node == peer, node_ids, -1).long()
+            topk_ids = torch.where(expert_node == node, node_ids, -1)
+
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
@@ -840,7 +988,17 @@ class DeepGemmMegaMoEExperts(nn.Module):
         if self.has_fused_shared_experts:
             kwargs["shared_l1_weights"] = self._kernel_weights("shared_l1")
             kwargs["shared_l2_weights"] = self._kernel_weights("shared_l2")
-        y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+        y = hidden_states.new_empty(
+            num_tokens + num_peer_tokens, self.hidden_size, dtype=torch.bfloat16
+        )
+        if rail is not None:
+            # The rail peer's tokens go in the buffer rows after ours.
+            peer_rows = slice(num_tokens, num_tokens + num_peer_tokens)
+            buffers = (symm_buffer.x, symm_buffer.x_sf, symm_buffer.topk_weights)
+            self._rail_exchange(
+                [(buf[:num_tokens], buf[peer_rows]) for buf in buffers]
+                + [(peer_topk_ids, symm_buffer.topk_idx[peer_rows])]
+            )
         getattr(deep_gemm, fmt.kernel)(
             y,
             self.l1_weights,
@@ -849,6 +1007,11 @@ class DeepGemmMegaMoEExperts(nn.Module):
             fast_math=self.fast_math,
             **kwargs,
         )
+        if rail is not None:
+            peer_y = torch.empty_like(y[:num_tokens])
+            self._rail_exchange([(y[num_tokens:], peer_y)])
+            y = y[:num_tokens]
+            y += peer_y
         if shared_experts is not None:
             y += shared_experts(hidden_states)
         return y

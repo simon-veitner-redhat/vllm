@@ -1665,6 +1665,20 @@ def get_ep_group() -> GroupCoordinator:
     return _EP
 
 
+_EP_NODE: GroupCoordinator | None = None
+_EP_RAIL: GroupCoordinator | None = None
+
+
+def get_ep_node_group() -> GroupCoordinator | None:
+    """EP ranks on this node, set when DeepGEMM MegaMoE runs on SM90 over two nodes."""
+    return _EP_NODE
+
+
+def get_ep_rail_group() -> GroupCoordinator | None:
+    """EP ranks with this node-local index on every node, set with the node group."""
+    return _EP_RAIL
+
+
 _EPLB: GroupCoordinator | None = None
 
 
@@ -2326,6 +2340,48 @@ def initialize_model_parallel(
                 use_all2all=use_all2all,
             )
 
+        # Node and rail subgroups of EP for DeepGEMM MegaMoE on SM90 over two nodes.
+        from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
+        from vllm.platforms import current_platform
+
+        global _EP_NODE, _EP_RAIL
+        assert _EP_NODE is None, "EP node group is already initialized"
+        assert _EP_RAIL is None, "EP rail group is already initialized"
+        if (
+            config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
+            and not enable_elastic_ep
+            and current_platform.is_device_capability(90)
+        ):
+            ranks_per_node = world_size // get_node_count()
+            node_ranks = [
+                [r for r in ranks if r // ranks_per_node == node]
+                for ranks in group_ranks
+                for node in dict.fromkeys(r // ranks_per_node for r in ranks)
+            ]
+            if len(node_ranks) == 2 * len(group_ranks):
+                assert sum(node_ranks, []) == sum(group_ranks, []) and all(
+                    len(ranks) == len(node_ranks[0]) for ranks in node_ranks
+                ), f"EP ranks {group_ranks} are not node-major with equal nodes."
+                _EP_NODE = init_model_parallel_group(
+                    node_ranks,
+                    get_world_group().local_rank,
+                    backend,
+                    group_name="ep_node",
+                    use_device_communicator=False,
+                )
+                ranks_per_ep_node = len(node_ranks[0])
+                rail_ranks = [
+                    ranks[i::ranks_per_ep_node]
+                    for ranks in group_ranks
+                    for i in range(ranks_per_ep_node)
+                ]
+                _EP_RAIL = init_model_parallel_group(
+                    rail_ranks,
+                    get_world_group().local_rank,
+                    backend,
+                    group_name="ep_rail",
+                )
+
         # Create EPLB group with the same ranks as EP if EPLB is enabled.
         # This is a separate process group to isolate EPLB communications
         # from MoE forward pass collectives and prevent deadlocks when
@@ -2501,6 +2557,16 @@ def destroy_model_parallel():
     if _EP:
         _EP.destroy()
     _EP = None
+
+    global _EP_NODE
+    if _EP_NODE:
+        _EP_NODE.destroy()
+    _EP_NODE = None
+
+    global _EP_RAIL
+    if _EP_RAIL:
+        _EP_RAIL.destroy()
+    _EP_RAIL = None
 
     global _EPLB
     if _EPLB:
