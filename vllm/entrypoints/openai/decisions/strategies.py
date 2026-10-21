@@ -68,6 +68,8 @@ logger = init_logger(__name__)
 MIN_WARM_PREFIX_TOKENS = 128
 #: The levels a score question takes on slot-readout checkpoints, as in training.
 SLOT_MAX_SCORE_LEVELS = 10
+#: The most options a question has on slot-readout checkpoints, as in qev.
+SLOT_MAX_OPTIONS = 255
 
 
 def common_prefix_len(prompts: Sequence[Sequence[int]]) -> int:
@@ -1285,8 +1287,24 @@ class SlotLMStrategy(ReadStrategy):
 
     def limits(self) -> DecisionLimits:
         return DecisionLimits(
-            max_questions=64, max_options=len(self.slot_ids), labeled=False
+            max_questions=64,
+            max_options=min(len(self.slot_ids), SLOT_MAX_OPTIONS),
+            labeled=False,
         )
+
+    def _may_warm_up(self, num_questions: int) -> bool:
+        """Whether a read of this many questions may first send the prefix
+        block alone (if the prefix is long enough, which only the rendered
+        prompt tells)."""
+        engine_client = self.context.engine_client
+        return (
+            num_questions >= 2
+            and engine_client.model_config.is_hybrid
+            and engine_client.vllm_config.cache_config.enable_prefix_caching
+        )
+
+    def num_requests(self, questions: list[Question]) -> int:
+        return len(questions) + self._may_warm_up(len(questions))
 
     def render_state(self, state: Any) -> str:
         return slot_prompt.render_state(state)
@@ -1431,12 +1449,7 @@ class SlotLMStrategy(ReadStrategy):
             )
 
         engine_client = self.context.engine_client
-        if (
-            len(questions) >= 2
-            and prefix_len >= MIN_WARM_PREFIX_TOKENS
-            and engine_client.model_config.is_hybrid
-            and engine_client.vllm_config.cache_config.enable_prefix_caching
-        ):
+        if prefix_len >= MIN_WARM_PREFIX_TOKENS and self._may_warm_up(len(questions)):
             # The prefix block alone: its cache is exactly what every question
             # reads, which the token LCP is not when the questions' text starts
             # alike.

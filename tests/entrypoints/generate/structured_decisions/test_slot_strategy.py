@@ -22,6 +22,7 @@ import torch
 
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.generate.structured_decisions.protocol import (
+    QuestionDiagnostics,
     StructuredDecisionRequest,
 )
 from vllm.entrypoints.generate.structured_decisions.serving import parse_questions
@@ -286,6 +287,40 @@ async def test_causal_mode_sends_no_blocks(tokenizer, monkeypatch):
         call.args[1].extra_args is None for call in engine.generate.call_args_list
     )
     assert all(r.attention_blocks is False for r in reads)
+
+
+def test_limits_and_request_count(tokenizer):
+    strategy, _ = make_strategy(tokenizer)
+    # qev reads at most 255 options.
+    assert strategy.limits().max_options == 255
+    request = StructuredDecisionRequest(
+        state="plain text",
+        questions={
+            "many": {"type": "choice", "criteria": {str(i): None for i in range(256)}}
+        },
+    )
+    with pytest.raises(StructuredDecisionError):
+        parse_questions(request, strategy.limits())
+    # Admission counts the prefix warm-up of a multi-question read.
+    one, three = (
+        parse_questions(
+            StructuredDecisionRequest(state="s", questions=PROBE_QUESTIONS), limits
+        )[:n]
+        for limits, n in ((strategy.limits(), 1), (strategy.limits(), 3))
+    )
+    assert strategy.num_requests(one) == 1
+    assert strategy.num_requests(three) == 4
+    strategy, _ = make_strategy(tokenizer, hybrid=False)
+    assert strategy.num_requests(three) == 3
+
+
+def test_stock_diagnostics_leave_out_attention_blocks():
+    stock = QuestionDiagnostics(label_mass=1.0, argmax_is_label=True)
+    assert "attention_blocks" not in stock.model_dump()
+    slot = QuestionDiagnostics(
+        label_mass=1.0, argmax_is_label=True, attention_blocks=False
+    )
+    assert slot.model_dump()["attention_blocks"] is False
 
 
 def test_refuses_to_start_without_mask_or_fp32_head(tokenizer):

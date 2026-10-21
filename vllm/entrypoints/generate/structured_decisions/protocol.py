@@ -73,6 +73,8 @@ class QuestionDiagnostics(OpenAIBaseModel):
     argmax_is_label: bool
     attention_blocks: bool | None = Field(
         default=None,
+        # Only slot-readout checkpoints report it.
+        exclude_if=lambda value: value is None,
         description="For checkpoints trained with block-bidirectional "
         "attention: whether the read applied it. Absent for other models.",
     )
