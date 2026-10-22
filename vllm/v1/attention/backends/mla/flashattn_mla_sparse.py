@@ -15,7 +15,9 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonMetadata,
     SparseMLACommonMetadataBuilder,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -222,6 +224,7 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
         layer: AttentionLayer,
         block_size: int,
         is_decode: bool,
+        out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not isinstance(q, tuple):
             raise NotImplementedError(
@@ -247,6 +250,7 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
             k=k_cache,
             v=v_cache,
             q_v=q_nope,
+            out=out,
             max_seqlen_q=1,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_k=topk_indices.shape[1],
@@ -276,8 +280,13 @@ class FlashAttnMLASparseFA4Backend(FlashInferMLASparseTRTLLMBackend):
     """FA4 for is_decode kernel calls; trtllm-gen for the rest."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
-    # The qv kernel asserts every descale is None: BF16 KV cache only.
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    # fp8: per-tensor e4m3 (576 B/token) only.
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
@@ -301,7 +310,14 @@ class FlashAttnMLASparseFA4Backend(FlashInferMLASparseTRTLLMBackend):
         return [576]
 
     @classmethod
-    def supports_combination(cls, *args: Any, **kwargs: Any) -> str | None:
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> str | None:
         from vllm.config import get_current_vllm_config_or_none
         from vllm.utils.flashinfer import has_flashinfer
 
@@ -339,7 +355,16 @@ class FlashAttnMLASparseFA4Backend(FlashInferMLASparseTRTLLMBackend):
                     f"FA4 sparse MLA requires {head_counts} gathered query heads, "
                     f"got num_heads={num_heads} * dcp_size={dcp_size}"
                 )
-        return super().supports_combination(*args, **kwargs)
+            # 128 heads run FA's prefill kernel, which has no fp8 KV variant.
+            if (
+                kv_cache_dtype is not None
+                and is_quantized_kv_cache(kv_cache_dtype)
+                and num_heads * dcp_size == 128
+            ):
+                return "FA4 sparse MLA supports fp8 KV only up to 64 gathered heads"
+        return super().supports_combination(
+            head_size, dtype, kv_cache_dtype, *args, **kwargs
+        )
 
 
 class FlashAttnMLASparseFA4MetadataBuilder(FlashInferMLASparseTRTLLMMetadataBuilder):
@@ -364,6 +389,8 @@ def _fa4_varlen_scalars(
 class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
     # FA4 emits a natural-log LSE; prefill converts trtllm-gen's log2 LSE.
     lse_base_on_e: bool = True
+    # Mixed batches: decodes on FA4, the rest on trtllm-gen.
+    split_mixed_mqa_batch: ClassVar[bool] = True
 
     def _forward_mqa_kernel(
         self,
@@ -375,6 +402,7 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
         layer: AttentionLayer,
         block_size: int,
         is_decode: bool,
+        out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not is_decode:
             out, lse = super()._forward_mqa_kernel(
@@ -385,6 +413,7 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
                 layer=layer,
                 block_size=block_size,
                 is_decode=is_decode,
+                out=out,
             )
             return out, None if lse is None else lse * math.log(2.0)
         if isinstance(q, tuple):
@@ -392,6 +421,13 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
         else:
             # 16B-aligned halves of the fused query; FA4 reads them in place.
             ql_nope, q_pe = q[..., : self.kv_lora_rank], q[..., self.kv_lora_rank :]
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            # Quantized caches are uint8; FA4 takes float8_e4m3fn. q is fused fp8.
+            kv_cache = kv_cache.view(current_platform.fp8_dtype())
+        # Shared with trtllm-gen: bmm1_scale = scale * q_scale * k_scale,
+        # bmm2_scale = k_scale (applied to the output).
+        self._prepare_mqa_kernel(layer, q_pe.device)
+        assert self.bmm1_scale is not None and self.bmm2_scale is not None
         kv_rows, _ = flat_kv_row_view(kv_cache, block_size)
         num_tokens = q_pe.shape[0]
         num_kv_rows = kv_rows.shape[0]
@@ -405,6 +441,7 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
             k=kv_rows[:, self.kv_lora_rank :].unsqueeze(1),
             v=kv_rows[:, : self.kv_lora_rank].unsqueeze(1),
             q_v=ql_nope,
+            out=out,
             max_seqlen_q=1,
             cu_seqlens_q=cu_seqlens_q[: num_tokens + 1],
             max_seqlen_k=num_kv_rows,
@@ -413,10 +450,18 @@ class FlashAttnMLASparseFA4Impl(FlashInferMLASparseImpl):
             gather_kv_indices=topk_indices,
             # Part of FA4's compile key: pass it unconditionally.
             gather_kv_valid_length=valid_counts,
-            softmax_scale=self.scale,
+            softmax_scale=self.bmm1_scale,
             # Causality is in the top-k list; causal=True would clamp flat rows.
             causal=False,
             fa_version=4,
             return_softmax_lse=self.need_to_return_lse_for_decode,
+            # FA4 picks its decode grid by the DCP size
+            fa4_sparse_decode_dcp_size=self.dcp_world_size,
         )
-        return kernel_out if self.need_to_return_lse_for_decode else (kernel_out, None)
+        out, lse = (
+            kernel_out if self.need_to_return_lse_for_decode else (kernel_out, None)
+        )
+        if self.bmm2_scale != 1.0:
+            # The LSE already carries k_scale through softmax_scale.
+            out.mul_(self.bmm2_scale)
+        return out, lse

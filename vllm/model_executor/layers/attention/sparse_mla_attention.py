@@ -639,6 +639,13 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     # Reuse the index group's top-k conversion only for uniform decode batches
     # of multi-layer groups; other batches convert per layer.
     group_conversion_decode_only: ClassVar[bool] = False
+    # Run a mixed batch as a decode call (is_decode=True) plus a prefill call
+    # into one output; _forward_mqa_kernel must then accept ``out=``.
+    split_mixed_mqa_batch: ClassVar[bool] = False
+
+    def _mqa_out_dtype(self) -> torch.dtype:
+        """Latent output dtype that both lanes of a split batch write into."""
+        raise NotImplementedError
 
     def __init__(
         self,
@@ -786,6 +793,22 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                     block_stride_rows=block_stride_rows,
                     return_valid_counts=True,
                 )
+            # Mixed batches run eagerly (UNIFORM_BATCH); never split in a capture.
+            if (
+                self.split_mixed_mqa_batch
+                and 0 < num_decode_tokens < num_tokens
+                and self.pcp_world_size == 1
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                return self._forward_mqa_split(
+                    q,
+                    kv_c_and_k_pe_cache,
+                    physical_topk,
+                    valid_counts,
+                    num_decode_tokens,
+                    layer=layer,
+                    block_size=block_size,
+                )
             return self._forward_mqa_kernel(
                 q,
                 kv_c_and_k_pe_cache,
@@ -880,6 +903,52 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         assert prefill_lse is not None
         return out, torch.cat((decode_lse, prefill_lse))
 
+    def _forward_mqa_split(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        valid_counts: torch.Tensor,
+        num_decode_tokens: int,
+        *,
+        layer: AttentionLayer,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Decodes (reordered to the front) and prefills as two kernel calls."""
+        nd = num_decode_tokens
+        ref = q[0] if isinstance(q, tuple) else q
+        out = ref.new_empty(
+            (*ref.shape[:2], self.kv_lora_rank), dtype=self._mqa_out_dtype()
+        )
+        q_d, q_p = (
+            ((q[0][:nd], q[1][:nd]), (q[0][nd:], q[1][nd:]))
+            if isinstance(q, tuple)
+            else (q[:nd], q[nd:])
+        )
+        _, lse_d = self._forward_mqa_kernel(
+            q_d,
+            kv_cache,
+            topk_indices[:nd],
+            valid_counts[:nd],
+            layer=layer,
+            block_size=block_size,
+            is_decode=True,
+            out=out[:nd],
+        )
+        _, lse_p = self._forward_mqa_kernel(
+            q_p,
+            kv_cache,
+            topk_indices[nd:],
+            valid_counts[nd:],
+            layer=layer,
+            block_size=block_size,
+            is_decode=False,
+            out=out[nd:],
+        )
+        if lse_d is None or lse_p is None:
+            return out, None
+        return out, torch.cat((lse_d, lse_p))
+
     def _forward_mqa_kernel(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -890,6 +959,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         layer: AttentionLayer,
         block_size: int,
         is_decode: bool,
+        out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         raise NotImplementedError
 

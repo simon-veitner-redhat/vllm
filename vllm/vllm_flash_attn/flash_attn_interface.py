@@ -216,6 +216,8 @@ def flash_attn_varlen_func(
     dynamic_causal: "torch.Tensor | None" = None,
     gather_kv_indices=None,
     gather_kv_valid_length=None,
+    # FA4 sparse MLA decode: the DCP size, which picks the decode grid
+    fa4_sparse_decode_dcp_size: int = 1,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -295,6 +297,8 @@ def flash_attn_varlen_func(
         gather_kv_indices: (total_q, k) int32 KV rows per query token, `-1` padded,
             k a multiple of 128. Requires q_v, excludes block_table. FA4 only.
         gather_kv_valid_length: (total_q,) int32, real entries per row. FA4 only.
+        fa4_sparse_decode_dcp_size: int. The caller's decode context parallel
+           size, which FA4 uses to pick the sparse MLA decode grid. FA4 only.
 
     Return:
         out: (total, nheads, headdim).
@@ -483,6 +487,11 @@ def flash_attn_varlen_func(
             v_descale=v_descale,
             output_scale=output_scale,
             fp8_kv_dequant=fa4_fp8_kv_dequant,
+            **(
+                {"sparse_decode_dcp_size": fa4_sparse_decode_dcp_size}
+                if fa4_sparse_decode_dcp_size > 1
+                else {}
+            ),
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")

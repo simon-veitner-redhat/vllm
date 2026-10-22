@@ -83,12 +83,19 @@ def _get_hisparse_worker(runner: VllmRunner) -> HiSparseConnectorWorker:
     not current_platform.is_cuda(), reason="HiSparse requires NVIDIA CUDA"
 )
 @pytest.mark.parametrize(
-    "with_offloading,attention_backend",
+    "with_offloading,attention_backend,kv_cache_dtype",
     [
-        pytest.param(False, None, id="standalone"),
-        pytest.param(True, None, id="offload"),
+        pytest.param(False, None, "auto", id="standalone"),
+        pytest.param(True, None, "auto", id="offload"),
         # Offloading does not touch the attention kernels: FA4 runs standalone.
-        pytest.param(False, "FLASH_ATTN_MLA_SPARSE_FA4", id="standalone-fa4"),
+        pytest.param(False, "FLASH_ATTN_MLA_SPARSE_FA4", "auto", id="standalone-fa4"),
+        pytest.param(
+            False,
+            "FLASH_ATTN_MLA_SPARSE_FA4",
+            "fp8",
+            id="standalone-fa4-fp8",
+            marks=pytest.mark.slow_test,
+        ),
     ],
 )
 @fork_new_process_for_each_test
@@ -97,6 +104,7 @@ def test_hisparse_spill_and_prefix_restore(
     vllm_runner: type[VllmRunner],
     with_offloading: bool,
     attention_backend: str | None,
+    kv_cache_dtype: str,
 ):
     """Spilled prefixes restore and FULL-graph decode writes reach host KV.
 
@@ -152,6 +160,7 @@ def test_hisparse_spill_and_prefix_restore(
         ),
         kv_transfer_config=kv_transfer_config,
         attention_backend=attention_backend,
+        kv_cache_dtype=kv_cache_dtype,
         block_size=64,
         max_model_len=320,
         max_num_batched_tokens=1024,

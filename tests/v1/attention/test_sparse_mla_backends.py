@@ -129,8 +129,12 @@ if current_platform.is_rocm():
     SPARSE_KV_CACHE_DTYPES = ["auto", "fp8"]
     SPARSE_BLOCK_SIZES = [64]
 else:
-    SPARSE_BACKENDS = [FlashMLASparseBackend, FlashInferMLASparseTRTLLMBackend]
-    SPARSE_BACKEND_IDS = ["FlashMLA", "FlashInferTRTLLM"]
+    SPARSE_BACKENDS = [
+        FlashMLASparseBackend,
+        FlashInferMLASparseTRTLLMBackend,
+        FlashAttnMLASparseFA4Backend,
+    ]
+    SPARSE_BACKEND_IDS = ["FlashMLA", "FlashInferTRTLLM", "FA4"]
     SPARSE_KV_CACHE_DTYPES = ["auto", "fp8", "fp8_ds_mla", "nvfp4_ds_mla"]
     SPARSE_BLOCK_SIZES = [32, 64]
 
@@ -596,6 +600,12 @@ def test_sparse_backend_decode_correctness(
     # Compute per-rank heads for simulated TP
     num_heads = max(1, total_num_heads // tensor_parallel_size)
 
+    if (
+        backend_cls == FlashAttnMLASparseFA4Backend
+        and not current_platform.is_device_capability_family(100)
+    ):
+        pytest.skip("FA4 sparse MLA requires SM 10.x")
+
     kv_lora_rank = 512
     head_size = kv_lora_rank + qk_rope_head_dim
     topk_tokens = 128
@@ -643,6 +653,22 @@ def test_sparse_backend_decode_correctness(
     )
     model_config.get_head_size = MethodType(lambda self: head_size, model_config)
     model_config.get_sliding_window = MethodType(lambda self: None, model_config)
+    if backend_cls == FlashAttnMLASparseFA4Backend:
+        # The backend's own gate: FA4 availability, head counts, fp8 vs 128 heads.
+        with set_current_vllm_config(vllm_config):
+            reason = backend_cls.supports_combination(
+                head_size,
+                dtype,
+                kv_cache_dtype,
+                block_size,
+                True,
+                False,
+                True,
+                False,
+                current_platform.get_device_capability(),
+            )
+        if reason is not None:
+            pytest.skip(reason)
 
     kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
 
@@ -4004,6 +4030,7 @@ def _fa4_impl(topk_indices_buffer, **fields):
         kv_cache_dtype="auto",
         dcp_world_size=1,
         dcp_rank=0,
+        pcp_world_size=1,
         need_to_return_lse_for_decode=False,
         is_nope_mla=False,
         _workspace_buffer=None,
@@ -4075,15 +4102,21 @@ def _record_fa4_kernels(monkeypatch, num_heads, *, device):
     def fake_fa4(**kwargs):
         fa4_calls.append(kwargs)
         rows = kwargs["q"].shape[0]
-        out = torch.ones(rows, num_heads, 512, dtype=torch.bfloat16, device=device)
+        out = kwargs.get("out")
+        if out is None:
+            out = torch.empty(rows, num_heads, 512, dtype=torch.bfloat16, device=device)
+        out.fill_(1.0)
         return (out, lse(rows)) if kwargs.get("return_softmax_lse") else out
 
     def fake_trtllm(**kwargs):
         trtllm_calls.append(kwargs)
         rows = kwargs["query"].shape[0]
-        out = torch.full(
-            (rows, 1, num_heads, 512), 2.0, dtype=torch.bfloat16, device=device
-        )
+        out = kwargs.get("out")
+        if out is None:
+            out = torch.empty(
+                (rows, 1, num_heads, 512), dtype=torch.bfloat16, device=device
+            )
+        out.fill_(2.0)
         return (out, lse(rows)) if kwargs.get("return_lse") else out
 
     monkeypatch.setattr(flashattn_sparse_module, "flash_attn_varlen_func", fake_fa4)
@@ -4094,9 +4127,19 @@ def _record_fa4_kernels(monkeypatch, num_heads, *, device):
 
 
 @pytest.mark.parametrize(
-    "num_heads,return_lse", [(128, False), (16, True)], ids=["heads128", "heads16_lse"]
+    "num_heads,return_lse,kv_cache_dtype,k_scale",
+    [
+        (128, False, "auto", 1.0),
+        (16, True, "auto", 1.0),
+        (16, True, "fp8", 1.0),
+        # 64 gathered heads: the DCP head-group split, with a non-unit scale.
+        (64, True, "fp8_e4m3", 3.0),
+    ],
+    ids=["heads128", "heads16_lse", "fp8_heads16_lse", "fp8_heads64_lse_kscale"],
 )
-def test_fa4_sparse_decode_kernel_correctness(num_heads, return_lse):
+def test_fa4_sparse_decode_kernel_correctness(
+    num_heads, return_lse, kv_cache_dtype, k_scale
+):
     if not current_platform.is_device_capability_family(100):
         pytest.skip("FA4 sparse MLA requires SM 10.x")
     if (reason := _fa4_cute_mla_available()) is not None:
@@ -4106,24 +4149,39 @@ def test_fa4_sparse_decode_kernel_correctness(num_heads, return_lse):
     impl = _fa4_impl(
         topk_indices_buffer=inputs.topk_indices,
         scale=inputs.scale,
+        kv_cache_dtype=kv_cache_dtype,
         need_to_return_lse_for_decode=return_lse,
     )
     q = (inputs.ql_nope, inputs.q_pe)
+    q_fused = q_ref = torch.cat(q, dim=-1)
+    kv_cache = inputs.kv_cache
+    layer = None
+    if kv_cache_dtype != "auto":
+        # Stored as x / scale like the cache writer and the layer's fused q
+        # quant; the reference reads the dequantized values.
+        fp8, q_scale = current_platform.fp8_dtype(), 2.0
+        kv_cache = (kv_cache.float() / k_scale).to(fp8)
+        inputs.kv_cache = kv_cache.float() * k_scale
+        kv_cache = kv_cache.view(torch.uint8)
+        q_fused = (q_ref.float() / q_scale).to(fp8)
+        q_ref = q_fused.float() * q_scale
+        q = (q_fused[..., : inputs.kv_lora_rank], q_fused[..., inputs.kv_lora_rank :])
+        layer = SimpleNamespace(_q_scale_float=q_scale, _k_scale_float=k_scale)
 
     with torch.inference_mode():
-        out, lse = impl.forward_mqa(q, inputs.kv_cache, inputs.metadata, None)
+        out, lse = impl.forward_mqa(q, kv_cache, inputs.metadata, layer)
         if not return_lse:
             assert lse is None
         else:
             out_fused, lse_fused = impl.forward_mqa(
-                torch.cat(q, dim=-1), inputs.kv_cache, inputs.metadata, None
+                q_fused, kv_cache, inputs.metadata, layer
             )
             assert lse.shape == (len(counts), num_heads)
             assert torch.equal(out, out_fused) and torch.equal(lse, lse_fused)
 
     kv_flat = inputs.kv_cache.view(-1, inputs.kv_lora_rank + inputs.rope_dim)
     keys = kv_flat[inputs.topk_indices.clamp(min=0).long()].float()
-    scores = torch.einsum("thd,tkd->thk", torch.cat(q, dim=-1).float(), keys)
+    scores = torch.einsum("thd,tkd->thk", q_ref.float(), keys)
     scores = (scores * inputs.scale).masked_fill(
         (inputs.topk_indices < 0)[:, None, :], float("-inf")
     )
@@ -4163,7 +4221,7 @@ def test_fa4_sparse_hook_routes_lanes(monkeypatch, is_decode):
     impl._convert_logical_to_physical_topk = MagicMock()
     dcp_filter = MagicMock(return_value=(inputs.topk_indices, inputs.valid_counts))
     monkeypatch.setattr(sparse_mla, "triton_filter_and_convert_dcp_index", dcp_filter)
-    inputs.metadata.num_decode_tokens = num_tokens if is_decode else 1
+    inputs.metadata.num_decode_tokens = num_tokens if is_decode else 0
 
     with torch.inference_mode():
         out, lse = impl.forward_mqa(q, inputs.kv_cache, inputs.metadata, None)
@@ -4189,6 +4247,119 @@ def test_fa4_sparse_hook_routes_lanes(monkeypatch, is_decode):
         torch.testing.assert_close(lse, expected, rtol=0, atol=1e-5)
 
 
+@pytest.mark.parametrize("pcp", [1, 2], ids=["no_pcp", "pcp"])
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+def test_fa4_sparse_splits_mixed_batch(monkeypatch, kv_cache_dtype, pcp):
+    """A mixed batch runs its decodes on FA4 and the rest on trtllm-gen, into
+    one output, with the natural-log LSEs concatenated for the DCP merge."""
+    import vllm.model_executor.layers.attention.sparse_mla_attention as sparse_mla
+
+    counts, num_decodes, num_heads = [1, 2, 3, 4, 5], 2, 32
+    num_tokens = len(counts)
+    inputs = _fa4_inputs(counts, num_heads=num_heads, device="cpu")
+    calls = _record_fa4_kernels(monkeypatch, num_heads, device="cpu")
+    fp8 = kv_cache_dtype != "auto"
+    q = torch.cat((inputs.ql_nope, inputs.q_pe), dim=-1)
+    kv_cache = inputs.kv_cache
+    if fp8:
+        q = q.to(current_platform.fp8_dtype())
+        kv_cache = kv_cache.to(current_platform.fp8_dtype()).view(torch.uint8)
+    impl = _fa4_impl(
+        topk_indices_buffer=inputs.topk_indices,
+        kv_cache_dtype=kv_cache_dtype,
+        dcp_world_size=2,
+        pcp_world_size=pcp,
+        need_to_return_lse_for_decode=True,
+    )
+    dcp_filter = MagicMock(return_value=(inputs.topk_indices, inputs.valid_counts))
+    monkeypatch.setattr(sparse_mla, "triton_filter_and_convert_dcp_index", dcp_filter)
+    inputs.metadata.num_decode_tokens = num_decodes
+    layer = SimpleNamespace(_q_scale_float=1.0, _k_scale_float=1.0)
+
+    with torch.inference_mode():
+        out, lse = impl.forward_mqa(q, kv_cache, inputs.metadata, layer)
+
+    assert out.shape == (num_tokens, num_heads, 512)
+    assert out.dtype == torch.bfloat16
+    if pcp > 1:
+        # Gated off under PCP: one trtllm-gen call for the whole batch.
+        assert calls.fa4 == [] and len(calls.trtllm) == 1
+        return
+    (fa4,) = calls.fa4
+    (trtllm,) = calls.trtllm
+    assert fa4["q"].shape[0] == num_decodes
+    assert torch.equal(fa4["gather_kv_indices"], inputs.topk_indices[:num_decodes])
+    assert torch.equal(trtllm["block_tables"][:, 0], inputs.topk_indices[num_decodes:])
+    # Both lanes wrote straight into the one output buffer.
+    assert fa4["out"].data_ptr() == out.data_ptr()
+    assert trtllm["out"].data_ptr() == out[num_decodes:].data_ptr()
+    assert (out[:num_decodes] == 1.0).all() and (out[num_decodes:] == 2.0).all()
+    expected_lse = torch.cat(
+        (calls.lse(num_decodes), calls.lse(num_tokens - num_decodes) * math.log(2.0))
+    )
+    torch.testing.assert_close(lse, expected_lse, rtol=0, atol=1e-5)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.parametrize("return_lse", [False, True], ids=["tp", "dcp_lse"])
+@pytest.mark.parametrize("is_decode", [True, False], ids=["decode", "prefill"])
+def test_fa4_sparse_fp8_lanes(monkeypatch, is_decode, return_lse):
+    """Under an fp8 cache both lanes take the layer's fused fp8 query. FA4
+    decode folds q_scale * k_scale into softmax_scale and applies k_scale (the
+    V scale) to the output only, never to the LSE the DCP merge reads."""
+    num_heads, q_scale, k_scale = 16, 2.0, 3.0
+    fp8 = current_platform.fp8_dtype()
+    inputs = _fa4_inputs([1, 2, 3], num_heads=num_heads)
+    calls = _record_fa4_kernels(monkeypatch, num_heads, device=DEVICE_TYPE)
+    impl = _fa4_impl(
+        topk_indices_buffer=inputs.topk_indices,
+        kv_cache_dtype="fp8",
+        scale=inputs.scale,
+        need_to_return_lse_for_decode=return_lse,
+    )
+    layer = SimpleNamespace(
+        _q_scale_float=q_scale, _k_scale_float=k_scale, _v_scale_float=float("nan")
+    )
+    # vLLM allocates fp8 caches as uint8; FA4 views them as fp8.
+    kv_cache = inputs.kv_cache.to(fp8).view(torch.uint8)
+    q = (torch.cat((inputs.ql_nope, inputs.q_pe), dim=-1) / q_scale).to(fp8)
+
+    with torch.inference_mode():
+        out, lse = impl._forward_mqa_kernel(
+            q,
+            kv_cache,
+            inputs.topk_indices,
+            inputs.valid_counts,
+            layer=layer,
+            block_size=inputs.block_size,
+            is_decode=is_decode,
+        )
+
+    rows = q.shape[0]
+    if not return_lse:
+        assert lse is None
+    elif is_decode:
+        torch.testing.assert_close(lse, calls.lse(rows), rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(
+            lse, calls.lse(rows) * math.log(2.0), rtol=0, atol=1e-5
+        )
+    if is_decode:
+        (fa4,) = calls.fa4
+        assert calls.trtllm == []
+        assert fa4["q"].dtype == fa4["q_v"].dtype == fp8
+        assert fa4["k"].dtype == fa4["v"].dtype == fp8
+        assert fa4["softmax_scale"] == pytest.approx(inputs.scale * q_scale * k_scale)
+        assert (out == k_scale).all()
+    else:
+        (trtllm,) = calls.trtllm
+        assert calls.fa4 == []
+        assert trtllm["query"].squeeze(1).data_ptr() == q.data_ptr()
+        assert trtllm["bmm1_scale"] == pytest.approx(inputs.scale * q_scale * k_scale)
+        assert trtllm["bmm2_scale"] == k_scale
+        assert (out == 2.0).all()
+
+
 @pytest.mark.parametrize(
     "config,expected",
     [
@@ -4200,6 +4371,9 @@ def test_fa4_sparse_hook_routes_lanes(monkeypatch, is_decode):
         ({"index_topk": 192}, "index_topk"),
         ({"rope": 32}, "(kv_lora_rank, qk_rope_head_dim)"),
         ({"flashinfer": False}, "FlashInfer"),
+        ({"kv": "fp8"}, None),
+        ({"kv": "fp8_e4m3", "dcp": 4}, None),
+        ({"kv": "fp8_e4m3", "heads": 128}, "fp8 KV"),
     ],
 )
 def test_fa4_sparse_gate(monkeypatch, config, expected):
@@ -4219,7 +4393,7 @@ def test_fa4_sparse_gate(monkeypatch, config, expected):
         reasons = FlashAttnMLASparseFA4Backend.validate_configuration(
             head_size=576,
             dtype=torch.bfloat16,
-            kv_cache_dtype="auto",
+            kv_cache_dtype=config.get("kv", "auto"),
             block_size=64,
             use_mla=True,
             has_sink=False,

@@ -99,7 +99,8 @@ def _get_backend_priorities(
             # See https://github.com/vllm-project/vllm/issues/35807 for
             # benchmark results
             if kv_cache_dtype is not None and is_quantized_kv_cache(kv_cache_dtype):
-                # Prefer FlashInfer for fp8 kv cache
+                # Prefer FlashInfer for fp8 kv cache. FA4 (fp8, <= 64 gathered
+                # heads) is selected only through the attention backend override.
                 sparse_backends = [
                     AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
                     AttentionBackendEnum.FLASHMLA_SPARSE,

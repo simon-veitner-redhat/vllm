@@ -488,6 +488,10 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # for query and kv_cache (mixed bf16+fp8 is not supported).
         self.supports_quant_query_input = True
 
+    def _mqa_out_dtype(self) -> torch.dtype:
+        # trtllm-gen MLA (and FA4 on the decode lane) write a bf16 latent.
+        return torch.bfloat16
+
     def _prepare_mqa_kernel(
         self,
         layer: AttentionLayer,
@@ -565,6 +569,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         layer: AttentionLayer,
         block_size: int,
         is_decode: bool,
+        out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if isinstance(q, tuple):
             ql_nope, q_pe = q
@@ -631,6 +636,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             bmm1_scale=self.bmm1_scale,
             bmm2_scale=self.bmm2_scale,
             sparse_mla_top_k=sparse_topk_capacity,
+            out=None if out is None else out.unsqueeze(1),
             return_lse=self.need_to_return_lse_for_decode,
             **extra_kwargs,
         )
