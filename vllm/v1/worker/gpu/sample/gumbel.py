@@ -170,14 +170,18 @@ def _log1p_neg_stable(value):
 
 @triton.jit
 def gumbel_noise(seed, pos, keys, USE_FP64: tl.constexpr):
+    # A single return: Triton checks every `return` against the others even in
+    # the branch a constexpr removes, and the two branches differ in dtype.
     if USE_FP64:
         u = murmur3_uniform64(seed, pos, keys)
-        return -tl.log(-tl.log(u))
-    u = murmur3_uniform32(seed, pos, keys)
-    # Draw the large-noise tail (which decides the argmax winner) from
-    # u -> 0, where fp32 has fine resolution. Avoid backend-specific
-    # log1p while preserving precision in the winning tail.
-    return -tl.log(-_log1p_neg_stable(u))
+        noise = -tl.log(-tl.log(u))
+    else:
+        u = murmur3_uniform32(seed, pos, keys)
+        # Draw the large-noise tail (which decides the argmax winner) from
+        # u -> 0, where fp32 has fine resolution. Avoid backend-specific
+        # log1p while preserving precision in the winning tail.
+        noise = -tl.log(-_log1p_neg_stable(u))
+    return noise
 
 
 @triton.jit

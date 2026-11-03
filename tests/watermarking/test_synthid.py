@@ -412,6 +412,7 @@ def test_synthid_fused_skipped_rows_share_gumbel_noise(use_fp64):
         random_sampler.seeds,
         random_sampler.positions,
         apply_temperature=False,
+        is_drafting=False,
         use_fp64=use_fp64,
     )
     assert torch.equal(actual, expected)
