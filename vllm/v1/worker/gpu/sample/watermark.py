@@ -473,7 +473,7 @@ def _uint32_to_uniform(value):
 
 
 @triton.jit
-def _philox_context_state(
+def philox_context_state(
     contexts_row_ptr,
     key_0,
     key_1,
@@ -509,7 +509,7 @@ def _philox_context_state(
 
 
 @triton.jit
-def _philox_candidate_words(groups, state_0, state_1, state_2, state_3, key_0, key_1):
+def philox_candidate_words(groups, state_0, state_1, state_2, state_3, key_0, key_1):
     candidate_words = groups.to(tl.uint32)
     vector_zero = candidate_words * 0
     return _philox4x32_10(
@@ -550,11 +550,11 @@ def philox_gumbel_block_argmax(
 ):
     """Apply the detector-compatible PRF to one vocabulary block."""
     tl.static_assert(BLOCK_SIZE % 4 == 0)
-    state_0, state_1, state_2, state_3 = _philox_context_state(
+    state_0, state_1, state_2, state_3 = philox_context_state(
         contexts_row_ptr, key_0, key_1, CONTEXT_WIDTH
     )
     groups = block_idx * (BLOCK_SIZE // 4) + tl.arange(0, BLOCK_SIZE // 4)
-    output_0, output_1, output_2, output_3 = _philox_candidate_words(
+    output_0, output_1, output_2, output_3 = philox_candidate_words(
         groups, state_0, state_1, state_2, state_3, key_0, key_1
     )
     # Lay the per-group words out in token order: 4g+0, 4g+1, 4g+2, 4g+3.
@@ -683,10 +683,10 @@ def _philox_gumbel_kernel(
 
     key_0 = key_0_value.to(tl.uint32)
     key_1 = key_1_value.to(tl.uint32)
-    state_0, state_1, state_2, state_3 = _philox_context_state(
+    state_0, state_1, state_2, state_3 = philox_context_state(
         contexts_ptr + row * context_stride, key_0, key_1, CONTEXT_WIDTH
     )
-    output_0, output_1, output_2, output_3 = _philox_candidate_words(
+    output_0, output_1, output_2, output_3 = philox_candidate_words(
         groups, state_0, state_1, state_2, state_3, key_0, key_1
     )
     candidate_0 = groups * 4
@@ -1087,6 +1087,27 @@ def _watermark_contexts_kernel(
     tl.store(contexts_ptr + row * CONTEXT_WIDTH + offsets, tokens, mask=in_context)
 
 
+def _watermark_contexts_torch(
+    expanded_idx_mapping: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    prompt_len: torch.Tensor,
+    total_len: torch.Tensor,
+    context_width: int,
+) -> torch.Tensor:
+    req_indices = expanded_idx_mapping.to(torch.int64)
+    safe_req_indices = req_indices.clamp_min(0)
+    total_lens = total_len[safe_req_indices].to(torch.int64).unsqueeze(-1)
+    prompt_lens = prompt_len[safe_req_indices].to(torch.int64).unsqueeze(-1)
+    positions = total_lens + torch.arange(
+        -context_width, 0, dtype=torch.int64, device=req_indices.device
+    )
+    valid = (req_indices >= 0).unsqueeze(-1) & (positions >= prompt_lens)
+    tokens = all_token_ids[
+        safe_req_indices.unsqueeze(-1), positions.clamp(0, all_token_ids.shape[1] - 1)
+    ]
+    return torch.where(valid, tokens, -1)
+
+
 def watermark_contexts(
     expanded_idx_mapping: torch.Tensor,
     all_token_ids: torch.Tensor,
@@ -1095,6 +1116,10 @@ def watermark_contexts(
     context_width: int,
 ) -> torch.Tensor:
     """Last `context_width` generated tokens of each row's request, -1 padded."""
+    if all_token_ids.device.type == "cpu":
+        return _watermark_contexts_torch(
+            expanded_idx_mapping, all_token_ids, prompt_len, total_len, context_width
+        )
     num_rows = expanded_idx_mapping.shape[0]
     contexts = all_token_ids.new_empty(num_rows, context_width)
     if num_rows == 0:
@@ -1120,8 +1145,11 @@ def _watermark_skip_mask_kernel(
     watermarking_ptr,
     temperature_ptr,
     repeated_ptr,
+    contexts_ptr,
+    contexts_stride,
     num_rows,
     HAS_REPEATED: tl.constexpr,
+    CONTEXT_WIDTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     rows = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -1132,6 +1160,11 @@ def _watermark_skip_mask_kernel(
     watermarking &= tl.load(temperature_ptr + req_idx, mask=valid, other=0.0) != 0.0
     if HAS_REPEATED:
         watermarking &= tl.load(repeated_ptr + rows, mask=mask, other=0) == 0
+    for i in tl.static_range(CONTEXT_WIDTH):
+        context_token = tl.load(
+            contexts_ptr + rows * contexts_stride + i, mask=mask, other=0
+        )
+        watermarking &= context_token >= 0
     tl.store(skip_ptr + rows, ~watermarking, mask=mask)
 
 
@@ -1140,8 +1173,12 @@ def watermark_skip_mask(
     watermarking: torch.Tensor,
     temperature: torch.Tensor,
     repeated_contexts: torch.Tensor | None,
+    contexts: torch.Tensor,
 ) -> torch.Tensor:
-    """Rows to sample without the watermark: opted out, greedy, or repeated."""
+    """Rows to sample without the watermark.
+
+    Opted out, greedy, repeated, or with an incomplete (-1 padded) context.
+    """
     if watermarking.device.type == "cpu":
         req_indices = expanded_idx_mapping.to(torch.int64)
         safe_req_indices = req_indices.clamp_min(0)
@@ -1149,6 +1186,7 @@ def watermark_skip_mask(
             (req_indices >= 0)
             & watermarking[safe_req_indices].to(torch.bool)
             & (temperature[safe_req_indices] != 0)
+            & (contexts >= 0).all(dim=-1)
         )
         if repeated_contexts is not None:
             apply &= ~repeated_contexts
@@ -1162,8 +1200,11 @@ def watermark_skip_mask(
         watermarking,
         temperature,
         repeated_contexts,
+        contexts,
+        contexts.stride(0),
         num_rows,
         HAS_REPEATED=repeated_contexts is not None,
+        CONTEXT_WIDTH=contexts.shape[1],
         BLOCK_SIZE=block_size,
     )
     return skip_mask

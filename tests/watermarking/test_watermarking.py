@@ -1968,30 +1968,98 @@ def test_dspark_target_only_watermarking_leaves_drafts_unwatermarked(monkeypatch
     assert torch.equal(sampled, torch.tensor([3, 4]))
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
-def test_watermark_context_and_skip_kernels_match_torch():
-    """The CUDA sampler builds contexts and skip masks in kernels."""
-    all_token_ids = torch.arange(40, dtype=torch.int32, device="cuda").view(4, 10)
-    prompt_len = torch.tensor([2, 8, 0, 5], dtype=torch.int32, device="cuda")
-    total_len = torch.tensor([7, 9, 10, 5], dtype=torch.int32, device="cuda")
-    expanded_idx_mapping = torch.tensor([3, 0, -1, 1, 2], device="cuda").int()
+def _reference_contexts(mapping, all_token_ids, prompt_len, total_len, width):
+    contexts = []
+    for request in mapping:
+        context = [-1] * width
+        if request >= 0:
+            for i in range(width):
+                position = total_len[request] - width + i
+                if position >= prompt_len[request]:
+                    context[i] = all_token_ids[request][position]
+        contexts.append(context)
+    return contexts
 
-    contexts = watermark_contexts(
-        expanded_idx_mapping, all_token_ids, prompt_len, total_len, 3
-    )
 
-    assert contexts.tolist() == [
-        [-1, -1, -1],
-        [4, 5, 6],
-        [-1, -1, -1],
-        [-1, -1, 18],
-        [27, 28, 29],
+def _reference_skip_mask(mapping, watermarking, temperature, repeated, contexts):
+    return [
+        request < 0
+        or not watermarking[request]
+        or temperature[request] == 0
+        or (repeated is not None and repeated[row])
+        or any(token < 0 for token in contexts[row])
+        for row, request in enumerate(mapping)
     ]
 
-    watermarking = torch.tensor([True, False, True, True], device="cuda")
-    temperature = torch.tensor([1.0, 1.0, 0.0, 0.5], device="cuda")
-    repeated = torch.tensor([True, False, False, False, False], device="cuda")
-    skip_mask = watermark_skip_mask(
-        expanded_idx_mapping, watermarking, temperature, repeated
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not current_platform.is_cuda(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("context_width", [1, 3, 4])
+def test_watermark_context_and_skip_mask_match_reference(device, context_width):
+    generator = torch.Generator().manual_seed(context_width)
+    num_requests, max_len, num_rows = 6, 12, 40
+    all_token_ids = torch.randint(0, 1000, (num_requests, max_len), generator=generator)
+    prompt_len = torch.randint(0, 8, (num_requests,), generator=generator)
+    total_len = torch.minimum(
+        prompt_len + torch.randint(0, 5, (num_requests,), generator=generator),
+        torch.tensor(max_len),
     )
-    assert skip_mask.tolist() == [True, False, True, True, True]
+    mapping = torch.randint(-1, num_requests, (num_rows,), generator=generator)
+    watermarking = torch.rand(num_requests, generator=generator) < 0.7
+    temperature = torch.tensor([0.0, 0.5, 1.0, 1.0, 0.0, 2.0])
+    repeated = torch.rand(num_rows, generator=generator) < 0.2
+
+    expected_contexts = _reference_contexts(
+        mapping.tolist(),
+        all_token_ids.tolist(),
+        prompt_len.tolist(),
+        total_len.tolist(),
+        context_width,
+    )
+    expected_skip = _reference_skip_mask(
+        mapping.tolist(),
+        watermarking.tolist(),
+        temperature.tolist(),
+        repeated.tolist(),
+        expected_contexts,
+    )
+    expected_skip_without_repeated = _reference_skip_mask(
+        mapping.tolist(),
+        watermarking.tolist(),
+        temperature.tolist(),
+        None,
+        expected_contexts,
+    )
+
+    mapping = mapping.int().to(device)
+    contexts = watermark_contexts(
+        mapping,
+        all_token_ids.int().to(device),
+        prompt_len.int().to(device),
+        total_len.int().to(device),
+        context_width,
+    )
+    skip_mask = watermark_skip_mask(
+        mapping,
+        watermarking.to(device),
+        temperature.to(device),
+        repeated.to(device),
+        contexts,
+    )
+    skip_mask_without_repeated = watermark_skip_mask(
+        mapping, watermarking.to(device), temperature.to(device), None, contexts
+    )
+
+    assert contexts.tolist() == expected_contexts
+    assert skip_mask.tolist() == expected_skip
+    assert skip_mask_without_repeated.tolist() == expected_skip_without_repeated

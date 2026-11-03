@@ -23,7 +23,7 @@ from vllm.v1.watermarking.factory import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import create_speculative_target_watermarker
 from vllm.v1.watermarking.synthid import _STREAM_DOMAIN as SYNTHID_STREAM
-from vllm.v1.watermarking.watermarker import RandomSampler, WatermarkSample
+from vllm.v1.watermarking.watermarker import WatermarkSample
 
 MASTER_KEY = 20250910
 KEY_A = derive_watermark_key(MASTER_KEY, b"key_a")
@@ -135,7 +135,7 @@ def _capture_synthid_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
         )
         return torch.zeros(logits.shape[0], dtype=torch.int64, device=logits.device)
 
-    monkeypatch.setattr("vllm.v1.watermarking.synthid.is_supported", lambda _: True)
+    monkeypatch.setattr("vllm.v1.watermarking.synthid.is_supported", lambda: True)
     monkeypatch.setattr(
         "vllm.v1.watermarking.synthid.synthid_sample", fake_synthid_sample
     )
@@ -282,53 +282,6 @@ def test_warmup_failure_does_not_abort_startup(
     assert "Skipping watermark sampler warmup." in caplog.text
 
 
-def test_failed_fused_synthid_kernel_falls_back_to_torch(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    fused_calls = []
-
-    def failing_synthid_sample(*args, **kwargs):
-        fused_calls.append(kwargs)
-        raise RuntimeError("kernel failed to compile")
-
-    torch_samples = []
-
-    def torch_random_sample(self, logits):
-        torch_samples.append(logits)
-        return torch.zeros(logits.shape[0], dtype=torch.int64)
-
-    monkeypatch.setattr("vllm.v1.watermarking.synthid.is_supported", lambda _: True)
-    monkeypatch.setattr(
-        "vllm.v1.watermarking.synthid.synthid_sample", failing_synthid_sample
-    )
-    monkeypatch.setattr(RandomSampler, "__call__", torch_random_sample)
-    worker = _worker(
-        WatermarkConfig(key=MASTER_KEY, algorithm="synthid_text", context_width=3)
-    )
-    watermarker = worker.model_runner.sampler.watermarker
-    assert watermarker.uses_fused_kernels(worker.device)
-
-    with caplog.at_level(logging.WARNING):
-        watermark_sample_warmup(worker)
-
-    assert len(fused_calls) == 1
-    assert caplog.text.count("fused SynthID-Text kernels failed") == 1
-    assert "Skipping watermark sampler warmup." not in caplog.text
-    assert not watermarker.uses_fused_kernels(worker.device)
-    assert len(torch_samples) == 2
-
-    logits = torch.zeros(1, 128)
-    contexts = torch.zeros(1, 3, dtype=torch.int32)
-    random_sampler = RandomSampler(
-        expanded_idx_mapping=torch.zeros(1, dtype=torch.int64),
-        temperatures=torch.ones(1),
-        seeds=torch.zeros(1, dtype=torch.int64),
-        positions=torch.zeros(1, dtype=torch.int64),
-    )
-    watermarker.sample(logits, contexts, random_sampler)
-    assert len(fused_calls) == 1
-
-
 @requires_cuda
 def test_single_key_warms_both_logits_dtypes(
     monkeypatch: pytest.MonkeyPatch,
@@ -456,7 +409,6 @@ def test_use_fp64_follows_the_path_that_forwards_it(
         assert call.get("use_fp64", False) is (call.get("skip_mask") is not None)
 
 
-@requires_cuda
 @pytest.mark.parametrize(
     "deduplicate_contexts,skip_masks",
     [("single_turn", {True}), ("none", {True, False})],
@@ -482,8 +434,7 @@ def test_synthid_warms_every_reachable_specialization(
                 context_width=3,
                 depth=24,
                 deduplicate_contexts=deduplicate_contexts,
-            ),
-            device="cuda",
+            )
         )
     )
 

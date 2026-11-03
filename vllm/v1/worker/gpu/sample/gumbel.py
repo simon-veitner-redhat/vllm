@@ -169,6 +169,18 @@ def _log1p_neg_stable(value):
 
 
 @triton.jit
+def gumbel_noise(seed, pos, keys, USE_FP64: tl.constexpr):
+    if USE_FP64:
+        u = murmur3_uniform64(seed, pos, keys)
+        return -tl.log(-tl.log(u))
+    u = murmur3_uniform32(seed, pos, keys)
+    # Draw the large-noise tail (which decides the argmax winner) from
+    # u -> 0, where fp32 has fine resolution. Avoid backend-specific
+    # log1p while preserving precision in the winning tail.
+    return -tl.log(-_log1p_neg_stable(u))
+
+
+@triton.jit
 def gumbel_noised_argmax(
     logits,
     keys,
@@ -198,16 +210,8 @@ def gumbel_noised_argmax(
     if temp != 0.0:
         if IS_DRAFTING:
             pos = pos + _DRAFT_NOISE_SALT
-        if USE_FP64:
-            u = murmur3_uniform64(seed, pos, keys)
-            gumbel_noise = -tl.log(-tl.log(u))
-        else:
-            u = murmur3_uniform32(seed, pos, keys)
-            # Draw the large-noise tail (which decides the argmax winner) from
-            # u -> 0, where fp32 has fine resolution. Avoid backend-specific
-            # log1p while preserving precision in the winning tail.
-            gumbel_noise = -tl.log(-_log1p_neg_stable(u))
-        logits = tl.where(mask, logits + gumbel_noise, float("-inf"))
+        noise = gumbel_noise(seed, pos, keys, USE_FP64)
+        logits = tl.where(mask, logits + noise, float("-inf"))
 
     return tl.max(logits, axis=0, return_indices=True)
 

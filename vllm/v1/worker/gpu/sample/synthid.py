@@ -7,30 +7,30 @@ that chunk, so the chunk's layers can run on a 2**CHUNK_BITS-bucket histogram
 of the mass reweighted by the earlier chunks. A depth-32 tournament takes
 three vocabulary passes, each building one histogram into a table of
 per-bucket log multipliers. A last pass adds the tables to the logits and
-either samples with Gumbel-max or writes the watermarked logits.
+samples with Gumbel-max.
 """
 
 import functools
-from typing import NamedTuple
 
 import torch
 
-from vllm.triton_utils import HAS_TRITON, tl, triton
-from vllm.v1.watermarking.prfs.philox import _UINT32_MASK as _UINT32_MASK_VALUE
-from vllm.v1.worker.gpu.sample.gumbel import (
-    _log1p_neg_stable,
-    murmur3_uniform32,
-    murmur3_uniform64,
-)
+from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON, gl, gluon, tl, triton
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_noise
 from vllm.v1.worker.gpu.sample.watermark import (
-    _philox_candidate_words,
-    _philox_context_state,
+    philox_candidate_words,
+    philox_context_state,
 )
+
+_UINT32_MASK = 0xFFFFFFFF
 
 _MAX_CHUNK_BITS = 11
 _MAX_CHUNKS = 3
 # One counter per chunk's histogram pass plus one for the last pass.
 _NUM_COUNTERS = _MAX_CHUNKS + 1
+_CONSUME_WARPS = 8
+# The last program reduces the splits in a single block of one lane each.
+_MAX_SPLITS = 32 * _CONSUME_WARPS
 _PROGRAMS_PER_SM = 4
 # One Philox call yields the words of 4 consecutive tokens.
 _HIST_GROUPS = 512
@@ -39,22 +39,16 @@ _HIST_TILE = 4 * _HIST_GROUPS
 # program cannot overflow its uint32 bins.
 _HIST_MAX_TOKENS = (1 << 16) - 1
 
-try:
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
 
-    HAS_GLUON = HAS_TRITON
-except ImportError:
-    HAS_GLUON = False
+def is_supported() -> bool:
+    """Validated on H100 (sm90); expected to work on sm80 and newer.
 
-
-@functools.cache
-def is_supported(device: torch.device) -> bool:
-    """Validated on H100 (sm90); expected to work on sm80 and newer."""
+    The layouts assume 32-thread warps, so ROCm takes the torch path.
+    """
     return (
-        HAS_GLUON
-        and device.type == "cuda"
-        and torch.cuda.get_device_capability(device) >= (8, 0)
+        HAS_TRITON
+        and current_platform.is_cuda()
+        and current_platform.has_device_capability(80)
     )
 
 
@@ -71,7 +65,7 @@ def _synthid_prepare_kernel(
 ):
     """Hash each row's context once and zero its ticket counters."""
     row = tl.program_id(0).to(tl.int64)
-    state_0, state_1, state_2, state_3 = _philox_context_state(
+    state_0, state_1, state_2, state_3 = philox_context_state(
         contexts_ptr + row * context_stride,
         key_0_value.to(tl.uint32),
         key_1_value.to(tl.uint32),
@@ -85,13 +79,14 @@ def _synthid_prepare_kernel(
     tl.store(counters_ptr + row * NUM_COUNTERS + counters, 0)
 
 
-if HAS_GLUON:
+if HAS_TRITON:
 
     @gluon.jit
     def _load_shared_table(
         log_tables_ptr,
         row,
         chunk: gl.constexpr,
+        active,
         NUM_CHUNKS: gl.constexpr,
         NUM_BINS: gl.constexpr,
         layout: gl.constexpr,
@@ -102,7 +97,11 @@ if HAS_GLUON:
             gl.float32,
             [NUM_BINS],
             shared_layout,
-            gl.load(log_tables_ptr + (row * NUM_CHUNKS + chunk) * NUM_BINS + bins),
+            gl.load(
+                log_tables_ptr + (row * NUM_CHUNKS + chunk) * NUM_BINS + bins,
+                mask=(bins >= 0) & active,
+                other=0.0,
+            ),
         )
 
     @gluon.jit
@@ -219,7 +218,7 @@ if HAS_GLUON:
         groups = tile * GROUPS + gl.arange(
             0, GROUPS, layout=gl.SliceLayout(1, group_layout)
         )
-        word_0, word_1, word_2, word_3 = _philox_candidate_words(
+        word_0, word_1, word_2, word_3 = philox_candidate_words(
             groups, state_0, state_1, state_2, state_3, key_0, key_1
         )
         word_idx = gl.expand_dims(
@@ -273,7 +272,7 @@ if HAS_GLUON:
         partial_max_ptr,  # [B, num_splits]
         log_tables_ptr,  # [B, NUM_CHUNKS, 2**CHUNK_BITS]
         row_offset_ptr,  # [B]
-        counters_ptr,  # [B, _NUM_COUNTERS]
+        counters_ptr,  # [B, NUM_COUNTERS]
         states_ptr,  # [B, 4]
         logits_ptr,
         logits_stride,
@@ -286,6 +285,7 @@ if HAS_GLUON:
         tiles_per_split,
         DEPTH: gl.constexpr,
         NUM_CHUNKS: gl.constexpr,
+        NUM_COUNTERS: gl.constexpr,
         CHUNK_BITS: gl.constexpr,
         CHUNK: gl.constexpr,
         HAS_SKIP: gl.constexpr,
@@ -298,7 +298,7 @@ if HAS_GLUON:
         where the offset keeps every token's mass in [0, 1]: the running max
         of the split for chunk 0, else the row's log-normalizer. Bins
         accumulate it as 48-bit fixed point in three uint32 shared-memory
-        words, as Hopper has native integer but not float shared atomics.
+        words, as integer adds give a deterministic sum.
         The row's last program to finish runs the chunk's layers.
         """
         row = gl.program_id(0).to(gl.int64)
@@ -326,11 +326,25 @@ if HAS_GLUON:
             )
             if CHUNK >= 1:
                 table_0 = _load_shared_table(
-                    log_tables_ptr, row, 0, NUM_CHUNKS, NUM_BINS, layout, shared_layout
+                    log_tables_ptr,
+                    row,
+                    0,
+                    True,
+                    NUM_CHUNKS,
+                    NUM_BINS,
+                    layout,
+                    shared_layout,
                 )
             if CHUNK >= 2:
                 table_1 = _load_shared_table(
-                    log_tables_ptr, row, 1, NUM_CHUNKS, NUM_BINS, layout, shared_layout
+                    log_tables_ptr,
+                    row,
+                    1,
+                    True,
+                    NUM_CHUNKS,
+                    NUM_BINS,
+                    layout,
+                    shared_layout,
                 )
             offset = float("-inf") if CHUNK == 0 else gl.load(row_offset_ptr + row)
 
@@ -406,7 +420,7 @@ if HAS_GLUON:
             )
             if CHUNK == 0:
                 gl.store(partial_max_ptr + row * num_splits + split, offset)
-            if _is_last_program(counters_ptr + row * 4 + CHUNK, num_splits):
+            if _is_last_program(counters_ptr + row * NUM_COUNTERS + CHUNK, num_splits):
                 _build_table(
                     partial_ptr,
                     partial_max_ptr,
@@ -432,13 +446,11 @@ if HAS_GLUON:
         ]
     )
     def _synthid_consume_kernel(
-        out_ptr,  # [B] sampled tokens if SAMPLE, else [B, V] fp32 logits
-        out_stride,
+        sampled_ptr,  # [B]
         split_argmax_ptr,  # [B, num_splits]
         split_max_ptr,  # [B, num_splits]
-        counters_ptr,  # [B, _NUM_COUNTERS]
+        counters_ptr,  # [B, NUM_COUNTERS]
         log_tables_ptr,  # [B, NUM_CHUNKS, 2**CHUNK_BITS]
-        row_offset_ptr,  # [B]
         states_ptr,  # [B, 4]
         logits_ptr,
         logits_stride,
@@ -454,17 +466,16 @@ if HAS_GLUON:
         vocab_size,
         tiles_per_split,
         NUM_CHUNKS: gl.constexpr,
+        NUM_COUNTERS: gl.constexpr,
         CHUNK_BITS: gl.constexpr,
         HAS_SKIP: gl.constexpr,
-        SAMPLE: gl.constexpr,
         USE_FP64: gl.constexpr,
         GROUPS: gl.constexpr,
         num_warps: gl.constexpr,
     ):
-        """Add the tables to one split of a row's logits.
+        """Add the tables to one split of a row's logits and Gumbel-max it.
 
-        Sampling takes the Gumbel-max over the split, and the row's last
-        program reduces the splits. Otherwise the log-probs are written.
+        The row's last program to finish reduces the splits.
         """
         row = gl.program_id(0).to(gl.int64)
         split = gl.program_id(1)
@@ -477,15 +488,36 @@ if HAS_GLUON:
         if HAS_SKIP:
             watermark = gl.load(skip_ptr + row) == 0
         table_0 = _load_shared_table(
-            log_tables_ptr, row, 0, NUM_CHUNKS, NUM_BINS, layout, shared_layout
+            log_tables_ptr,
+            row,
+            0,
+            watermark,
+            NUM_CHUNKS,
+            NUM_BINS,
+            layout,
+            shared_layout,
         )
         if NUM_CHUNKS >= 2:
             table_1 = _load_shared_table(
-                log_tables_ptr, row, 1, NUM_CHUNKS, NUM_BINS, layout, shared_layout
+                log_tables_ptr,
+                row,
+                1,
+                watermark,
+                NUM_CHUNKS,
+                NUM_BINS,
+                layout,
+                shared_layout,
             )
         if NUM_CHUNKS >= 3:
             table_2 = _load_shared_table(
-                log_tables_ptr, row, 2, NUM_CHUNKS, NUM_BINS, layout, shared_layout
+                log_tables_ptr,
+                row,
+                2,
+                watermark,
+                NUM_CHUNKS,
+                NUM_BINS,
+                layout,
+                shared_layout,
             )
         gl.barrier()
 
@@ -496,18 +528,15 @@ if HAS_GLUON:
             stream_0.to(gl.uint32),
             stream_1.to(gl.uint32),
         )
-        if SAMPLE:
-            req_state_idx = gl.load(expanded_idx_mapping_ptr + row).to(gl.int64)
-            is_valid_req = req_state_idx >= 0
-            temp = gl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0)
-            seed = gl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
-            pos = gl.load(pos_ptr + row)
-            best_value = gl.full(
-                (), float("-inf"), gl.float64 if USE_FP64 else gl.float32, layout=None
-            )
-            best_token = gl.full((), 0, gl.int64, layout=None)
-        else:
-            row_offset = gl.load(row_offset_ptr + row)
+        req_state_idx = gl.load(expanded_idx_mapping_ptr + row).to(gl.int64)
+        is_valid_req = req_state_idx >= 0
+        temp = gl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0)
+        seed = gl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
+        pos = gl.load(pos_ptr + row)
+        best_value = gl.full(
+            (), float("-inf"), gl.float64 if USE_FP64 else gl.float32, layout=None
+        )
+        best_token = gl.full((), 0, gl.int64, layout=None)
         for tile_offset in range(tiles_per_split):
             tile = split * tiles_per_split + tile_offset
             candidate = tile * (4 * GROUPS) + gl.arange(0, 4 * GROUPS, layout=layout)
@@ -530,10 +559,7 @@ if HAS_GLUON:
                         GROUPS,
                         layout,
                     )
-                    watermarked = logits
-                    if not SAMPLE:
-                        watermarked -= row_offset
-                    watermarked += table_0.gather(
+                    watermarked = logits + table_0.gather(
                         (words & BIN_MASK).to(gl.int32), axis=0
                     )
                     if NUM_CHUNKS >= 2:
@@ -551,167 +577,53 @@ if HAS_GLUON:
                         -3.4028234663852886e38,
                         watermarked,
                     )
-                if SAMPLE:
-                    # Same noise as `gumbel_noised_argmax`, whose indexed max
-                    # Gluon lacks.
-                    scores = logits.to(gl.float64) if USE_FP64 else logits
-                    if temp != 0.0:
-                        if USE_FP64:
-                            uniform = murmur3_uniform64(seed, pos, candidate)
-                            noise = -gl.log(-gl.log(uniform))
-                        else:
-                            uniform = murmur3_uniform32(seed, pos, candidate)
-                            noise = -gl.log(-_log1p_neg_stable(uniform))
-                        scores = gl.where(mask, scores + noise, float("-inf"))
-                    value = gl.max(scores, axis=0)
-                    token = gl.min(
-                        gl.where(scores == value, candidate, vocab_size), axis=0
-                    )
-                    # Strictly greater keeps the lowest token on ties, as an
-                    # argmax over the whole row does.
-                    if value > best_value:
-                        best_value = value
-                        best_token = token.to(gl.int64)
-            if not SAMPLE:
-                gl.store(out_ptr + row * out_stride + candidate, logits, mask=mask)
-        if SAMPLE:
-            gl.store(split_argmax_ptr + row * num_splits + split, best_token)
-            gl.store(split_max_ptr + row * num_splits + split, best_value)
-            if _is_last_program(counters_ptr + row * 4 + 3, num_splits):
-                # Splits are in token order: the first maximal split holds the
-                # lowest maximal token.
-                SPLIT_BLOCK: gl.constexpr = 32 * num_warps
-                split_layout: gl.constexpr = gl.BlockedLayout(
-                    [1], [32], [num_warps], [0]
-                )
-                splits = gl.arange(0, SPLIT_BLOCK, layout=split_layout)
-                for start in range(0, num_splits, SPLIT_BLOCK):
-                    split_mask = start + splits < num_splits
-                    values = gl.load(
-                        split_max_ptr + row * num_splits + start + splits,
-                        mask=split_mask,
-                        other=float("-inf"),
-                        cache_modifier=".cg",
-                    )
-                    tokens = gl.load(
-                        split_argmax_ptr + row * num_splits + start + splits,
-                        mask=split_mask,
-                        other=0,
-                        cache_modifier=".cg",
-                    )
-                    value = gl.max(values, axis=0)
-                    if (value > best_value) | (start == 0):
-                        first = gl.min(
-                            gl.where(values == value, splits, SPLIT_BLOCK), axis=0
-                        )
-                        best_value = value
-                        best_token = gl.sum(
-                            gl.where(splits == first, tokens, 0), axis=0
-                        )
-                gl.store(out_ptr + row, best_token)
+                # The same noise as `gumbel_noised_argmax`, whose indexed max
+                # Gluon lacks.
+                scores = logits.to(gl.float64) if USE_FP64 else logits
+                if temp != 0.0:
+                    noise = gumbel_noise(seed, pos, candidate, USE_FP64)
+                    scores = gl.where(mask, scores + noise, float("-inf"))
+                value = gl.max(scores, axis=0)
+                token = gl.min(gl.where(scores == value, candidate, vocab_size), axis=0)
+                # Strictly greater keeps the lowest token on ties, as an
+                # argmax over the whole row does.
+                if value > best_value:
+                    best_value = value
+                    best_token = token.to(gl.int64)
+        gl.store(split_argmax_ptr + row * num_splits + split, best_token)
+        gl.store(split_max_ptr + row * num_splits + split, best_value)
+        if _is_last_program(
+            counters_ptr + row * NUM_COUNTERS + NUM_COUNTERS - 1, num_splits
+        ):
+            # Splits are in token order: the first maximal split holds the
+            # lowest maximal token.
+            SPLIT_BLOCK: gl.constexpr = 32 * num_warps
+            split_layout: gl.constexpr = gl.BlockedLayout([1], [32], [num_warps], [0])
+            splits = gl.arange(0, SPLIT_BLOCK, layout=split_layout)
+            split_mask = splits < num_splits
+            values = gl.load(
+                split_max_ptr + row * num_splits + splits,
+                mask=split_mask,
+                other=float("-inf"),
+                cache_modifier=".cg",
+            )
+            tokens = gl.load(
+                split_argmax_ptr + row * num_splits + splits,
+                mask=split_mask,
+                other=0,
+                cache_modifier=".cg",
+            )
+            first = gl.min(
+                gl.where(values == gl.max(values, axis=0), splits, SPLIT_BLOCK), axis=0
+            )
+            gl.store(
+                sampled_ptr + row, gl.sum(gl.where(splits == first, tokens, 0), axis=0)
+            )
 
 
 @functools.cache
 def _num_sms(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
-
-
-class _Tables(NamedTuple):
-    grid: tuple[int, int]
-    log_tables: torch.Tensor
-    row_offset: torch.Tensor
-    states: torch.Tensor
-    counters: torch.Tensor
-    args: tuple[int, ...]
-    constexprs: dict[str, int | bool]
-
-
-def _build_tables(
-    logits: torch.Tensor,
-    contexts: torch.Tensor,
-    key: int,
-    depth: int,
-    stream: int,
-    skip_mask: torch.Tensor | None,
-) -> _Tables:
-    """Build the per-row tables of log multipliers, one per chunk of layers.
-
-    Returns the launch arguments the final pass shares with the histograms.
-    """
-    assert 1 <= depth <= 32
-    num_chunks = triton.cdiv(depth, _MAX_CHUNK_BITS)
-    chunk_bits = triton.cdiv(depth, num_chunks)
-    num_bins = 1 << chunk_bits
-    num_tokens, vocab_size = logits.shape
-    num_tiles = triton.cdiv(vocab_size, _HIST_TILE)
-    # At least two tiles per program, or reducing the partial histograms
-    # costs more than the parallelism saves.
-    num_splits = min(
-        triton.cdiv(_PROGRAMS_PER_SM * _num_sms(logits.device), max(num_tokens, 1)),
-        triton.cdiv(num_tiles, 2),
-    )
-    tiles_per_split = min(
-        triton.cdiv(num_tiles, num_splits), _HIST_MAX_TOKENS // _HIST_TILE
-    )
-    num_splits = triton.cdiv(num_tiles, tiles_per_split)
-
-    partial = logits.new_empty(num_tokens, num_splits, num_bins, dtype=torch.float32)
-    partial_max = logits.new_empty(num_tokens, num_splits, dtype=torch.float32)
-    row_offset = logits.new_empty(num_tokens, dtype=torch.float32)
-    log_tables = logits.new_empty(num_tokens, num_chunks, num_bins, dtype=torch.float32)
-    states = logits.new_empty(num_tokens, 4, dtype=torch.int32)
-    counters = logits.new_empty(num_tokens, _NUM_COUNTERS, dtype=torch.int32)
-
-    key_args = (key & _UINT32_MASK_VALUE, key >> 32)
-    stream_args = (stream & _UINT32_MASK_VALUE, stream >> 32)
-    _synthid_prepare_kernel[(num_tokens,)](
-        states,
-        counters,
-        contexts,
-        contexts.stride(0),
-        *key_args,
-        CONTEXT_WIDTH=contexts.shape[-1],
-        NUM_COUNTERS=_NUM_COUNTERS,
-    )
-    grid = (num_tokens, num_splits)
-    for chunk in range(num_chunks):
-        _synthid_hist_kernel[grid](
-            partial,
-            partial_max,
-            log_tables,
-            row_offset,
-            counters,
-            states,
-            logits,
-            logits.stride(0),
-            skip_mask,
-            *key_args,
-            *stream_args,
-            vocab_size,
-            tiles_per_split,
-            DEPTH=depth,
-            NUM_CHUNKS=num_chunks,
-            CHUNK_BITS=chunk_bits,
-            CHUNK=chunk,
-            HAS_SKIP=skip_mask is not None,
-            GROUPS=_HIST_GROUPS,
-            num_warps=16,
-        )
-    return _Tables(
-        grid,
-        log_tables,
-        row_offset,
-        states,
-        counters,
-        (*key_args, *stream_args, vocab_size, tiles_per_split),
-        dict(
-            NUM_CHUNKS=num_chunks,
-            CHUNK_BITS=chunk_bits,
-            HAS_SKIP=skip_mask is not None,
-            GROUPS=_HIST_GROUPS,
-            num_warps=8,
-        ),
-    )
 
 
 def synthid_sample(
@@ -729,28 +641,87 @@ def synthid_sample(
 ) -> torch.Tensor:
     """Gumbel-max sample `logits` [B, V] after the SynthID-Text tournament.
 
-    Draws the same noise as `gumbel_sample` on the log-probs that
-    `synthid_watermark_logits` returns. Rows in `skip_mask` are sampled from
-    `logits` unchanged.
+    Draws the same noise as `gumbel_sample` on the log-probs of the torch
+    tournament. Rows in `skip_mask` are sampled from `logits` unchanged. Rows
+    of `logits` may be strided, but not their elements.
     """
-    sampled = logits.new_empty(logits.shape[0], dtype=torch.int64)
-    if logits.shape[0] == 0:
+    assert 1 <= depth <= 32
+    assert logits.stride(-1) == 1 and contexts.stride(-1) == 1
+    num_rows, vocab_size = logits.shape
+    sampled = logits.new_empty(num_rows, dtype=torch.int64)
+    if num_rows == 0:
         return sampled
-    tables = _build_tables(logits, contexts, key, depth, stream, skip_mask)
-    num_splits = tables.grid[1]
-    split_argmax = logits.new_empty(logits.shape[0], num_splits, dtype=torch.int64)
-    split_max = logits.new_empty(
-        logits.shape[0], num_splits, dtype=torch.float64 if use_fp64 else torch.float32
+
+    num_chunks = triton.cdiv(depth, _MAX_CHUNK_BITS)
+    chunk_bits = triton.cdiv(depth, num_chunks)
+    num_bins = 1 << chunk_bits
+    num_tiles = triton.cdiv(vocab_size, _HIST_TILE)
+    # At least two tiles per program, or reducing the partial histograms
+    # costs more than the parallelism saves.
+    num_splits = min(
+        triton.cdiv(_PROGRAMS_PER_SM * _num_sms(logits.device), num_rows),
+        triton.cdiv(num_tiles, 2),
     )
-    _synthid_consume_kernel[tables.grid](
+    tiles_per_split = min(
+        triton.cdiv(num_tiles, num_splits), _HIST_MAX_TOKENS // _HIST_TILE
+    )
+    num_splits = triton.cdiv(num_tiles, tiles_per_split)
+    assert num_splits <= _MAX_SPLITS, "vocabulary too large for one-pass reduction"
+
+    partial = logits.new_empty(num_rows, num_splits, num_bins, dtype=torch.float32)
+    partial_max = logits.new_empty(num_rows, num_splits, dtype=torch.float32)
+    row_offset = logits.new_empty(num_rows, dtype=torch.float32)
+    log_tables = logits.new_empty(num_rows, num_chunks, num_bins, dtype=torch.float32)
+    states = logits.new_empty(num_rows, 4, dtype=torch.int32)
+    counters = logits.new_empty(num_rows, _NUM_COUNTERS, dtype=torch.int32)
+    split_argmax = logits.new_empty(num_rows, num_splits, dtype=torch.int64)
+    split_max = logits.new_empty(
+        num_rows, num_splits, dtype=torch.float64 if use_fp64 else torch.float32
+    )
+
+    key_args = (key & _UINT32_MASK, key >> 32)
+    stream_args = (stream & _UINT32_MASK, stream >> 32)
+    _synthid_prepare_kernel[(num_rows,)](
+        states,
+        counters,
+        contexts,
+        contexts.stride(0),
+        *key_args,
+        CONTEXT_WIDTH=contexts.shape[-1],
+        NUM_COUNTERS=_NUM_COUNTERS,
+    )
+    grid = (num_rows, num_splits)
+    for chunk in range(num_chunks):
+        _synthid_hist_kernel[grid](
+            partial,
+            partial_max,
+            log_tables,
+            row_offset,
+            counters,
+            states,
+            logits,
+            logits.stride(0),
+            skip_mask,
+            *key_args,
+            *stream_args,
+            vocab_size,
+            tiles_per_split,
+            DEPTH=depth,
+            NUM_CHUNKS=num_chunks,
+            NUM_COUNTERS=_NUM_COUNTERS,
+            CHUNK_BITS=chunk_bits,
+            CHUNK=chunk,
+            HAS_SKIP=skip_mask is not None,
+            GROUPS=_HIST_GROUPS,
+            num_warps=16,
+        )
+    _synthid_consume_kernel[grid](
         sampled,
-        0,
         split_argmax,
         split_max,
-        tables.counters,
-        tables.log_tables,
-        tables.row_offset,
-        tables.states,
+        counters,
+        log_tables,
+        states,
         logits,
         logits.stride(0),
         skip_mask,
@@ -758,48 +729,16 @@ def synthid_sample(
         temperature,
         seed,
         pos,
-        *tables.args,
-        SAMPLE=True,
+        *key_args,
+        *stream_args,
+        vocab_size,
+        tiles_per_split,
+        NUM_CHUNKS=num_chunks,
+        NUM_COUNTERS=_NUM_COUNTERS,
+        CHUNK_BITS=chunk_bits,
+        HAS_SKIP=skip_mask is not None,
         USE_FP64=use_fp64,
-        **tables.constexprs,
+        GROUPS=_HIST_GROUPS,
+        num_warps=_CONSUME_WARPS,
     )
     return sampled
-
-
-def synthid_watermark_logits(
-    logits: torch.Tensor,
-    contexts: torch.Tensor,
-    key: int,
-    depth: int,
-    stream: int = 0,
-) -> torch.Tensor:
-    """Log-probs [B, V] of `logits` after the SynthID-Text tournament.
-
-    Masked tokens stay -inf.
-    """
-    watermarked = torch.empty_like(logits, dtype=torch.float32)
-    if logits.shape[0] == 0:
-        return watermarked
-    tables = _build_tables(logits, contexts, key, depth, stream, None)
-    _synthid_consume_kernel[tables.grid](
-        watermarked,
-        watermarked.stride(0),
-        None,
-        None,
-        tables.counters,
-        tables.log_tables,
-        tables.row_offset,
-        tables.states,
-        logits,
-        logits.stride(0),
-        None,
-        None,
-        None,
-        None,
-        None,
-        *tables.args,
-        SAMPLE=False,
-        USE_FP64=False,
-        **tables.constexprs,
-    )
-    return watermarked

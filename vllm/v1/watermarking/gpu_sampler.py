@@ -90,15 +90,13 @@ class GPUWatermarkSampler(Sampler):
                 expanded_idx_mapping, contexts
             )
 
-        needs_mixed_sampling = repeated_contexts is not None or not np.all(enabled)
-        skip_mask = None
-        if needs_mixed_sampling:
-            skip_mask = watermark_skip_mask(
-                expanded_idx_mapping,
-                self.watermarking.gpu,
-                self.sampling_states.temperature.gpu,
-                repeated_contexts,
-            )
+        skip_mask = watermark_skip_mask(
+            expanded_idx_mapping,
+            self.watermarking.gpu,
+            self.sampling_states.temperature.gpu,
+            repeated_contexts,
+            contexts,
+        )
 
         random_sampler = RandomSampler(
             expanded_idx_mapping=expanded_idx_mapping,
@@ -164,11 +162,7 @@ class GPUWatermarkSampler(Sampler):
         and ``[20, 21]``. The first verification row precedes the first draft.
         """
         context_width = self.watermarker.context_width
-        if (
-            expanded_local_pos is None
-            and draft_sampled is None
-            and expanded_idx_mapping.device.type != "cpu"
-        ):
+        if expanded_local_pos is None and draft_sampled is None:
             return watermark_contexts(
                 expanded_idx_mapping,
                 self.req_states.all_token_ids.gpu,
