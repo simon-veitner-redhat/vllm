@@ -343,8 +343,7 @@ class FlashAttentionBackend(AttentionBackend):
             and (head_size := vllm_config.model_config.get_head_size()) >= 128
             and get_flash_attn_version(
                 head_size=head_size,
-                head_size_v=cls.head_size_v,
-                supports_fa4_hd256=True,
+                head_size_v=getattr(cls, "head_size_v", None),
             )
             == 4
         ):
