@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash adapter for the DeepGEMM MegaMoE kernel."""
 
+from typing import Any
+
 import torch
 from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
+    MEGA_MOE_FP8_BLOCK_SM90,
     MEGA_MOE_MXFP8,
     DeepGemmMegaMoEExperts,
     MegaMoEWeightSpec,
@@ -15,6 +18,8 @@ from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     requant_block_fp8_to_ue8m0,
 )
+from vllm.platforms import current_platform
+from vllm.utils.deep_gemm import _import_deep_gemm
 
 logger = init_logger(__name__)
 
@@ -23,15 +28,18 @@ Shard = tuple[int | None, str]
 
 
 class Glm5NextMegaMoEExperts(DeepGemmMegaMoEExperts):
-    """MXFP8 MegaMoE experts loaded from GLM-5.3-Flash's block-FP8 checkpoint.
+    """MegaMoE experts loaded from GLM-5.3-Flash's block-FP8 checkpoint.
 
     The checkpoint stores E4M3 weights with one float32 scale per
-    ``weight_block_size`` block; the kernel takes power-of-two UE8M0 scales per
-    1x32. Loading writes each weight shard straight into the kernel layout and
-    stages its block scale in ``*_weight_scale_inv``. Once a load is complete,
-    the model's ``process_weights_after_loading`` calls
-    :meth:`requantize_block_fp8`, which rounds every newly loaded shard to the
-    kernel scales in place. The shared expert is fused the same way.
+    ``weight_block_size`` block. Loading writes each weight shard straight into
+    the kernel layout and stages its block scale in ``*_weight_scale_inv``.
+    Once a load is complete, the model's ``process_weights_after_loading``
+    calls :meth:`finalize_block_fp8_weights`. The shared expert is fused the
+    same way.
+
+    SM100 takes power-of-two UE8M0 scales per 1x32, so
+    :meth:`requantize_block_fp8` rounds every newly loaded shard in place. SM90
+    takes the FP32 block scales as they are.
     """
 
     def __init__(
@@ -44,10 +52,18 @@ class Glm5NextMegaMoEExperts(DeepGemmMegaMoEExperts):
     ):
         self.weight_block_size = weight_block_size
         self._num_fused_shared_experts = num_shared_experts
-        # Shards whose weight / block scale arrived since the last requantize.
+        # Shards whose weight / block scale arrived since the last finalize.
         self._new_weights: set[Shard] = set()
         self._new_scales: set[Shard] = set()
-        super().__init__(vllm_config, weight_format=MEGA_MOE_MXFP8, **kwargs)
+        weight_format = MEGA_MOE_MXFP8
+        if current_platform.is_device_capability(90):
+            if tuple(weight_block_size) != (128, 128):
+                raise NotImplementedError(
+                    "GLM-5.3 MegaMoE on SM90 takes 128x128 block-FP8 weights, "
+                    f"not {tuple(weight_block_size)} blocks."
+                )
+            weight_format = MEGA_MOE_FP8_BLOCK_SM90
+        super().__init__(vllm_config, weight_format=weight_format, **kwargs)
 
     def _fusable_shared_experts(
         self, shared_experts: nn.Module | None
@@ -143,6 +159,90 @@ class Glm5NextMegaMoEExperts(DeepGemmMegaMoEExperts):
             self._load_weight(param.data, loaded_weight, shard_id, False)
             self._new_weights.add((None, shard_id))
 
+    def _check_paired_shards(self) -> None:
+        unpaired = self._new_weights ^ self._new_scales
+        if unpaired:
+            raise ValueError(
+                f"{self.prefix}: block-FP8 shards (local expert, shard; None is "
+                "the shared expert) loaded without their weight or block scale: "
+                f"{sorted(unpaired, key=str)}"
+            )
+
+    def finalize_block_fp8_weights(self) -> None:
+        """Turn every shard loaded since the last call into kernel weights."""
+        if self.weight_format == MEGA_MOE_FP8_BLOCK_SM90:
+            self._transform_block_fp8_sm90()
+        else:
+            self.requantize_block_fp8()
+
+    @torch.no_grad()
+    def _transform_block_fp8_sm90(self, chunk: int = 8) -> None:
+        """Build the SM90 kernel weights and scales with DeepGEMM, at most
+        ``chunk`` experts per call, without requantizing.
+
+        A load that skipped ``weight_loader`` (e.g. dummy weights) leaves the
+        kernel scales unbuilt, so then every expert is transformed.
+        """
+        self._check_paired_shards()
+        experts = {e for e, _ in self._new_weights if e is not None}
+        if self.w13_weight_scale.numel() == 0:
+            experts = set(range(self.num_local_experts))
+        runs: list[list[int]] = []
+        for e in sorted(experts):
+            if runs and runs[-1][1] == e and e - runs[-1][0] < chunk:
+                runs[-1][1] = e + 1
+            else:
+                runs.append([e, e + 1])
+        groups: list[tuple[str, str, Any]] = [
+            ("w13", "w2", slice(start, end)) for start, end in runs
+        ]
+        if self.has_fused_shared_experts and (
+            any(e is None for e, _ in self._new_weights)
+            or self.shared_l1_weight_scale.numel() == 0
+        ):
+            groups.append(("shared_l1", "shared_l2", ...))
+
+        deep_gemm = _import_deep_gemm()
+        for l1, l2, index in groups:
+            w13 = getattr(self, f"{l1}_weight").data
+            w2 = getattr(self, f"{l2}_weight").data
+            # Back to checkpoint row order: undo the 8-row gate/up interleave.
+            w13_rows = w13[index].unflatten(-2, (-1, 2, 8))
+            (w13_kernel, sf13), (w2_kernel, sf2) = (
+                deep_gemm.transform_weights_for_mega_moe(
+                    (
+                        w13_rows.transpose(-4, -3).flatten(-4, -2),
+                        getattr(self, f"{l1}_weight_scale_inv").data[index],
+                    ),
+                    (w2[index], getattr(self, f"{l2}_weight_scale_inv").data[index]),
+                    activation=self.activation.name,
+                    arch_major=9,
+                )
+            )
+            w13[index].copy_(w13_kernel)
+            w2[index].copy_(w2_kernel)
+            self._store_kernel_scale(l1, index, sf13)
+            self._store_kernel_scale(l2, index, sf2)
+        self._new_weights.clear()
+        self._new_scales.clear()
+
+    def _store_kernel_scale(self, name: str, index: Any, sf: torch.Tensor) -> None:
+        """Write DeepGEMM's kernel scales of experts ``index`` (``...`` for the
+        shared expert), keeping their strides (MN-major, TMA-aligned)."""
+        param = getattr(self, f"{name}_weight_scale")
+        if index is ...:
+            param.data = sf
+            return
+        if param.numel() == 0:
+            # Groups are contiguous, so every expert takes sf.stride(0) words.
+            storage = torch.zeros(
+                self.num_local_experts * sf.stride(0), dtype=sf.dtype, device=sf.device
+            )
+            param.data = storage.as_strided(
+                (self.num_local_experts, *sf.shape[1:]), sf.stride()
+            )
+        param.data[index].copy_(sf)
+
     @torch.no_grad()
     def requantize_block_fp8(self, chunk: int = 8) -> None:
         """Round every shard loaded since the last call to UE8M0 1x32 scales,
@@ -152,13 +252,7 @@ class Glm5NextMegaMoEExperts(DeepGemmMegaMoEExperts):
         block scale in separate ``load_weights`` calls, but both have to be in
         by then.
         """
-        unpaired = self._new_weights ^ self._new_scales
-        if unpaired:
-            raise ValueError(
-                f"{self.prefix}: block-FP8 shards (local expert, shard; None is "
-                "the shared expert) loaded without their weight or block scale: "
-                f"{sorted(unpaired, key=str)}"
-            )
+        self._check_paired_shards()
         for shard_id in ("w1", "w3", "w2"):
             experts = sorted(
                 e for e, s in self._new_weights if s == shard_id and e is not None

@@ -93,11 +93,14 @@ def test_kernel_registers_itself_as_warmup_provider(is_bmm) -> None:
 
 def test_mega_moe_predicate_matches_only_native_mega_moe_layers(monkeypatch) -> None:
     """Without the MegaMoE model modules loaded, nothing matches and nothing is
-    imported; with them loaded, only DeepSeek-V4 and Kimi K3 MegaMoE layers match."""
+    imported; with them loaded, only DeepSeek-V4, Kimi K3 and GLM-5.3-Flash
+    MegaMoE layers match."""
     name = "vllm.models.deepseek_v4.nvidia.model"
     kimi_name = "vllm.models.kimi_k3.nvidia.model"
+    glm_name = "vllm.models.glm5next.common.model"
     monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.delitem(sys.modules, kimi_name, raising=False)
+    monkeypatch.delitem(sys.modules, glm_name, raising=False)
     other = SimpleNamespace(use_native_mega_moe=True, use_mega_moe=True)
     assert not deep_gemm_warmup._mega_moe_may_use_deep_gemm(other)
     assert name not in sys.modules and kimi_name not in sys.modules
@@ -116,6 +119,13 @@ def test_mega_moe_predicate_matches_only_native_mega_moe_layers(monkeypatch) -> 
     kimi_mega.use_mega_moe, kimi_fused.use_mega_moe = True, False
     assert deep_gemm_warmup._mega_moe_may_use_deep_gemm(kimi_mega)
     assert not deep_gemm_warmup._mega_moe_may_use_deep_gemm(kimi_fused)
+
+    glm_cls = type("Glm5NextMoE", (), {})
+    monkeypatch.setitem(sys.modules, glm_name, SimpleNamespace(Glm5NextMoE=glm_cls))
+    glm_mega, glm_fused = glm_cls(), glm_cls()
+    glm_mega.use_mega_moe, glm_fused.use_mega_moe = True, False
+    assert deep_gemm_warmup._mega_moe_may_use_deep_gemm(glm_mega)
+    assert not deep_gemm_warmup._mega_moe_may_use_deep_gemm(glm_fused)
 
 
 def test_mega_moe_m_values_reach_mega_gate(monkeypatch) -> None:

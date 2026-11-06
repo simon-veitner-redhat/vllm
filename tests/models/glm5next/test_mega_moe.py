@@ -19,6 +19,7 @@ from vllm.model_executor.model_loader.reload import (
 )
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.models.glm5next.nvidia.mega_moe import Glm5NextMegaMoEExperts
+from vllm.platforms import current_platform
 
 BLOCK = (128, 128)
 HIDDEN, INTER = 256, 128
@@ -35,6 +36,9 @@ def sm100_mega_moe_layout(monkeypatch):
         "vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe."
         "check_deep_gemm_mega_moe_supported",
         lambda *args: None,
+    )
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda *args, **kwargs: False
     )
 
 
