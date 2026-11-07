@@ -27,11 +27,11 @@ if(DEEPGEMM_SRC_DIR)
   set(deepgemm_SOURCE_DIR "${DEEPGEMM_SRC_DIR}")
   message(STATUS "DeepGEMM using local DEEPGEMM_SRC_DIR: ${deepgemm_SOURCE_DIR}")
 else()
-  # Not pushed yet, so the default is a local clone next to this checkout.
-  set(_DEEPGEMM_UPSTREAM_REPO "${CMAKE_SOURCE_DIR}/../DeepGEMM-vllm")
-  # Pinned to branch glm53-mega-moe-sm90-pr, FP8 routed weights with FP32
-  # 128x128 block scales on top of vllm-project/DeepGEMM#44 (SM90 Mega MoE),
-  # itself on the fork's dev branch: upstream's 26/09/30 release (2.8.1)
+  set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/simon-veitner-redhat/DeepGEMM.git")
+  # Pinned to branch glm53-mega-moe-sm90-pr-rebase-dev, FP8 routed weights
+  # with FP32 128x128 block scales on top of vllm-project/DeepGEMM dev at
+  # 0f7698f, the merge of vllm-project/DeepGEMM#44 (SM90 Mega MoE). dev is
+  # upstream's 26/09/30 release (2.8.1)
   # plus the SM120 port, the SM90 paged-MQA kv_block=32/next_n=4 port,
   # configurable SwiGLU alpha/beta, SiTU for FP8/FP4 Mega MoE, and NVFP4
   # Mega MoE, plus swiglustep for BF16/FP8/NVFP4 Mega MoE and F8_128x4
@@ -40,9 +40,10 @@ else()
   # (vllm-project/DeepGEMM#39), and the MX MegaMoE alignment fix
   # (vllm-project/DeepGEMM#43), plus the restored FP32 MQA logits and their
   # `logits_dtype` switch (vllm-project/DeepGEMM#46) and the mega_mhc
-  # CUDA-graph replay barrier fix (vllm-project/DeepGEMM#48).
+  # CUDA-graph replay barrier fix (vllm-project/DeepGEMM#48), plus the SM90
+  # FP8 x FP4 Mega MoE kernel (vllm-project/DeepGEMM#44).
   # Uses the PyTorch 2.11 stable ABI and CPython 3.10 limited API.
-  set(_DEEPGEMM_UPSTREAM_TAG "068a3b4020eb2159525c3bb1c90ac1d630c558d9")
+  set(_DEEPGEMM_UPSTREAM_TAG "c21bcb7dbe896cb0c33c1df00a29ef2984b1a1df")
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)
