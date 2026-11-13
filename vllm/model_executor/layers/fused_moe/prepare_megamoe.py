@@ -530,6 +530,13 @@ def _eplb_kernel_args(eplb_state: EplbLayerState | None) -> tuple:
     )
 
 
+def megamoe_prepare_block_m(num_tokens: int) -> int:
+    """Row tile `prepare_megamoe_inputs` uses for `num_tokens` tokens."""
+    # On GB200, 8-row tiles win from 64 tokens and 32-row tiles from 1024 (1.3-1.6x
+    # over 8 rows); smaller batches stay untiled.
+    return 32 if num_tokens >= 1024 else 8 if num_tokens >= 64 else 1
+
+
 def prepare_megamoe_inputs(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -614,9 +621,7 @@ def prepare_megamoe_inputs(
                 f"{required_rows}, got {shared_x_sf.shape[0]}."
             )
 
-    # On GB200, 8-row tiles win from 64 tokens and 32-row tiles from 1024 (1.3-1.6x
-    # over 8 rows); smaller batches stay untiled.
-    block_m = 32 if num_tokens >= 1024 else 8 if num_tokens >= 64 else 1
+    block_m = megamoe_prepare_block_m(num_tokens)
     grid = (triton.cdiv(num_tokens, block_m), triton.cdiv(hidden_size, block_k))
     block_topk = triton.next_power_of_2(top_k)
     padding_stride_m = is_padding.stride(0) if is_padding is not None else 0

@@ -364,6 +364,8 @@ class DeepGemmMegaMoEExperts(nn.Module):
         self.l2_input_scale = l2_input_scale
         self._kernel_kwargs = activation.kernel_kwargs()
         self.eplb_state = EplbLayerState()
+        # Set by the warmup to reach (tokens, BLOCK_M) pairs of uneven DP steps.
+        self.warmup_mean_num_tokens: int | None = None
         # L2 input scale of every logical expert; the NVFP4 kernel takes the max.
         self._w2_input_scales = torch.zeros(self.num_logical_experts, device="cpu")
         self.l2_activation_scale = 1.0
@@ -936,6 +938,8 @@ class DeepGemmMegaMoEExperts(nn.Module):
 
         CUDA graph steps pad every DP rank to one count, so it is `num_tokens`.
         """
+        if self.warmup_mean_num_tokens is not None:
+            return self.warmup_mean_num_tokens
         if is_forward_context_available():
             dp_metadata = get_forward_context().dp_metadata
             if dp_metadata is not None:

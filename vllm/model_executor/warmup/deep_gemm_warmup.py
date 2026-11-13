@@ -28,6 +28,9 @@ from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import DeepGemmE
 from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
     TritonOrDeepGemmExperts,
 )
+from vllm.model_executor.layers.fused_moe.prepare_megamoe import (
+    megamoe_prepare_block_m,
+)
 from vllm.tracing import instrument
 from vllm.utils.deep_gemm import (
     _import_deep_gemm,
@@ -389,7 +392,17 @@ def _get_fp8_fp4_mega_moe_m_values(
             if uses_mega_gate and hasattr(dg, "get_bf16_mega_gate_config")
             else {}
         )
-        key = (tuple(gate_config.items()), experts.get_block_m(num_tokens))
+        # The input-staging kernel is compiled per row tile and BLOCK_M.
+        prepare_tile = (
+            None
+            if experts.weight_format.uses_nvfp4_api
+            else megamoe_prepare_block_m(num_tokens)
+        )
+        key = (
+            tuple(gate_config.items()),
+            experts.get_block_m(num_tokens),
+            prepare_tile,
+        )
         # Keep the largest M: DeepSeek-V4 only calls bf16_mega_gate above a
         # small token threshold, and a config's largest M is always above it.
         m_values[key] = num_tokens
@@ -424,7 +437,7 @@ def _deepgemm_fp8_fp4_mega_moe_warmup(
     offsets = (0, 1) if sp_masked else (0,)
 
     # Run the whole layer so the gate sees the same optional inputs as serving.
-    for num_tokens in m_values:
+    def run(num_tokens: int) -> None:
         inputs: tuple = (hidden_states[:num_tokens],)
         if _mega_moe_uses_mega_gate(module):
             from vllm.models.deepseek_v4.nvidia.model import (
@@ -449,8 +462,25 @@ def _deepgemm_fp8_fp4_mega_moe_warmup(
             )
             with override_forward_context(forward_context):
                 module(*inputs)
+
+    for num_tokens in m_values:
+        run(num_tokens)
         if pbar is not None:
             pbar.update(1)
+
+    # SM90 takes BLOCK_M from the mean tokens per rank, so on uneven eager DP
+    # steps a rank's own token count meets any BLOCK_M.
+    experts = module.experts
+    if experts.weight_format.sm90:
+        tiles = {megamoe_prepare_block_m(m): m for m in range(1, max_m + 1)}
+        block_ms = {experts.get_block_m(m): m for m in range(1, max_m + 1)}
+        try:
+            for mean_num_tokens in block_ms.values():
+                experts.warmup_mean_num_tokens = mean_num_tokens
+                for num_tokens in tiles.values():
+                    run(num_tokens)
+        finally:
+            experts.warmup_mean_num_tokens = None
 
     FP8_FP4_MEGA_MOE_WARMUP_CACHE.add(key)
 

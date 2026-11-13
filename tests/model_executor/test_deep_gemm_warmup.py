@@ -11,6 +11,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import (
     DeepGemmFp8BlockScaledMMKernel,
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
+    MEGA_MOE_FP8_BLOCK_SM90,
     MEGA_MOE_MXFP4,
     MEGA_MOE_NVFP4,
 )
@@ -183,3 +184,62 @@ def test_mega_moe_m_values_reach_mega_gate(monkeypatch) -> None:
         use_mega_gate=True,
     )
     assert deep_gemm_warmup._get_fp8_fp4_mega_moe_m_values(module, 40) == [16, 32, 40]
+
+
+@pytest.mark.parametrize(
+    "weight_format", [MEGA_MOE_MXFP4, MEGA_MOE_FP8_BLOCK_SM90], ids=lambda f: f.name
+)
+def test_mega_moe_warmup_covers_input_staging_variants(
+    monkeypatch, weight_format
+) -> None:
+    """The input-staging kernel is compiled per row tile (1/8/32 rows from 64 and
+    1024 tokens) and BLOCK_M. Every pair reachable at an even token count is warmed;
+    on SM90, where BLOCK_M follows the mean tokens per rank, every pair is."""
+    monkeypatch.setattr(
+        deep_gemm_warmup, "_import_deep_gemm", lambda: SimpleNamespace()
+    )
+    monkeypatch.setattr(deep_gemm_warmup, "FP8_FP4_MEGA_MOE_WARMUP_CACHE", set())
+
+    def get_block_m(num_tokens):
+        return 16 if num_tokens < 100 else 32 if num_tokens < 1500 else 64
+
+    calls: list[tuple[int, int, int]] = []
+
+    class Module:
+        gate = SimpleNamespace(input_size=8, output_size=4)
+        use_sequence_parallel = False
+        experts: SimpleNamespace
+
+        def __call__(self, hidden_states):
+            num_tokens = hidden_states.shape[0]
+            mean = experts.warmup_mean_num_tokens
+            calls.append(
+                (
+                    deep_gemm_warmup.megamoe_prepare_block_m(num_tokens),
+                    get_block_m(num_tokens if mean is None else mean),
+                    num_tokens,
+                )
+            )
+
+    experts = SimpleNamespace(
+        get_block_m=get_block_m,
+        weight_format=weight_format,
+        has_fused_shared_experts=True,
+        warmup_mean_num_tokens=None,
+        get_symm_buffer=lambda: SimpleNamespace(x=torch.empty(0)),
+    )
+    module = Module()
+    module.experts = experts
+    deep_gemm_warmup._deepgemm_fp8_fp4_mega_moe_warmup(module, 2048)
+
+    variants = {(tile, block_m) for tile, block_m, _ in calls}
+    even = {
+        (deep_gemm_warmup.megamoe_prepare_block_m(n), get_block_m(n))
+        for n in range(1, 2049)
+    }
+    assert even <= variants
+    if weight_format.sm90:
+        assert variants == {(t, b) for t in (1, 8, 32) for b in (16, 32, 64)}
+    else:
+        assert variants == even
+    assert experts.warmup_mean_num_tokens is None
