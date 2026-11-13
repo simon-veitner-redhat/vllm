@@ -1505,6 +1505,22 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
         if pooler_config.use_activation is None:
             pooler_config.use_activation = False
 
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        decision = vllm_config.model_config.hf_config.decision_config
+        if decision.get("attention_mode") == "prefix_bidir" and (
+            vllm_config.scheduler_config.enable_chunked_prefill
+            or vllm_config.cache_config.enable_prefix_caching
+        ):
+            # A prompt's state block is read in both directions, so it cannot
+            # be split across steps or taken from the prefix cache.
+            raise ValueError(
+                "Decision 3.0 prefix_bidir checkpoints do not support chunked "
+                "prefill or prefix caching; remove --enable-chunked-prefill "
+                "and --enable-prefix-caching."
+            )
+
 
 class SnowflakeGteNewModelConfig(VerifyAndUpdateConfig):
     @staticmethod
