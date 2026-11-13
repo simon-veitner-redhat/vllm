@@ -27,7 +27,6 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.platforms import current_platform
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
@@ -209,14 +208,6 @@ class D3ForSequenceClassification(_D3ForSequenceClassificationBase):
         if model_config.hf_config.decision_config.get("attention_mode") == (
             "prefix_bidir"
         ):
-            # The blocks reach the attention only through backends that read
-            # PrefixLM ranges, which multimodal checkpoints select while their
-            # multimodal inputs are enabled.
-            if not (current_platform.is_cuda_alike() and model_config.is_mm_prefix_lm):
-                raise ValueError(
-                    "Decision 3.0 prefix_bidir checkpoints need a CUDA or ROCm "
-                    "GPU and multimodal inputs enabled"
-                )
             # The other attention modes keep the runner's default state.
             self.get_model_state_cls = lambda: D3PrefixBidirModelState
 

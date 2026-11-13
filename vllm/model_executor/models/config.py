@@ -1507,9 +1507,14 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
 
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        from vllm.platforms import current_platform
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
         Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
         decision = vllm_config.model_config.hf_config.decision_config
-        if decision.get("attention_mode") == "prefix_bidir" and (
+        if decision.get("attention_mode") != "prefix_bidir":
+            return
+        if (
             vllm_config.scheduler_config.enable_chunked_prefill
             or vllm_config.cache_config.enable_prefix_caching
         ):
@@ -1519,6 +1524,32 @@ class D3ForSequenceClassificationConfig(Qwen3_5ForConditionalGenerationConfig):
                 "Decision 3.0 prefix_bidir checkpoints do not support chunked "
                 "prefill or prefix caching; remove --enable-chunked-prefill "
                 "and --enable-prefix-caching."
+            )
+        if not current_platform.is_cuda_alike():
+            raise ValueError(
+                "Decision 3.0 prefix_bidir checkpoints need a CUDA or ROCm GPU"
+            )
+        # Triton attention applies the PrefixLM ranges of
+        # `D3PrefixBidirModelState`. A per-kind backend wins over the global one,
+        # as in the selector.
+        attention_config = vllm_config.attention_config
+        if attention_config.backend is None:
+            attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+        backend = attention_config.backend_per_kind.get(
+            "full_attention", attention_config.backend
+        )
+        if backend != AttentionBackendEnum.TRITON_ATTN:
+            raise ValueError(
+                "Decision 3.0 prefix_bidir checkpoints need the TRITON_ATTN "
+                f"attention backend for full attention, not {backend.name}"
+            )
+        max_model_len = vllm_config.model_config.max_model_len
+        scheduled = vllm_config.scheduler_config.max_num_scheduled_tokens
+        if scheduled is not None and scheduled < max_model_len:
+            raise ValueError(
+                "Decision 3.0 prefix_bidir checkpoints prefill each prompt in one "
+                f"step, so --max-num-scheduled-tokens ({scheduled}) must be at "
+                f"least --max-model-len ({max_model_len})"
             )
 
 
