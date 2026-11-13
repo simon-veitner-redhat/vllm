@@ -115,23 +115,19 @@ def test_qwen35_joint_head_selects_clef_flash(tmp_path, has_joint_head, architec
         assert not hasattr(config, "joint_head_config")
 
 
-@pytest.mark.parametrize("attention_mode", ["noncausal_full_attention", "prefix_bidir"])
 @pytest.mark.parametrize("has_decision_config", [False, True])
 @pytest.mark.parametrize(
     "architecture", ["Qwen3_5Model", "Qwen3_5ForConditionalGeneration"]
 )
-def test_qwen35_decision_config_selects_d3(
-    tmp_path, has_decision_config, architecture, attention_mode
-):
-    """Only a bare Qwen3.5 backbone with a decision_config.json selects d3, and
-    only a prefix_bidir one needs attention that reads PrefixLM ranges."""
+def test_qwen35_decision_config_selects_d3(tmp_path, has_decision_config, architecture):
+    """Only a bare Qwen3.5 backbone with a decision_config.json selects d3."""
     from transformers import Qwen3_5Config
 
     decision_config = {
         "format_version": 1,
         "codes": ["A", "B"],
         "token_ids": [32, 33],
-        "attention_mode": attention_mode,
+        "attention_mode": "noncausal_full_attention",
     }
     if has_decision_config:
         (tmp_path / "decision_config.json").write_text(json.dumps(decision_config))
@@ -146,11 +142,61 @@ def test_qwen35_decision_config_selects_d3(
     if has_decision_config and architecture == "Qwen3_5Model":
         assert converted.architectures == ["D3ForSequenceClassification"]
         assert config.decision_config == decision_config
-        assert converted.is_mm_prefix_lm == (attention_mode == "prefix_bidir")
     else:
         assert converted.architectures == [architecture]
         assert not hasattr(config, "decision_config")
-        assert not converted.is_mm_prefix_lm
+
+
+@pytest.mark.parametrize(
+    "engine_args,error",
+    [
+        ({}, None),
+        ({"attention_backend": "FLASH_ATTN"}, "TRITON_ATTN"),
+        (
+            {
+                "attention_config": {
+                    "backend_per_kind": {"full_attention": "FLASH_ATTN"}
+                }
+            },
+            "TRITON_ATTN",
+        ),
+        ({"enable_chunked_prefill": True}, "chunked prefill"),
+        ({"enable_prefix_caching": True}, "prefix caching"),
+        ({"max_num_scheduled_tokens": 1024}, "max-num-scheduled-tokens"),
+    ],
+)
+def test_d3_prefix_bidir_config(tmp_path, monkeypatch, engine_args, error):
+    """A prefix_bidir checkpoint prefills each prompt in one step with Triton
+    attention, whose ranges D3PrefixBidirModelState passes."""
+    from transformers import Qwen3_5Config
+
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.platforms import current_platform
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
+    Qwen3_5Config(
+        architectures=["Qwen3_5Model"], text_config={"max_position_embeddings": 8192}
+    ).save_pretrained(tmp_path)
+    (tmp_path / "decision_config.json").write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "codes": ["A", "B"],
+                "token_ids": [32, 33],
+                "attention_mode": "prefix_bidir",
+            }
+        )
+    )
+    args = EngineArgs(model=str(tmp_path), skip_tokenizer_init=True, **engine_args)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            args.create_engine_config()
+        return
+    config = args.create_engine_config()
+    assert config.attention_config.backend == AttentionBackendEnum.TRITON_ATTN
+    assert not config.scheduler_config.enable_chunked_prefill
+    assert not config.cache_config.enable_prefix_caching
 
 
 def _assert_model_arch_config(model_config, expected: dict):
