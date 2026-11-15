@@ -219,6 +219,7 @@ _TEXT_GENERATION_MODELS = {
 _EMBEDDING_MODELS = {
     # [Text-only]
     "BertModel": ("bert", "BertEmbeddingModel"),
+    "BertSegmentLayoutModel": ("bert_segment_layout", "BertSegmentLayoutModel"),
     "BertForMaskedLM": ("bert", "BertForMaskedLM"),
     "BertSpladeSparseEmbeddingModel": ("bert", "BertSpladeSparseEmbeddingModel"),
     "BgeM3EmbeddingModel": ("roberta", "BgeM3EmbeddingModel"),

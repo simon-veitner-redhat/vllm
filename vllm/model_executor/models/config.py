@@ -702,6 +702,22 @@ class JinaForRankingConfig(VerifyAndUpdateConfig):
         model_config.hf_config.embedding_size = 512
 
 
+class BertSegmentLayoutModelConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config) -> None:
+        model_config = vllm_config.model_config
+        if model_config.runner_type != "pooling":
+            raise ValueError("BertSegmentLayoutModel is a pooling model")
+        kind = getattr(model_config.hf_config, "segment_layout_backend", "auto")
+        if kind not in ("auto", "flex", "varlen"):
+            raise ValueError(
+                f"segment_layout_backend must be auto, flex or varlen, got {kind!r}"
+            )
+        # No CUDA graph check here: vLLM already forces PIECEWISE for pooling
+        # models (config/vllm.py:1997-2007). The backends read the step's rows
+        # outside the captured pieces, so PIECEWISE and eager are both fine.
+
+
 class JinaRobertaModelConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -1277,6 +1293,7 @@ class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
 
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "AliceAIForCausalLM": AliceAIForCausalLMConfig,
+    "BertSegmentLayoutModel": BertSegmentLayoutModelConfig,
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,
     "D3ForSequenceClassification": D3ForSequenceClassificationConfig,
