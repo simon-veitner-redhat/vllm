@@ -77,6 +77,25 @@ class NemotronDiffusionRequestValidator(LogitsProcessorV2):
         return logits
 
 
+class NemotronBidirectionalReadValidator(NemotronDiffusionRequestValidator):
+    """Admits only single-token requests for bidirectional reads.
+
+    With `is_causal=False` in AR mode, the prompt is read in one bidirectional
+    forward without a KV cache, so later decode steps would not see it. The
+    model config registers this processor for that mode; it leaves logits
+    unchanged.
+    """
+
+    @classmethod
+    def validate_params(cls, sampling_params: SamplingParams) -> None:
+        if sampling_params.max_tokens != 1:
+            raise ValueError(
+                "Nemotron with is_causal=False scores the last prompt position "
+                "in one bidirectional forward and keeps no KV cache; set "
+                "max_tokens=1."
+            )
+
+
 def _hf_yarn_get_mscale(scale: float, mscale: float = 1.0) -> float:
     """`get_mscale` from HF `_compute_yarn_parameters`."""
     if scale <= 1.0:
@@ -187,6 +206,13 @@ class NemotronLabsDiffusionForBlockDiffusion(nn.Module, SupportsPP, SupportsQuan
 
     def get_model_state_cls(self):
         if self.ar_mode:
+            if not getattr(self.config, "is_causal", True):
+                # Bidirectional reads: encoder-only attention, no KV cache.
+                from vllm.v1.worker.gpu.model_states.encoder_only import (
+                    EncoderOnlyModelState,
+                )
+
+                return EncoderOnlyModelState
             from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 
             return DefaultModelState
