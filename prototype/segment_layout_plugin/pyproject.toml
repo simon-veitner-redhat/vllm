@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-segment-layout"
+version = "0.0.1"
+description = "Prototype: one-pass multi-candidate scoring (segment attention layout) as a model-owned vLLM plugin"
+requires-python = ">=3.10"
+# vllm itself is expected in the environment; the prototype pins nothing.
+dependencies = []
+
+[project.entry-points."vllm.general_plugins"]
+segment_layout = "vllm_segment_layout:register"
+
+[project.entry-points."vllm.io_processor_plugins"]
+segment_layout = "vllm_segment_layout.io_processor:get_io_processor"
+
+[tool.setuptools.packages.find]
+where = ["src"]
