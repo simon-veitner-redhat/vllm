@@ -930,9 +930,28 @@ class NemotronLabsDiffusionForBlockDiffusionConfig(VerifyAndUpdateConfig):
                 "a bidirectional prompt's keys depend on later tokens."
             )
             cache_config.enable_prefix_caching = False
-        # A prompt chunk would not attend to the later chunks.
+        # A prompt chunk would not attend to the later chunks, so each prompt
+        # runs in one step. As EngineArgs does with chunked prefill off, raise
+        # the step budget to --max-model-len so every admitted prompt fits.
         scheduler_config = vllm_config.scheduler_config
         scheduler_config.enable_chunked_prefill = False
+        scheduler_config.long_prefill_token_threshold = 0
+        max_model_len = vllm_config.model_config.max_model_len
+        if scheduler_config.max_num_batched_tokens < max_model_len:
+            logger.info(
+                "Raising max_num_batched_tokens from %d to %d: Nemotron with "
+                "is_causal=False runs each prompt in one step.",
+                scheduler_config.max_num_batched_tokens,
+                max_model_len,
+            )
+            scheduler_config.max_num_batched_tokens = max_model_len
+        scheduled = scheduler_config.max_num_scheduled_tokens
+        if scheduled is not None and scheduled < max_model_len:
+            raise ValueError(
+                "Nemotron with is_causal=False runs each prompt in one step, so "
+                f"--max-num-scheduled-tokens ({scheduled}) must be at least "
+                f"--max-model-len ({max_model_len})."
+            )
         # Later decode steps would not see the prompt, so admission rejects
         # requests for more than one token; requests without max_tokens
         # (e.g. chat completions) default to one.
@@ -945,18 +964,6 @@ class NemotronLabsDiffusionForBlockDiffusionConfig(VerifyAndUpdateConfig):
         processors = list(model_config.logits_processors or ())
         if validator not in processors:
             model_config.logits_processors = [*processors, validator]
-        max_prompt_len = scheduler_config.max_num_batched_tokens
-        if scheduler_config.max_num_scheduled_tokens is not None:
-            max_prompt_len = min(
-                max_prompt_len, scheduler_config.max_num_scheduled_tokens
-            )
-        logger.info(
-            "Nemotron with is_causal=False reads the last prompt position in "
-            "one bidirectional forward without chunked prefill. Requests must "
-            "use max_tokens=1, and prompts are limited to %d tokens (one "
-            "scheduling step); raise --max-num-batched-tokens for longer ones.",
-            max_prompt_len,
-        )
 
 
 class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
