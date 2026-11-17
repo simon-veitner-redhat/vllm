@@ -328,6 +328,7 @@ def test_bidirectional_reads_config(mode):
         hf_config=SimpleNamespace(is_causal=False),
         logits_processors=None,
         max_logprobs=20,
+        max_model_len=2048,
     )
     config = _vllm_config_for(
         model_config,
@@ -360,6 +361,40 @@ def test_bidirectional_reads_config(mode):
     ]
 
 
+def _bidirectional_engine_config(tmp_path, **engine_args):
+    """The engine config of a bidirectional read checkpoint with only a
+    config.json."""
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.transformers_utils.configs import NemotronLabsDiffusionConfig
+
+    NemotronLabsDiffusionConfig(
+        architectures=["NemotronLabsDiffusionModel"]
+    ).save_pretrained(tmp_path)
+    return EngineArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        hf_overrides={"ar_mode": True, "is_causal": False},
+        **engine_args,
+    ).create_engine_config()
+
+
+@pytest.mark.parametrize("budget,expected", [(2048, 4096), (8192, 8192)])
+def test_bidirectional_reads_fit_each_prompt_in_one_step(tmp_path, budget, expected):
+    """Without chunked prefill, a prompt above the step budget would wait
+    forever, so the budget covers --max-model-len."""
+    config = _bidirectional_engine_config(
+        tmp_path, max_model_len=4096, max_num_batched_tokens=budget
+    )
+    scheduler_config = config.scheduler_config
+    assert not scheduler_config.enable_chunked_prefill
+    assert scheduler_config.long_prefill_token_threshold == 0
+    assert scheduler_config.max_num_batched_tokens == expected
+    with pytest.raises(ValueError, match="max-num-scheduled-tokens"):
+        _bidirectional_engine_config(
+            tmp_path, max_model_len=4096, max_num_scheduled_tokens=2048
+        )
+
+
 def _admit_ar(architecture, is_causal, params, logits_processors=None):
     """Run the model's config hook, then the engine's admission check for
     logits processor arguments, which precedes any worker."""
@@ -375,6 +410,7 @@ def _admit_ar(architecture, is_causal, params, logits_processors=None):
         override_generation_config={},
         hf_config=SimpleNamespace(is_causal=is_causal),
         logits_processors=logits_processors,
+        max_model_len=2048,
     )
     config_cls = MODELS_CONFIG_MAP.get(architecture)
     if config_cls is not None:
