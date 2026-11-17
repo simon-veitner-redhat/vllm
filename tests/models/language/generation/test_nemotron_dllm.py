@@ -446,6 +446,39 @@ def test_bidirectional_reads_require_one_token(
             _admit_ar(architecture, is_causal, params)
 
 
+def test_bidirectional_reads_refuse_prompt_logprobs():
+    """Prompt positions attend to later tokens, so their logprobs are not
+    next-token scores."""
+    from vllm import SamplingParams
+    from vllm.exceptions import VLLMValidationError
+
+    with pytest.raises(VLLMValidationError, match="prompt logprobs"):
+        _admit_ar(
+            "NemotronLabsDiffusionModel",
+            False,
+            SamplingParams(temperature=0, max_tokens=1, prompt_logprobs=1),
+        )
+
+
+def test_bidirectional_reads_refuse_max_new_tokens_override():
+    from types import SimpleNamespace
+
+    from vllm.model_executor.models.config import (
+        NemotronLabsDiffusionForBlockDiffusionConfig,
+    )
+
+    model_config = SimpleNamespace(
+        is_diffusion=False,
+        override_generation_config={"max_new_tokens": 16},
+        hf_config=SimpleNamespace(is_causal=False),
+        logits_processors=None,
+    )
+    with pytest.raises(ValueError, match="max_new_tokens must be 1"):
+        NemotronLabsDiffusionForBlockDiffusionConfig.verify_and_update_config(
+            _vllm_config_for(model_config)
+        )
+
+
 def test_bidirectional_reads_keep_user_logits_processors():
     from vllm import SamplingParams
     from vllm.exceptions import VLLMValidationError

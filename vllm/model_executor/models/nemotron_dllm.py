@@ -94,6 +94,15 @@ class NemotronBidirectionalReadValidator(NemotronDiffusionRequestValidator):
                 "in one bidirectional forward and keeps no KV cache; set "
                 "max_tokens=1."
             )
+        # Each prompt position attends to the tokens after it.
+        if (
+            sampling_params.prompt_logprobs is not None
+            or sampling_params.prompt_logprob_token_ids is not None
+        ):
+            raise ValueError(
+                "Nemotron with is_causal=False reads only the last prompt "
+                "position; prompt logprobs are not supported."
+            )
 
 
 def _hf_yarn_get_mscale(scale: float, mscale: float = 1.0) -> float:

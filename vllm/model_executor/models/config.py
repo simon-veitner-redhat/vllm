@@ -988,7 +988,13 @@ class NemotronLabsDiffusionForBlockDiffusionConfig(VerifyAndUpdateConfig):
         # Later decode steps would not see the prompt, so admission rejects
         # requests for more than one token; requests without max_tokens
         # (e.g. chat completions) default to one.
-        model_config.override_generation_config.setdefault("max_new_tokens", 1)
+        overrides = model_config.override_generation_config
+        if overrides.setdefault("max_new_tokens", 1) != 1:
+            raise ValueError(
+                "Nemotron with is_causal=False reads one token per request; "
+                "--override-generation-config max_new_tokens must be 1, not "
+                f"{overrides['max_new_tokens']}."
+            )
         validator = (
             "vllm.model_executor.models.nemotron_dllm:"
             "NemotronBidirectionalReadValidator"
