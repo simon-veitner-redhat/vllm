@@ -950,7 +950,26 @@ class NemotronLabsDiffusionForBlockDiffusionConfig(VerifyAndUpdateConfig):
         scheduler_config = vllm_config.scheduler_config
         scheduler_config.enable_chunked_prefill = False
         scheduler_config.long_prefill_token_threshold = 0
-        max_model_len = vllm_config.model_config.max_model_len
+        # Without a KV cache there is no full-budget profile run, so
+        # torch.compile sizes its index dtype from a small warmup batch and
+        # uses 32-bit offsets. Keep the widest activation, gate_up
+        # (tokens x 2 * intermediate_size), below 2**31 elements per step.
+        model_config = vllm_config.model_config
+        intermediate_size = model_config.hf_text_config.intermediate_size
+        max_step_tokens = (2**31 - 1) // (2 * intermediate_size)
+        if model_config.original_max_model_len is None:
+            model_config.max_model_len = min(
+                model_config.max_model_len, max_step_tokens
+            )
+        max_model_len = model_config.max_model_len
+        budget = max(scheduler_config.max_num_batched_tokens, max_model_len)
+        if budget > max_step_tokens:
+            raise ValueError(
+                "Nemotron with is_causal=False runs at most "
+                f"{max_step_tokens} tokens per step (32-bit indexing of the "
+                f"MLP activation); set --max-model-len and "
+                f"--max-num-batched-tokens to at most {max_step_tokens}."
+            )
         if scheduler_config.max_num_batched_tokens < max_model_len:
             logger.info(
                 "Raising max_num_batched_tokens from %d to %d: Nemotron with "
@@ -969,7 +988,6 @@ class NemotronLabsDiffusionForBlockDiffusionConfig(VerifyAndUpdateConfig):
         # Later decode steps would not see the prompt, so admission rejects
         # requests for more than one token; requests without max_tokens
         # (e.g. chat completions) default to one.
-        model_config = vllm_config.model_config
         model_config.override_generation_config.setdefault("max_new_tokens", 1)
         validator = (
             "vllm.model_executor.models.nemotron_dllm:"
